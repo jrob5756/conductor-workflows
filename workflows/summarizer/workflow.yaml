@@ -7,7 +7,7 @@ workflow:
       type: string
       description: The text to summarize
   runtime:
-    model: claude-sonnet-4
+    default_model: claude-sonnet-4
 
 agents:
   - name: drafter
