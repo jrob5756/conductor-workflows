@@ -1,0 +1,38 @@
+workflow:
+  name: summarizer
+  description: Summarize text in two stages — draft a summary, then refine it.
+  entry_point: drafter
+  input:
+    text:
+      type: string
+      description: The text to summarize
+
+agents:
+  - name: drafter
+    prompt: !file prompt-draft.md
+    output:
+      draft:
+        type: string
+        description: Initial draft summary
+    routes:
+      - to: refiner
+
+  - name: refiner
+    prompt: |
+      You are an editor. Improve the following draft summary for clarity,
+      conciseness, and accuracy. Keep it under 3 sentences.
+
+      Original text:
+      {{ workflow.input.text }}
+
+      Draft summary:
+      {{ drafter.output.draft }}
+    output:
+      summary:
+        type: string
+        description: Refined final summary
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ refiner.output.summary }}"

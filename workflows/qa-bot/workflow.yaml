@@ -1,0 +1,24 @@
+workflow:
+  name: qa-bot
+  description: Answer a question concisely and accurately.
+  entry_point: answerer
+  input:
+    question:
+      type: string
+      description: The question to answer
+
+agents:
+  - name: answerer
+    prompt: |
+      Answer the following question concisely and accurately.
+
+      Question: {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
