@@ -6,6 +6,8 @@ workflow:
     question:
       type: string
       description: The question to answer
+  runtime:
+    model: claude-sonnet-4
 
 agents:
   - name: answerer

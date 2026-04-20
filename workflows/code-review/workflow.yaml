@@ -6,6 +6,8 @@ workflow:
     code:
       type: string
       description: The code to review
+  runtime:
+    model: claude-sonnet-4
 
 agents:
   - name: reviewer
