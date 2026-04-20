@@ -2,12 +2,12 @@ workflows:
   qa-bot:
     description: "Simple question-answering workflow with a single agent"
     path: workflows/qa-bot/workflow.yaml
-    versions: ["1.0.0"]
+    versions: ["1.0.0", "1.0.1"]
   summarizer:
     description: "Two-stage summarizer — draft then refine"
     path: workflows/summarizer/workflow.yaml
-    versions: ["1.0.0"]
+    versions: ["1.0.0", "1.0.1"]
   code-review:
     description: "Multi-agent code review with reviewer and critic"
     path: workflows/code-review/workflow.yaml
-    versions: ["1.0.0"]
+    versions: ["1.0.0", "1.0.1"]
