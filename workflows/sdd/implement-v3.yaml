@@ -1,0 +1,1016 @@
+# Implementation Workflow v3 — Quality-First Restructure
+#
+# This workflow implements a feature based on an implementation plan document.
+# Each agent is matched to the model best suited for its specific cognitive task.
+#
+# Key changes vs v2 (implement.yaml):
+#   - epic_selector: kept on Claude Sonnet 4.6 (genuinely mechanical task)
+#   - epic_reviewer: Sonnet 4.6 → GPT-5.5
+#       (cross-family review breaks Claude same-family bias on Claude-authored code)
+#   - fixer: Sonnet 4.6 → Claude Opus 4.7 1M
+#       (fixer does real implementation work; was under-modeled)
+#   - Added plan_adversarial_reviewer (Opus 4.7 Extra High Reasoning)
+#       (actively tries to break the integrated implementation)
+#   - Added merge_plan_feedback script to consolidate plan-level reviewer outputs
+#   - Added fixer attempt counter + fixer_escalation_gate (human)
+#       (prevents the fixer ↔ plan_review loop from spinning forever)
+#
+# Flow:
+#   epic_selector (Claude Sonnet 4.6)
+#     ↓ (if epics remain)
+#   coder (Opus 4.7 1M)
+#     ↓
+#   epic_reviewer (GPT-5.5)
+#     ↓ (loops to coder if rejected)
+#   committer (Sonnet 4.6)
+#     ↓ (loops to epic_selector if more epics)
+#   [plan_reviewer (Opus 4.7 1M) || plan_adversarial_reviewer (Opus 4.7 Xhigh)]
+#     ↓
+#   merge_plan_feedback (script)
+#     ↓ (approved → $end)
+#     ↓ (rejected & attempts < 3 → fixer)
+#     ↓ (rejected & attempts >= 3 → fixer_escalation_gate)
+#   fixer (Opus 4.7 1M)
+#     ↓ → plan_review_parallel
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL IDENTIFIER NOTES
+# ─────────────────────────────────────────────────────────────────────────────
+# Confirmed-valid identifiers used here:
+#   claude-opus-4.7-1m-internal, claude-sonnet-4.6
+#
+# Best-guess identifiers (may need adjustment if Copilot rejects them):
+#   gpt-5.5                            alts: gpt-5.4
+#   claude-opus-4.7-extra-high         alts: claude-opus-4.7-xhigh,
+#                                            claude-opus-4.7-thinking-high,
+#                                            claude-opus-4.7-extra-high-reasoning
+#
+# If a model is rejected on first run, fall back to claude-opus-4.7 (no suffix)
+# or claude-opus-4.7-1m-internal for the affected agent.
+#
+# Usage:
+#   conductor run workflows/sdd/implement-v3.yaml --input plan="path/to/plan.md"
+#
+#   With specific epic:
+#   conductor run workflows/sdd/implement-v3.yaml --input plan="..." --input epic="EPIC-001"
+
+workflow:
+  name: implement-v3
+  description: Quality-first multi-agent implementation workflow with adversarial plan-level review and bounded fixer escalation
+  version: "3.0.0"
+  entry_point: epic_selector
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["search"]
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+      ms-learn:
+        type: http
+        url: https://learn.microsoft.com/api/mcp
+        tools: ["*"]
+
+  input:
+    plan:
+      type: string
+      required: true
+      description: A link to an implementation plan (e.g., `.plan.md`) or the plan content itself
+    epic:
+      type: string
+      required: false
+      description: A specific epic ID to implement. If not provided, all incomplete epics are in scope
+    max_fixer_attempts:
+      type: number
+      required: false
+      default: 3
+      description: Maximum number of fixer ↔ plan_review iterations before escalating to human
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 100
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARALLEL GROUP — Plan-level Review
+# ─────────────────────────────────────────────────────────────────────────────
+parallel:
+  - name: plan_review_parallel
+    description: Holistic reviewer + adversarial reviewer evaluate the integrated implementation in parallel
+    agents:
+      - plan_reviewer
+      - plan_adversarial_reviewer
+    failure_mode: fail_fast
+    routes:
+      - to: merge_plan_feedback
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENTS
+# ─────────────────────────────────────────────────────────────────────────────
+agents:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. EPIC SELECTOR (Claude Sonnet 4.6)
+  # Mechanical structured-document parsing: read plan, identify statuses,
+  # pick next epic, extract details. Sonnet is built for this kind of
+  # focused mechanical task — deeper reasoning would be wasted here.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: epic_selector
+    description: Reads the plan and selects exactly one epic to implement next
+    model: claude-sonnet-4.6
+    input:
+      - workflow.input.plan
+      - workflow.input.epic?
+      - committer.output?
+    system_prompt: |
+      You are an Implementation Planner agent. Your ONLY job is to read an implementation
+      plan document and identify the SINGLE next epic that needs to be implemented.
+
+      You do NOT implement anything. You do NOT write code. You ONLY:
+      1. Read and parse the plan document
+      2. Identify epic statuses (DONE, IN PROGRESS, NOT STARTED, TO DO)
+      3. Select the first incomplete epic
+      4. Extract that epic's details for the implementation agent
+
+      You must be precise about epic identification and status tracking.
+    prompt: |
+      Read the implementation plan and identify the next epic to implement.
+
+      **Plan:**
+      {{ workflow.input.plan }}
+
+      {% if workflow.input.epic %}
+      **Requested Epic:** {{ workflow.input.epic }}
+      Only select this specific epic. If it is already DONE, report all_complete as true.
+      {% endif %}
+
+      {% if committer is defined and committer.output %}
+      **Previous Epic Completed:** {{ committer.output.epic_completed }}
+      **Committer's Remaining Epics:** {{ committer.output.remaining_epics | json }}
+      **Committer's Next Epic Suggestion:** {{ committer.output.next_epic }}
+      {% endif %}
+
+      ## YOUR TASKS
+
+      1. **Read the Plan Document**
+         - If the plan is a file path, read the file to get the full plan content
+         - Parse the entire document to identify ALL epics
+         - For each epic, determine its current status:
+           - Look at task status fields (DONE, IN PROGRESS, NOT STARTED, TO DO)
+           - An epic is DONE only if ALL its tasks are marked DONE
+           - An epic is IN PROGRESS if any task is IN PROGRESS
+           - Otherwise it is NOT STARTED
+
+      2. **Select the Next Epic**
+         - If a specific epic was requested via input, select that epic
+         - If the committer suggested a next epic, verify it is indeed incomplete and select it
+         - Otherwise, scan epics in order (Epic 1, Epic 2, etc.) and select the FIRST one that is NOT DONE
+         - Check prerequisites: verify all prerequisite epics are DONE before selecting
+         - If ALL epics are DONE, set `all_complete` to true
+
+      3. **Extract Epic Details**
+         - Copy the FULL epic details including:
+           - Epic title and description/goal
+           - All tasks with their descriptions and file paths
+           - Acceptance criteria
+           - Prerequisites
+           - Any technical notes relevant to the epic
+         - This will be the ONLY information the implementation agent receives about the epic
+
+      4. **Create a Plan Summary**
+         - Summarize the overall plan (what is being built)
+         - List all epics with their current status
+
+      **CRITICAL:** Do NOT implement anything. Do NOT write or modify any code.
+      Your output will be passed to the implementation agent.
+    output:
+      plan_summary:
+        type: string
+        description: Summary of the overall implementation plan
+      all_epics:
+        type: array
+        description: List of all epic IDs/names with their current status
+      current_epic:
+        type: string
+        description: The epic ID/name selected for implementation
+      epic_details:
+        type: string
+        description: Full details of the selected epic (tasks, acceptance criteria, files, prerequisites)
+      prerequisites_met:
+        type: boolean
+        description: Whether all prerequisites for the selected epic are satisfied
+      all_complete:
+        type: boolean
+        description: True only if ALL epics in the plan are marked DONE
+      remaining_count:
+        type: number
+        description: Number of epics still remaining (not DONE)
+    routes:
+      - to: coder
+        when: "{{ not output.all_complete and output.prerequisites_met }}"
+      - to: plan_review_parallel
+        when: "{{ output.all_complete }}"
+      - to: $end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. CODER (Claude Opus 4.7 1M)
+  # Heart of the workflow. Deep codebase research + implementation + tests,
+  # interleaved. 1M context is essential for accumulated file reads during
+  # the implementation loop.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: coder
+    description: Implements code changes for a single epic
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.plan
+      - epic_selector.output
+      - epic_reviewer.output?
+    system_prompt: |
+      You are a Senior Software Engineer agent. Your task is to implement code changes
+      for ONE specific epic that has been assigned to you.
+
+      Your core capabilities include:
+      - Deep codebase research to understand existing patterns, dependencies, and conventions
+      - Identifying all relevant code, modules, and integration points
+      - Writing clean, well-documented, production-ready code
+      - Anticipating edge cases and handling them properly
+      - Creating comprehensive tests
+      - Following existing code patterns and conventions precisely
+
+      CRITICAL CONSTRAINT: You must implement ONLY the epic specified below.
+      Do NOT implement any other epics, even if you can see them in the plan.
+      After completing this ONE epic, stop and report your results.
+    prompt: |
+      Implement the following epic. Do NOT implement any other epics.
+
+      **Epic to Implement:** {{ epic_selector.output.current_epic }}
+
+      **Epic Details:**
+      {{ epic_selector.output.epic_details }}
+
+      **Plan Context (for reference only - do NOT implement other epics):**
+      {{ epic_selector.output.plan_summary }}
+
+      **Plan Document:**
+      {{ workflow.input.plan }}
+
+      {% if epic_reviewer is defined and epic_reviewer.output and epic_reviewer.output.decision == "REQUEST_CHANGES" %}
+      **Previous Implementation Failed Review - Fix These Issues:**
+      {{ epic_reviewer.output.feedback }}
+
+      **Specific Issues to Address:**
+      {% for issue in epic_reviewer.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% endif %}
+
+      ## IMPLEMENTATION TASKS
+
+      You are implementing ONLY: **{{ epic_selector.output.current_epic }}**
+
+      1. **Deep Codebase Research**
+         - Analyze the codebase to understand existing patterns and conventions
+         - Identify all files that will be created, modified, or deleted for THIS epic
+         - Review related modules and their interfaces
+         - Identify integration points and potential conflicts
+         - Document the coding style, naming conventions, and patterns used
+
+      2. **Update Plan Status to IN PROGRESS**
+         - Open the plan document and update this epic's status to "IN PROGRESS"
+         - Update task statuses within this epic from "TO DO" or "NOT STARTED" to "IN PROGRESS"
+         - Save the plan document
+
+      3. **Write Tests First**
+         - For each task in THIS epic, write tests that define the expected behavior BEFORE implementing the code
+         - Run the tests and confirm they fail (they define what "done" looks like)
+         - These tests are your success criteria — implementation is complete when they pass
+
+      4. **Implement the Changes**
+         For THIS epic only:
+         - Create or modify files as specified in the epic details
+         - Follow existing code patterns and conventions exactly
+         - Run your tests after each significant change — stop when they pass
+
+         **Surgical changes constraint**: Every changed line MUST trace to a task in THIS epic.
+         Do NOT "improve" adjacent code, add type hints to unrelated functions, refactor code
+         not specified for change, or add abstractions/configurability not in the plan.
+         If you notice unrelated issues, mention them in implementation_notes — do not fix them.
+
+      5. **Verify All Tests Pass**
+         - Run the full test suite to confirm no regressions
+         - Ensure your new tests all pass
+
+      6. **Document Your Changes**
+         - Add inline comments only where the logic is not self-evident
+         - Update any relevant documentation specified in the epic
+
+      **STOP after completing this epic. Do NOT continue to the next epic.**
+    output:
+      current_epic:
+        type: string
+      epic_details:
+        type: string
+      files_modified:
+        type: array
+        items:
+          type: string
+      changes_made:
+        type: array
+        items:
+          type: string
+      tests_added:
+        type: array
+        items:
+          type: string
+      edge_cases_handled:
+        type: array
+        items:
+          type: string
+      implementation_notes:
+        type: string
+    routes:
+      - to: epic_reviewer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. EPIC REVIEWER (GPT-5.5)
+  # Cross-family review. Coder is Claude Opus; using a non-Claude reviewer
+  # catches Claude-specific code patterns (error handling shapes, comment
+  # density, naming) that another Claude model rationalizes as fine.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: epic_reviewer
+    description: Reviews the implementation for a single epic — uses a different model family to catch Claude-specific code patterns
+    model: gpt-5.5
+    input:
+      - coder.output
+    system_prompt: |
+      You are a Code Review agent. You conduct thorough reviews of code changes
+      to ensure quality, correctness, and adherence to best practices.
+
+      You are critical but constructive, providing specific, actionable feedback
+      that helps improve the code.
+
+      Be especially attentive to patterns that Claude models commonly produce:
+      - Over-elaborate error handling that swallows useful information
+      - Defensive checks for impossible conditions
+      - Excessive comments restating what the code does
+      - Repetitive parallel constructions ("validate X, validate Y, validate Z")
+      - Hedging language in docstrings that obscures behavior
+    prompt: |
+      Review the implementation changes for the following epic.
+
+      **Epic:** {{ coder.output.current_epic }}
+
+      **Epic Details:**
+      {{ coder.output.epic_details }}
+
+      **Changes Made:**
+      {% for change in coder.output.changes_made %}
+      - {{ change }}
+      {% endfor %}
+
+      **Files Modified:**
+      {% for file in coder.output.files_modified %}
+      - {{ file }}
+      {% endfor %}
+
+      **Tests Added:**
+      {% for test in coder.output.tests_added %}
+      - {{ test }}
+      {% endfor %}
+
+      **Edge Cases Handled:**
+      {% for edge_case in coder.output.edge_cases_handled %}
+      - {{ edge_case }}
+      {% endfor %}
+
+      **Implementation Notes:**
+      {{ coder.output.implementation_notes }}
+
+      ## REVIEW TASKS
+
+      1. **Requirements Verification**
+         - Verify that all requirements from the epic are met
+         - Check that acceptance criteria are satisfied
+         - Ensure no requirements were missed
+
+      2. **Scope Containment**
+         - Verify every changed line traces to a specific task in THIS epic
+         - Flag any modified files NOT specified in the epic details
+         - Flag any drive-by changes: formatting, style adjustments, comment rewrites, or refactoring outside the epic's scope
+         - Flag unnecessary abstractions, configurability, or flexibility not in the plan
+         - The test: every changed line should trace directly to an ITEM in this epic
+
+      3. **Code Quality**
+         - Read the actual modified files. Do NOT rely solely on the coder's summary.
+         - Check for bugs, errors, or logical issues
+         - Verify proper error handling — flag both missing and excessive
+         - Ensure code is clean and well-documented
+         - Confirm code follows existing patterns and conventions
+
+      4. **Test-First Verification**
+         - Verify tests exist for the new functionality
+         - Check that tests were written to define behavior (not just retroactively validate it)
+         - Check that tests cover edge cases and error conditions
+
+      Provide your decision: APPROVE or REQUEST_CHANGES.
+
+      If REQUEST_CHANGES, provide specific, actionable feedback.
+      If changes include scope creep (untraced modifications), this alone is grounds for REQUEST_CHANGES.
+    output:
+      decision:
+        type: string
+        description: APPROVE or REQUEST_CHANGES
+      feedback:
+        type: string
+      issues:
+        type: array
+        items:
+          type: string
+      strengths:
+        type: array
+        items:
+          type: string
+      approved:
+        type: boolean
+    routes:
+      - to: committer
+        when: "{{ output.approved }}"
+      - to: coder
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. COMMITTER (Claude Sonnet 4.6)
+  # Mechanical task: format updates, commit message, scan for next epic.
+  # Sonnet is the right tier — Haiku would be too light for the "scan all
+  # epics correctly" subtask.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: committer
+    description: Commits the changes and updates the plan document
+    model: claude-sonnet-4.6
+    input:
+      - workflow.input.plan
+      - coder.output
+      - epic_reviewer.output
+      - epic_selector.output
+    system_prompt: |
+      You are a Commit and Documentation agent. Your job is to:
+      - Create clear, descriptive git commits for completed work
+      - Update plan documents to reflect progress
+      - Determine if there are more epics to implement
+    prompt: |
+      The following epic has been implemented and approved.
+
+      **Epic:** {{ coder.output.current_epic }}
+
+      **Epic Details:**
+      {{ coder.output.epic_details }}
+
+      **Changes Made:**
+      {% for change in coder.output.changes_made %}
+      - {{ change }}
+      {% endfor %}
+
+      **Files Modified:**
+      {% for file in coder.output.files_modified %}
+      - {{ file }}
+      {% endfor %}
+
+      **Reviewer Feedback:**
+      {{ epic_reviewer.output.feedback }}
+
+      **All Epics:**
+      {{ epic_selector.output.all_epics | json }}
+
+      ## COMMIT AND UPDATE TASKS
+
+      1. **Update Plan Document**
+         a. Change the epic's status from "IN PROGRESS" to "DONE"
+         b. For each task in the epic, update status from "IN PROGRESS"/"TO DO" to "DONE"
+         c. Check completed acceptance criteria checkboxes (`- [ ]` → `- [x]`)
+         d. Add completion date and any relevant notes
+         Save the updated plan document.
+
+      2. **Create Git Commit**
+         - Stage all modified files INCLUDING the updated plan document
+         - Create a clear commit message starting with the epic ID
+         - Example: "EPIC-001: Implement user authentication flow"
+
+      3. **Determine Next Steps**
+         - Re-read the plan document after updating it
+         - Scan ALL epics in order
+         - Build a list of remaining epics that are NOT marked as "DONE"
+         - If there are remaining epics:
+           - Set `all_complete` to FALSE
+           - Set `next_epic` to the FIRST remaining epic (by ID order)
+           - Set `remaining_epics` to the full list of non-DONE epics
+         - ONLY set `all_complete` to TRUE if EVERY epic in the plan is "DONE"
+
+      **IMPORTANT:** Do NOT set `all_complete` to true unless you have verified that
+      ALL epics in the entire plan document are marked as DONE. When in doubt,
+      set `all_complete` to false and specify the next epic to implement.
+    output:
+      epic_completed:
+        type: string
+      commit_message:
+        type: string
+      plan_updated:
+        type: boolean
+      remaining_epics:
+        type: array
+        items:
+          type: string
+      all_complete:
+        type: boolean
+      next_epic:
+        type: string
+    routes:
+      - to: epic_selector
+        when: "{{ not output.all_complete }}"
+      - to: plan_review_parallel
+        when: "{{ output.all_complete }}"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. PLAN REVIEWER (Claude Opus 4.7 1M)
+  # Holistic review of the integrated implementation. 1M context needed to
+  # load files from many epics across the full diff.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: plan_reviewer
+    description: Holistic review of the entire implementation across all epics
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.plan
+      - epic_selector.output
+      - coder.output?
+      - committer.output?
+      - fixer.output?
+    system_prompt: |
+      You are a Senior Architecture Reviewer. Your job is to perform a holistic review
+      of the entire implementation after all epics have been completed.
+
+      You review:
+      - Overall architecture and design coherence
+      - Cross-cutting concerns (error handling, logging, security)
+      - Code consistency across all changes
+      - Integration between components
+      - Documentation completeness
+      - Test coverage across the entire feature
+
+      You are thorough and ensure the implementation is production-ready.
+    prompt: |
+      All epics have been implemented. Perform a holistic review of the entire implementation.
+
+      **Original Plan:**
+      {{ workflow.input.plan }}
+
+      **Plan Summary:**
+      {{ epic_selector.output.plan_summary }}
+
+      {% if fixer is defined and fixer.output %}
+      **Most Recent Fixer Output (this is a re-review):**
+      {{ fixer.output.fix_notes }}
+
+      Files modified by fixer:
+      {% for f in fixer.output.files_modified %}
+      - {{ f }}
+      {% endfor %}
+      {% endif %}
+
+      {% if committer is defined and committer.output %}
+      **Final Commit:**
+      {{ committer.output.commit_message }}
+      {% endif %}
+
+      ## HOLISTIC REVIEW TASKS
+
+      Read the actual files in the codebase. Do NOT rely solely on summaries.
+      Use git tools (e.g. `git diff`, `git log`) to review the full set of changes.
+
+      1. **Architecture Review**
+         - Review the overall architecture of the changes
+         - Ensure components integrate well together
+         - Check for proper separation of concerns
+         - Verify the design is maintainable and extensible
+
+      2. **Scope Containment (Minimal Diff)**
+         - Review all changed files across ALL commits against the plan's Files Affected section
+         - Flag any files modified that are NOT in the plan
+         - Flag any changes that do not trace to a specific requirement or EPIC task
+         - Flag unnecessary abstractions, patterns, or configurability not in the plan
+         - Ask: "Is there anything in this diff that wasn't asked for?" If yes, flag it.
+
+      3. **Cross-Cutting Concerns**
+         - Review error handling across all components
+         - Check logging and observability
+         - Verify security considerations
+         - Ensure proper resource management
+
+      4. **Code Consistency**
+         - Check for consistent patterns across all changes
+         - Verify naming conventions are consistent
+         - Ensure code style is uniform
+
+      5. **Documentation Review**
+         - Verify documentation is complete and accurate
+         - Check that README or other docs are updated
+         - Ensure code comments are helpful
+
+      6. **Test Coverage**
+         - Review overall test coverage
+         - Identify any gaps in testing
+         - Verify integration tests exist where needed
+
+      7. **Git History Review**
+         - Review all commits made during implementation
+         - Ensure commit messages are clear and descriptive
+         - Check for any commits that should be squashed or amended
+
+      Provide your decision: APPROVE or REQUEST_CHANGES.
+    output:
+      decision:
+        type: string
+        description: APPROVE or REQUEST_CHANGES
+      feedback:
+        type: string
+      architecture_issues:
+        type: array
+        items:
+          type: string
+      code_issues:
+        type: array
+        items:
+          type: string
+      documentation_issues:
+        type: array
+        items:
+          type: string
+      test_gaps:
+        type: array
+        items:
+          type: string
+      strengths:
+        type: array
+        items:
+          type: string
+      approved:
+        type: boolean
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 6. PLAN ADVERSARIAL REVIEWER (Claude Opus 4.7 Extra High Reasoning)
+  # Tries to break the integrated implementation. Pure deep-reasoning task
+  # over a bounded set of files — perfect Extra High Reasoning use case.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: plan_adversarial_reviewer
+    description: Attempts to break the integrated implementation — finds concurrency hazards, integration assumption breaks, edge-case failures
+    model: claude-opus-4.7
+    reasoning:
+      effort: xhigh
+    input:
+      - workflow.input.plan
+      - epic_selector.output
+      - coder.output?
+      - committer.output?
+      - fixer.output?
+    system_prompt: |
+      You are an Adversarial Implementation Reviewer. Your job is NOT to evaluate
+      the implementation's quality — it is to TRY TO BREAK IT.
+
+      You assume there is a bug, race condition, or unconsidered failure mode
+      somewhere in this code, and your job is to find it.
+
+      You think like:
+      - An SRE reading the code at 3am during an incident
+      - A security reviewer looking for what could go wrong
+      - A staff engineer who has been burned by every shape of integration bug
+
+      You are especially attentive to:
+      - Concurrency, ordering, and consistency hazards
+      - Race conditions between components built in different epics
+      - Edge cases the implementation implicitly assumes away
+      - Hidden assumptions that could turn out to be false in production
+      - Integration gaps where two epics touch the same surface
+      - Backward compatibility breaks
+      - Performance pathologies under load or with adversarial inputs
+      - Security implications the author may not have considered
+      - Resource leaks (file handles, connections, goroutines, etc.)
+      - Error handling that swallows information needed to diagnose failures
+    prompt: |
+      Attempt to break this implementation. Find what is wrong with it.
+
+      **Plan:** {{ workflow.input.plan }}
+
+      **Plan Summary:** {{ epic_selector.output.plan_summary }}
+
+      {% if fixer is defined and fixer.output %}
+      **Most Recent Fixer Output (re-review):**
+      {{ fixer.output.fix_notes }}
+      {% endif %}
+
+      Read the actual files in the codebase and the recent git history. Use
+      `git diff` and `git log` to see the integrated changes across all epics.
+
+      For each weakness you identify, provide:
+      - **Weakness**: precise description of what is wrong or missing
+      - **Why it matters**: the failure mode this enables (be concrete)
+      - **Reproducer**: minimal scenario that triggers the failure
+      - **Severity**: CRITICAL / HIGH / MEDIUM / LOW
+      - **Suggested fix**: what the implementation should do instead
+
+      Be specific and concrete. "Error handling could be better" is not useful.
+      "On line 47 of foo.py, if the connection drops between the read() and
+      the commit(), the lock is never released because the finally block is
+      missing — this will deadlock subsequent writers" is useful.
+
+      Categorize your findings:
+      - Concurrency / consistency hazards
+      - Edge cases / hidden assumptions
+      - Integration gaps between epics
+      - Resource leaks
+      - Backward compatibility
+      - Performance pathologies
+      - Security
+      - Operational concerns (observability, debuggability)
+
+      ## Approval
+
+      You approve the implementation (score >= 90) only if you cannot identify
+      any CRITICAL or HIGH severity weaknesses. Be honest — this agent's value
+      depends on your willingness to find problems.
+
+      Provide:
+      1. Score 0-100 (lower if more / more severe weaknesses found)
+      2. Approved if no CRITICAL or HIGH weaknesses
+      3. Detailed feedback consolidating all weaknesses
+      4. List of critical issues (CRITICAL and HIGH severity items)
+    output:
+      score:
+        type: number
+      approved:
+        type: boolean
+      feedback:
+        type: string
+      critical_issues:
+        type: array
+        items:
+          type: string
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 7. MERGE PLAN FEEDBACK (script — no LLM)
+  # Deterministic aggregation of the two reviewers. Also tracks the fixer
+  # attempt count so we can escalate to a human after N tries.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: merge_plan_feedback
+    type: script
+    description: Aggregates plan_reviewer + plan_adversarial_reviewer outputs and routes based on approval and fixer attempt count
+    input:
+      - plan_review_parallel.outputs
+      - fixer.output?
+    command: bash
+    args:
+      - "-c"
+      - |
+        cat <<'EOF'
+        ## Consolidated Plan Review
+
+        ### Holistic Reviewer ({{ "APPROVED" if plan_review_parallel.outputs.plan_reviewer.approved else "REJECTED" }})
+
+        {{ plan_review_parallel.outputs.plan_reviewer.feedback }}
+
+        Architecture issues:
+        {% for issue in plan_review_parallel.outputs.plan_reviewer.architecture_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        Code issues:
+        {% for issue in plan_review_parallel.outputs.plan_reviewer.code_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        Documentation issues:
+        {% for issue in plan_review_parallel.outputs.plan_reviewer.documentation_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        Test gaps:
+        {% for gap in plan_review_parallel.outputs.plan_reviewer.test_gaps %}
+        - {{ gap }}
+        {% endfor %}
+
+        ---
+
+        ### Adversarial Reviewer (score: {{ plan_review_parallel.outputs.plan_adversarial_reviewer.score }} — {{ "APPROVED" if plan_review_parallel.outputs.plan_adversarial_reviewer.approved else "REJECTED" }})
+
+        {{ plan_review_parallel.outputs.plan_adversarial_reviewer.feedback }}
+
+        Critical issues:
+        {% for issue in plan_review_parallel.outputs.plan_adversarial_reviewer.critical_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        ---
+
+        ### Aggregate Status
+
+        Both reviewers approved: {{ "YES" if (plan_review_parallel.outputs.plan_reviewer.approved and plan_review_parallel.outputs.plan_adversarial_reviewer.approved) else "NO" }}
+
+        Fixer attempt count: {{ (fixer.output.attempt_count | default(0)) if fixer is defined and fixer.output else 0 }}
+        Max fixer attempts: {{ workflow.input.max_fixer_attempts | default(3) }}
+        EOF
+    routes:
+      - to: $end
+        when: "{{ plan_review_parallel.outputs.plan_reviewer.approved and plan_review_parallel.outputs.plan_adversarial_reviewer.approved }}"
+      - to: fixer_escalation_gate
+        when: "{{ fixer is defined and fixer.output and (fixer.output.attempt_count | default(0)) >= (workflow.input.max_fixer_attempts | default(3)) }}"
+      - to: fixer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 8. FIXER (Claude Opus 4.7 1M) — UPGRADED FROM SONNET
+  # The fixer does real implementation work: architecture fixes, test additions,
+  # code-quality fixes across multiple files. Was under-modeled at Sonnet in v2.
+  # Tracks attempt_count so the merge_plan_feedback router can escalate.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: fixer
+    description: Fixes issues identified by the plan reviewer and adversarial reviewer
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.plan
+      - coder.output?
+      - plan_review_parallel.outputs
+      - merge_plan_feedback.output
+      - fixer.output?
+    system_prompt: |
+      You are a Senior Software Engineer specializing in fixing issues identified
+      during holistic code review and adversarial review.
+
+      You make targeted, precise fixes while maintaining the overall integrity
+      of the implementation. You read the actual code before fixing it — never
+      fix from a summary alone.
+
+      You handle issues from two reviewers:
+      - Holistic reviewer: architecture, consistency, documentation, test coverage
+      - Adversarial reviewer: concurrency hazards, edge cases, integration gaps,
+        backward compatibility, performance, security
+    prompt: |
+      Plan-level review identified issues that need fixing.
+
+      **Original Plan:** {{ workflow.input.plan }}
+
+      **Holistic Reviewer Issues:**
+
+      Architecture:
+      {% for issue in plan_review_parallel.outputs.plan_reviewer.architecture_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Code:
+      {% for issue in plan_review_parallel.outputs.plan_reviewer.code_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Documentation:
+      {% for issue in plan_review_parallel.outputs.plan_reviewer.documentation_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Test gaps:
+      {% for gap in plan_review_parallel.outputs.plan_reviewer.test_gaps %}
+      - {{ gap }}
+      {% endfor %}
+
+      **Adversarial Reviewer Critical Issues:**
+      {% for issue in plan_review_parallel.outputs.plan_adversarial_reviewer.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      **Adversarial Reviewer Full Feedback:**
+      {{ plan_review_parallel.outputs.plan_adversarial_reviewer.feedback }}
+
+      {% if fixer is defined and fixer.output %}
+      **Previous Fixer Attempts:** {{ fixer.output.attempt_count }}
+
+      **Previous Fix Notes:**
+      {{ fixer.output.fix_notes }}
+
+      The previous fix did not satisfy the reviewers. Read the latest review
+      feedback carefully — focus on what is still wrong, not what you already fixed.
+      {% endif %}
+
+      ## FIX TASKS
+
+      For each issue, read the actual code, then fix it. Be surgical — do not
+      add unrelated improvements.
+
+      1. **Address Adversarial Reviewer Critical Issues First**
+         These are the most likely to indicate real bugs.
+
+      2. **Address Architecture Issues**
+         Component integration, separation of concerns, design problems.
+
+      3. **Fix Code Issues**
+         Code quality, consistency, bugs, error handling.
+
+      4. **Complete Documentation**
+         README, code comments, API docs.
+
+      5. **Add Missing Tests**
+         Especially for the adversarial findings — write a test that
+         demonstrates each fix works.
+
+      6. **Commit Fixes**
+         Stage all fixes. Create a clear commit message.
+         Example: "fix: Address plan review feedback - close TOCTOU race in auth handler, add concurrency tests"
+
+      ## ATTEMPT COUNTER
+
+      Set `attempt_count` to the previous value plus 1, or 1 if this is the first attempt.
+      {% if fixer is defined and fixer.output %}
+      Previous attempt_count was {{ fixer.output.attempt_count }}, so set this to {{ fixer.output.attempt_count + 1 }}.
+      {% else %}
+      This is the first attempt — set attempt_count to 1.
+      {% endif %}
+    output:
+      issues_fixed:
+        type: array
+        items:
+          type: string
+      files_modified:
+        type: array
+        items:
+          type: string
+      tests_added:
+        type: array
+        items:
+          type: string
+      documentation_updated:
+        type: array
+        items:
+          type: string
+      commit_message:
+        type: string
+      fix_notes:
+        type: string
+      all_issues_resolved:
+        type: boolean
+        description: Whether the fixer believes all issues have been resolved
+      attempt_count:
+        type: number
+        description: How many times the fixer has run (used for escalation)
+    routes:
+      - to: plan_review_parallel
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 9. FIXER ESCALATION GATE (human)
+  # If the fixer ↔ plan_review loop has run too many times, stop spinning
+  # and ask a human what to do. Catches loops where the reviewers and fixer
+  # are stuck disagreeing about something fundamental.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: fixer_escalation_gate
+    type: human_gate
+    description: Escalation when the fixer has been unable to satisfy reviewers within max_fixer_attempts
+    prompt: |
+      The fixer has run {{ fixer.output.attempt_count }} times but the plan reviewers
+      still report issues. This usually means the reviewers and the fixer are stuck
+      disagreeing about something fundamental that needs human judgment.
+
+      **Most recent consolidated review:**
+      {{ merge_plan_feedback.output.stdout }}
+
+      **Most recent fixer notes:**
+      {{ fixer.output.fix_notes }}
+
+      How would you like to proceed?
+    options:
+      - label: Try fixer one more time with my guidance
+        value: retry_with_guidance
+        route: fixer
+        prompt_for: human_guidance
+      - label: Accept the current state and end (override reviewers)
+        value: accept_anyway
+        route: $end
+      - label: Abort
+        value: abort
+        route: $end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKFLOW OUTPUT
+# ─────────────────────────────────────────────────────────────────────────────
+output:
+  plan: "{{ workflow.input.plan }}"
+  epic_requested: "{{ workflow.input.epic | default('all') }}"
+  epics_completed: "{{ committer.output.epic_completed if committer is defined else '' }}"
+  remaining_epics: "{{ committer.output.remaining_epics | json if committer is defined else '[]' }}"
+  all_complete: "{{ committer.output.all_complete if committer is defined else false }}"
+  last_commit: "{{ committer.output.commit_message if committer is defined else '' }}"
+  epic_review_decision: "{{ epic_reviewer.output.decision if epic_reviewer is defined else '' }}"
+  plan_review_decision: "{{ plan_review_parallel.outputs.plan_reviewer.decision if plan_review_parallel is defined else '' }}"
+  adversarial_score: "{{ plan_review_parallel.outputs.plan_adversarial_reviewer.score if plan_review_parallel is defined else '' }}"
+  fixer_attempts: "{{ fixer.output.attempt_count if fixer is defined and fixer.output else 0 }}"
+  iterations: "{{ context.iteration }}"

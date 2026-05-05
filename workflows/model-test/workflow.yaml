@@ -1,0 +1,167 @@
+workflow:
+  name: model-test
+  description: Pings every candidate Copilot model in parallel with a trivial prompt to see which IDs the SDK accepts.
+  entry_point: probe_all
+  version: 0.1.0
+  runtime:
+    provider: copilot
+    timeout: 30
+    max_session_seconds: 30
+  limits:
+    max_iterations: 50
+    timeout_seconds: 180
+
+agents:
+  - name: probe_claude_opus_47
+    model: claude-opus-4.7
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_opus_47_1m
+    model: claude-opus-4.7-1m-internal
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_opus_47_high
+    model: claude-opus-4.7-high
+    reasoning:
+      effort: high
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_opus_47_xhigh
+    model: claude-opus-4.7-xhigh
+    reasoning:
+      effort: xhigh
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_opus_46
+    model: claude-opus-4.6
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_opus_46_1m
+    model: claude-opus-4.6-1m
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_sonnet_46
+    model: claude-sonnet-4.6
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_claude_haiku_45
+    model: claude-haiku-4.5
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_gpt_55
+    model: gpt-5.5
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_gpt_54
+    model: gpt-5.4
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_gpt_53_codex
+    model: gpt-5.3-codex
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_gpt_54_mini
+    model: gpt-5.4-mini
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+  - name: probe_gpt_41
+    model: gpt-4.1
+    system_prompt: "Reply with exactly the word: OK"
+    prompt: "Say OK."
+    output:
+      reply: { type: string }
+    routes: [{ to: $end }]
+
+parallel:
+  - name: probe_all
+    description: Probe all candidate models concurrently; record per-model success/failure.
+    failure_mode: continue_on_error
+    agents:
+      - probe_claude_opus_47
+      - probe_claude_opus_47_1m
+      - probe_claude_opus_47_high
+      - probe_claude_opus_47_xhigh
+      - probe_claude_opus_46
+      - probe_claude_opus_46_1m
+      - probe_claude_sonnet_46
+      - probe_claude_haiku_45
+      - probe_gpt_55
+      - probe_gpt_54
+      - probe_gpt_53_codex
+      - probe_gpt_54_mini
+      - probe_gpt_41
+    routes:
+      - to: $end
+
+output:
+  results: |
+    {% set probes = [
+      'probe_claude_opus_47',
+      'probe_claude_opus_47_1m',
+      'probe_claude_opus_47_high',
+      'probe_claude_opus_47_xhigh',
+      'probe_claude_opus_46',
+      'probe_claude_opus_46_1m',
+      'probe_claude_sonnet_46',
+      'probe_claude_haiku_45',
+      'probe_gpt_55',
+      'probe_gpt_54',
+      'probe_gpt_53_codex',
+      'probe_gpt_54_mini',
+      'probe_gpt_41'
+    ] %}
+    {% for name in probes -%}
+    {% if name in probe_all.outputs -%}
+    PASS  {{ name }} -> {{ probe_all.outputs[name].reply | default('(no reply)') }}
+    {% else -%}
+    FAIL  {{ name }} -> {{ probe_all.errors[name].message | default('(unknown error)') }}
+    {% endif -%}
+    {%- endfor %}

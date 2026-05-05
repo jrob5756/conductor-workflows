@@ -1,0 +1,1081 @@
+# Plan Workflow v3 — Quality-First Restructure
+#
+# This workflow produces a high-quality solution design and implementation plan
+# through a deeply specialized multi-agent pipeline. Each agent is matched to
+# the model best suited for its specific cognitive task.
+#
+# Flow:
+#   purpose_interpreter (GPT-5.5 Xhigh)
+#     ↓
+#   researcher (Claude Opus 4.7 1M)
+#     ↓
+#   designer (Claude Opus 4.7 1M)  ←──── revision loop
+#     ↓
+#   [design_technical_reviewer || design_readability_reviewer || design_adversarial_reviewer]
+#     ↓
+#   merge_design_feedback (script)
+#     ↓ (loops to designer if any reviewer rejects)
+#   design_approval_gate (human)
+#     ↓
+#   planner (Claude Opus 4.7 1M)  ←──── revision loop
+#     ↓
+#   plan_reviewer (GPT-5.5)
+#     ↓
+#   consistency_checker (GPT-5.5 Xhigh)
+#     ↓ (loops to planner if orphans found)
+#   $end
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL IDENTIFIER NOTES
+# ─────────────────────────────────────────────────────────────────────────────
+# Conductor passes model IDs straight through to the GitHub Copilot API.
+# Confirmed-valid identifiers used here:
+#   claude-opus-4.7-1m-internal        (Claude Opus 4.7, 1M context, Internal)
+#   claude-sonnet-4.6
+#
+# Best-guess identifiers (may need adjustment if Copilot rejects them — try
+# each rejected name with the alternates listed):
+#   gpt-5.5                            alts: gpt-5.4
+#   claude-opus-4.7-extra-high         alts: claude-opus-4.7-xhigh,
+#                                            claude-opus-4.7-thinking-high,
+#                                            claude-opus-4.7-extra-high-reasoning
+#
+# If a model is rejected on first run, fall back to claude-opus-4.7 (no suffix)
+# or claude-opus-4.7-1m-internal for the affected agent.
+#
+# Usage:
+#   conductor run workflows/sdd/plan-v3.yaml --input purpose="..."
+#
+#   With explicit output path:
+#   conductor run workflows/sdd/plan-v3.yaml --input purpose="..." \
+#     --input output_path="docs/auth-migration.plan.md"
+
+workflow:
+  name: plan-v3
+  description: Quality-first multi-agent solution design and implementation planning workflow with specialized model selection per cognitive task
+  version: "3.0.0"
+  entry_point: purpose_interpreter
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["search"]
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+      ms-learn:
+        type: http
+        url: https://learn.microsoft.com/api/mcp
+        tools: ["*"]
+
+  input:
+    purpose:
+      type: string
+      required: true
+      description: A clear description of the feature, change, or initiative to design and plan
+    output_path:
+      type: string
+      required: false
+      description: Optional file path for the plan document (e.g. docs/my-feature.plan.md)
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 100
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARALLEL GROUP — Design Review
+# ─────────────────────────────────────────────────────────────────────────────
+parallel:
+  - name: design_review
+    description: Three independent reviewers evaluate the design from disjoint perspectives
+    agents:
+      - design_technical_reviewer
+      - design_readability_reviewer
+      - design_adversarial_reviewer
+    failure_mode: fail_fast
+    routes:
+      - to: merge_design_feedback
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENTS
+# ─────────────────────────────────────────────────────────────────────────────
+agents:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. PURPOSE INTERPRETER (GPT-5.5 Xhigh)
+  # Surfaces ambiguities in the input before downstream agents commit effort.
+  # Xhigh reasoning helps with careful step-by-step analysis of what each
+  # phrase could mean. GPT-5.5's stronger base capability + Xhigh reasoning
+  # is the strongest non-Claude choice in the picker.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: purpose_interpreter
+    description: Interprets the raw purpose input against the repo's high-level structure and surfaces ambiguities before downstream agents commit effort
+    model: gpt-5.5
+    input:
+      - workflow.input.purpose
+    system_prompt: |
+      You are a Requirements Interpreter. Your job is to take a raw human-written
+      "purpose" statement and turn it into a precise, unambiguous specification
+      that downstream agents can build against.
+
+      You scan the repository's top-level structure (READMEs, top-level directories,
+      package manifests, config files) to ground your interpretation in what the
+      project actually is. You do NOT read deep into source code — that is the
+      researcher's job. Your job is breadth, not depth.
+
+      You are especially attentive to:
+      - Ambiguous terms that could mean multiple things in this codebase
+      - Implicit assumptions in the purpose statement
+      - Scope boundaries that the user did not explicitly state
+      - Missing details that will block downstream design work
+    prompt: |
+      Interpret the following purpose statement against this repository's structure.
+
+      **Purpose:** {{ workflow.input.purpose }}
+
+      ---
+
+      ## Phase 1: Repository Scan
+
+      Read the repository's top-level files and directory structure to understand:
+      - What the project is and what it does
+      - What technologies, languages, and frameworks it uses
+      - What the major code areas are
+      - Any project-wide conventions documented in READMEs or contributing guides
+
+      Do NOT read deep into source files — keep your scan broad and shallow.
+
+      ## Phase 2: Interpretation
+
+      Produce a structured interpretation of the purpose:
+
+      1. **Restated Goal**: One paragraph describing what you believe the user
+         is asking for, in your own words, grounded in the repo context.
+
+      2. **Key Terms**: For each non-trivial term in the purpose, define what
+         it most likely means in this specific codebase.
+
+      3. **Scope Boundaries**: What you believe is in-scope and out-of-scope.
+         Be explicit about decisions you are making on the user's behalf.
+
+      4. **Ambiguities**: List every meaningful ambiguity in the purpose
+         statement. For each, list the plausible interpretations and which
+         one you are choosing as the working assumption.
+
+      5. **Assumptions**: Explicit assumptions you are making that the user
+         did not state.
+
+      6. **Open Questions**: Questions a human stakeholder should answer
+         before this work is built. Mark each as BLOCKING or NON-BLOCKING.
+    output:
+      restated_goal:
+        type: string
+        description: One-paragraph restatement of the goal
+      key_terms:
+        type: object
+        description: Map of term to its definition in this codebase
+      scope_in:
+        type: array
+        items:
+          type: string
+        description: Items considered in-scope
+      scope_out:
+        type: array
+        items:
+          type: string
+        description: Items considered out-of-scope
+      ambiguities:
+        type: array
+        items:
+          type: object
+        description: List of ambiguities with chosen interpretation and alternatives
+      assumptions:
+        type: array
+        items:
+          type: string
+        description: Explicit assumptions
+      open_questions:
+        type: array
+        items:
+          type: object
+        description: Open questions with BLOCKING/NON-BLOCKING markers
+    routes:
+      - to: researcher
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. RESEARCHER (Claude Opus 4.7 1M)
+  # Deep codebase + external research. Produces a structured research artifact
+  # that the designer consumes. Separating research from drafting prevents
+  # the architect from cutting research short to start writing.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: researcher
+    description: Performs deep codebase analysis and external research, producing a structured research artifact for the designer to consume
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.purpose
+      - purpose_interpreter.output
+    system_prompt: |
+      You are a Principal Research Engineer. Your job is to thoroughly
+      investigate everything the designer will need to make sound, grounded
+      design decisions — both inside the codebase and externally.
+
+      You do NOT design. You do NOT write the design document. You produce
+      a structured research artifact: facts, citations, patterns, constraints.
+
+      You are especially attentive to:
+      - Existing components, patterns, and conventions in the codebase
+      - Technical debt or constraints that will affect the design
+      - Authoritative external sources for libraries, protocols, and standards
+      - Versions, API names, and exact technical facts (not paraphrases)
+      - Prior art in the codebase that the designer should respect
+    prompt: |
+      Perform thorough research for the following design effort.
+
+      **Purpose:** {{ workflow.input.purpose }}
+
+      **Interpreted Goal:** {{ purpose_interpreter.output.restated_goal }}
+
+      **Key Terms (use these definitions):**
+      {% for term, definition in purpose_interpreter.output.key_terms.items() %}
+      - **{{ term }}**: {{ definition }}
+      {% endfor %}
+
+      **In-Scope:**
+      {% for item in purpose_interpreter.output.scope_in %}
+      - {{ item }}
+      {% endfor %}
+
+      **Out-of-Scope:**
+      {% for item in purpose_interpreter.output.scope_out %}
+      - {{ item }}
+      {% endfor %}
+
+      **Working Assumptions:**
+      {% for assumption in purpose_interpreter.output.assumptions %}
+      - {{ assumption }}
+      {% endfor %}
+
+      ---
+
+      ## Phase 1: Codebase Research
+
+      Deeply explore the relevant portions of the codebase:
+      - Identify every existing component, abstraction, and pattern that is
+        relevant to this design
+      - Map dependencies between components
+      - Document the current architecture and data flow for affected areas
+      - Note technical debt, constraints, or quirks the designer must respect
+      - Cite specific file paths and (where useful) line numbers
+
+      ## Phase 2: External Research
+
+      Use the web-search, context7, and ms-learn MCP tools to research:
+      - Best practices for the technologies and patterns involved
+      - Authoritative documentation for libraries, frameworks, and protocols
+      - Industry standards or conventions that apply
+      - Prior art and similar designs
+
+      Cite every external claim with a URL.
+
+      ## Phase 3: Structured Output
+
+      Produce a research artifact with the following structure. Be specific
+      and cite sources. Do not paraphrase — quote exact API names, version
+      numbers, and file paths.
+
+      Do NOT design or recommend an approach — that is the designer's job.
+      Your output is facts and findings, not opinions.
+    output:
+      codebase_findings:
+        type: object
+        description: |
+          Structured findings from the codebase. Include:
+          - relevant_components: list of {name, file_path, purpose, notes}
+          - existing_patterns: list of {pattern, examples, applicability}
+          - constraints: list of {constraint, source, impact}
+          - technical_debt: list of {issue, file_path, impact}
+      external_findings:
+        type: object
+        description: |
+          Structured findings from external sources. Include:
+          - libraries: list of {name, version, capability, url}
+          - standards: list of {name, summary, url}
+          - prior_art: list of {description, url, relevance}
+          - best_practices: list of {practice, source_url}
+      open_research_questions:
+        type: array
+        items:
+          type: string
+        description: Research questions that could not be definitively answered
+    routes:
+      - to: designer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. DESIGNER (Claude Opus 4.7 1M)
+  # Authors the design document. Consumes research as structured input rather
+  # than re-doing it. 1M context is essential for the revision loop where
+  # prior drafts + consolidated feedback + research artifact all stack.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: designer
+    description: Authors the design document, grounded in the research artifact, and revises in response to consolidated reviewer feedback
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.purpose
+      - workflow.input.output_path?
+      - purpose_interpreter.output
+      - researcher.output
+      - designer.output?
+      - merge_design_feedback.output?
+    system_prompt: |
+      You are a Principal Software Architect. You author clear, high-level
+      technical design documents that are deeply grounded in the codebase
+      and the research provided to you.
+
+      You consume research as structured input. You do NOT redo research —
+      trust the researcher's findings and cite them in your design.
+
+      Your designs are:
+      - High-level but grounded (not abstract hand-waving)
+      - Focused on *what* and *why*; the planner will handle *how*
+      - Honest about trade-offs, risks, and open questions
+      - Structured for engineering and architecture audiences
+    prompt: |
+      {% if designer is defined and designer.output and merge_design_feedback is defined and merge_design_feedback.output %}
+      ## REVISION
+
+      You are revising an existing design based on consolidated reviewer feedback.
+
+      **Existing document:** {{ designer.output.file_path }}
+
+      Read the existing document and revise it to address the feedback below.
+      Preserve content that is satisfactory.
+
+      **Consolidated Feedback:**
+      {{ merge_design_feedback.output.stdout }}
+
+      ---
+      {% endif %}
+
+      Author a design document for the following purpose.
+
+      **Purpose:** {{ workflow.input.purpose }}
+
+      **Interpreted Goal:** {{ purpose_interpreter.output.restated_goal }}
+
+      **Scope Boundaries — In:** {{ purpose_interpreter.output.scope_in | join(', ') }}
+      **Scope Boundaries — Out:** {{ purpose_interpreter.output.scope_out | join(', ') }}
+
+      **Working Assumptions:**
+      {% for assumption in purpose_interpreter.output.assumptions %}
+      - {{ assumption }}
+      {% endfor %}
+
+      ---
+
+      ## Research Artifact (use as your factual basis)
+
+      ### Codebase Findings
+      {{ researcher.output.codebase_findings | tojson(indent=2) }}
+
+      ### External Findings
+      {{ researcher.output.external_findings | tojson(indent=2) }}
+
+      {% if researcher.output.open_research_questions %}
+      ### Open Research Questions
+      {% for q in researcher.output.open_research_questions %}
+      - {{ q }}
+      {% endfor %}
+      {% endif %}
+
+      ---
+
+      ## Design Document Sections
+
+      Write the following sections. This document is design only — the
+      implementation plan is produced by a separate agent.
+
+      1. **Executive Summary** — one paragraph: problem, approach, outcome
+      2. **Background** — current state, motivation, prior art (cite codebase findings)
+      3. **Problem Statement** — specific problems being solved
+      4. **Goals and Non-Goals**
+      5. **Requirements** — functional and non-functional
+      6. **Proposed Design**
+         - Architecture Overview
+         - Key Components (responsibilities and interfaces)
+         - Data Flow
+         - API Contracts (if applicable)
+         - Design Decisions (with rationale)
+      7. **Alternatives Considered** *(optional — include when non-obvious choices exist)*
+      8. **Dependencies** — external, internal, sequencing
+      9. **Impact Analysis** *(optional — include for multi-component changes)*
+      10. **Security Considerations** *(optional — include when relevant)*
+      11. **Risks and Mitigations** *(optional — include for meaningful risks)*
+      12. **Open Questions** — items needing further input
+      13. **References** — links to research sources
+
+      Ground every claim in the research artifact or cite a specific source.
+      Avoid aspirational language. If something is uncertain, call it out as
+      an open question.
+
+      ---
+
+      ## REVISION NOTES
+
+      {% if designer is defined and designer.output and merge_design_feedback is defined and merge_design_feedback.output %}
+      Provide a concise summary of what you changed and why in `revision_notes`.
+      Structure it as a bullet list.
+      {% else %}
+      Set `revision_notes` to "Initial draft."
+      {% endif %}
+
+      ---
+
+      ## SAVING THE DOCUMENT
+
+      {% if workflow.input.output_path %}
+      Save the design document to: `{{ workflow.input.output_path | replace('.plan.md', '.design.md') }}`
+      {% else %}
+      Choose a file path:
+      - If purpose references an existing document, derive the name and save
+        in the same directory (e.g. `feature-x.brainstorm.md` → `feature-x.design.md`)
+      - Otherwise, save in the current working directory as
+        `[descriptive-slug].design.md`
+      {% endif %}
+    output:
+      file_path:
+        type: string
+        description: The path where the design document was saved
+      revision_notes:
+        type: string
+        description: Summary of changes made in this revision
+    routes:
+      - to: design_review
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. DESIGN TECHNICAL REVIEWER (Claude Opus 4.7 1M)
+  # Fact-checks the design against the codebase. Needs 1M context to actually
+  # load source files for verification.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: design_technical_reviewer
+    description: Fact-checks the design against the codebase and external sources
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.purpose
+      - purpose_interpreter.output
+      - researcher.output
+      - designer.output.file_path
+      - designer.output.revision_notes
+    system_prompt: |
+      You are a Senior Engineering Reviewer. You verify that the design
+      is technically accurate and grounded in the actual codebase.
+
+      You read the design, then independently verify its claims by reading
+      source files and external documentation. You do NOT evaluate writing
+      style or document structure — that is a separate reviewer's job.
+    prompt: |
+      Review the design document for **technical accuracy and grounding**.
+
+      **Design Location:** {{ designer.output.file_path }}
+
+      **Original Purpose:** {{ workflow.input.purpose }}
+
+      **Interpreted Goal:** {{ purpose_interpreter.output.restated_goal }}
+
+      Read the design document. Independently verify its technical claims:
+      - Read source files referenced in the design
+      - Verify API names, version numbers, and library capabilities
+      - Confirm that the described current state matches the codebase
+      - Confirm that the proposed design is feasible given the existing system
+
+      You may use the researcher's findings as a starting point, but you must
+      independently verify rather than trust.
+
+      ## Evaluation Criteria
+
+      | Criterion | Description |
+      |-----------|-------------|
+      | Technical Accuracy | Are technical claims, versions, and APIs correct? |
+      | Codebase Grounding | Is the design grounded in actual code, not aspirational? |
+      | Completeness | Are all aspects of the problem addressed? |
+      | Design Soundness | Are the architectural decisions well-reasoned? |
+      | Alternatives Analysis | Were alternatives fairly evaluated? |
+      | Feasibility | Can this be implemented given the existing system? |
+      | Simplicity | Is this the minimum viable design? Flag unnecessary complexity. |
+      | Assumption Transparency | Are assumptions stated? Are ambiguities flagged? |
+
+      Do NOT evaluate writing style, structure, or formatting.
+
+      Provide:
+      1. Score 0-100
+      2. Approved if score >= 90
+      3. Specific feedback on technical issues
+      4. List of critical technical issues
+    output:
+      score:
+        type: number
+      approved:
+        type: boolean
+      feedback:
+        type: string
+      critical_issues:
+        type: array
+        items:
+          type: string
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. DESIGN READABILITY REVIEWER (GPT-5.5)
+  # Cross-family reviewer. Catches Claude-isms (over-hedging, repetitive
+  # parallel constructions) that another Claude model would gloss over.
+  # GPT-5.5's stronger base capability matters more than reasoning depth for
+  # editorial judgment on a single document.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: design_readability_reviewer
+    description: Reviews the design for structure, clarity, and readability — uses a different model family to catch Claude-specific writing patterns
+    model: gpt-5.5
+    input:
+      - workflow.input.purpose
+      - designer.output.file_path
+      - designer.output.revision_notes
+    system_prompt: |
+      You are a Senior Technical Writer. You evaluate design documents for
+      structure, clarity, audience fit, and readability. You do NOT evaluate
+      technical correctness — that is handled by a separate reviewer.
+
+      Be especially attentive to:
+      - Vague or hedging language that obscures meaning
+      - Repetitive sentence structures (rule-of-three, parallel constructions)
+      - Filler phrases that add no information
+      - Sections that bury the lead or wander from their stated topic
+      - Inconsistent voice or detail level across sections
+    prompt: |
+      Review the design document for **structure, clarity, and readability**.
+
+      **Design Location:** {{ designer.output.file_path }}
+
+      **Original Purpose:** {{ workflow.input.purpose }}
+
+      Read the design document. The audience is engineers and architects
+      who will review this design and decide whether to proceed.
+
+      ## Expected Structure
+
+      1. Executive Summary, 2. Background, 3. Problem Statement,
+      4. Goals/Non-Goals, 5. Requirements, 6. Proposed Design,
+      7. Alternatives Considered (optional), 8. Dependencies,
+      9. Impact Analysis (optional), 10. Security (optional),
+      11. Risks (optional), 12. Open Questions, 13. References.
+
+      ## Evaluation Criteria
+
+      | Criterion | Description |
+      |-----------|-------------|
+      | Document Structure | Logical organization and section flow |
+      | Clarity | Precise, unambiguous language |
+      | Audience Fit | Appropriate detail for engineers and architects |
+      | Decision Framing | Are decisions and trade-offs clearly framed? |
+      | Cohesion | Does it read as a unified work? |
+      | Formatting | Effective use of tables, lists, code references |
+      | Executive Summary | Conveys problem, approach, outcome in one paragraph |
+      | Concision | Free of filler, hedging, and redundancy |
+
+      Do NOT evaluate technical accuracy.
+
+      Provide:
+      1. Score 0-100
+      2. Approved if score >= 90
+      3. Specific feedback on structure and clarity
+      4. List of critical readability issues
+    output:
+      score:
+        type: number
+      approved:
+        type: boolean
+      feedback:
+        type: string
+      critical_issues:
+        type: array
+        items:
+          type: string
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 6. DESIGN ADVERSARIAL REVIEWER (Claude Opus 4.7 Extra High Reasoning)
+  # Tries to break the design. Pure deep-reasoning task on a single document —
+  # the perfect use case for Extra High Reasoning, where giving up the 1M
+  # window is acceptable because input is bounded.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: design_adversarial_reviewer
+    description: Attempts to break the design — finds unconsidered failure modes, edge cases, hidden assumptions, and second-order effects
+    model: claude-opus-4.7
+    reasoning:
+      effort: xhigh
+    input:
+      - workflow.input.purpose
+      - designer.output.file_path
+      - designer.output.revision_notes
+    system_prompt: |
+      You are an Adversarial Design Reviewer. Your job is NOT to evaluate
+      the design — it is to TRY TO BREAK IT.
+
+      You think like a senior engineer reviewing a proposal who suspects
+      the author has missed something important. You think like an SRE
+      reading the design at 3am during an incident. You think like a
+      security reviewer looking for what could go wrong.
+
+      You assume the design is wrong somewhere and your job is to find where.
+
+      You are especially attentive to:
+      - Failure modes the design does not address
+      - Edge cases the design implicitly assumes away
+      - Hidden assumptions that could turn out to be false
+      - Second-order effects on other parts of the system
+      - Operational failures (deployment, monitoring, debugging gaps)
+      - Concurrency, ordering, and consistency hazards
+      - Backward compatibility breaks
+      - Performance pathologies under load or with adversarial inputs
+      - Security implications the author may not have considered
+      - Scope creep risks that will cause the design to fail to ship
+    prompt: |
+      Attempt to break this design. Find what is wrong with it.
+
+      **Design Location:** {{ designer.output.file_path }}
+
+      **Original Purpose:** {{ workflow.input.purpose }}
+
+      Read the design carefully. Then attack it from every angle you can.
+
+      For each weakness you identify, provide:
+      - **Weakness**: precise description of what is wrong or missing
+      - **Why it matters**: the failure mode this enables
+      - **Severity**: CRITICAL / HIGH / MEDIUM / LOW
+      - **Suggested mitigation**: how the design should be revised
+
+      Be specific and concrete. "The design should consider security" is not
+      useful. "The design fails to specify how token revocation propagates
+      to in-flight requests, which means a revoked token remains valid for
+      up to N seconds during a session lifetime" is useful.
+
+      Categorize your findings:
+      - Failure modes
+      - Edge cases
+      - Hidden assumptions
+      - Second-order effects
+      - Operational concerns
+      - Concurrency / consistency hazards
+      - Backward compatibility
+      - Performance pathologies
+      - Security
+      - Scope / shipability
+
+      ## Approval
+
+      You approve the design (score >= 90) only if you cannot identify any
+      CRITICAL or HIGH severity weaknesses. Be honest — this agent's value
+      depends on your willingness to find problems.
+
+      Provide:
+      1. Score 0-100 (lower if more / more severe weaknesses found)
+      2. Approved if no CRITICAL or HIGH weaknesses
+      3. Detailed feedback consolidating all weaknesses
+      4. List of critical issues (CRITICAL and HIGH severity items)
+    output:
+      score:
+        type: number
+      approved:
+        type: boolean
+      feedback:
+        type: string
+      critical_issues:
+        type: array
+        items:
+          type: string
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 7. MERGE DESIGN FEEDBACK (script — no LLM)
+  # Deterministic aggregation. Eliminates an LLM failure mode — the consolidated
+  # feedback is exactly what the reviewers said, with no risk of the merging
+  # agent reinterpreting or losing critical issues.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: merge_design_feedback
+    type: script
+    description: Aggregates the three reviewers' outputs into a structured revision request
+    input:
+      - design_review.outputs
+    command: bash
+    args:
+      - "-c"
+      - |
+        cat <<'EOF'
+        ## Consolidated Design Review
+
+        ### Technical Reviewer (score: {{ design_review.outputs.design_technical_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_technical_reviewer.approved else "REJECTED" }})
+
+        {{ design_review.outputs.design_technical_reviewer.feedback }}
+
+        Critical issues:
+        {% for issue in design_review.outputs.design_technical_reviewer.critical_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        ---
+
+        ### Readability Reviewer (score: {{ design_review.outputs.design_readability_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_readability_reviewer.approved else "REJECTED" }})
+
+        {{ design_review.outputs.design_readability_reviewer.feedback }}
+
+        Critical issues:
+        {% for issue in design_review.outputs.design_readability_reviewer.critical_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        ---
+
+        ### Adversarial Reviewer (score: {{ design_review.outputs.design_adversarial_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_adversarial_reviewer.approved else "REJECTED" }})
+
+        {{ design_review.outputs.design_adversarial_reviewer.feedback }}
+
+        Critical issues:
+        {% for issue in design_review.outputs.design_adversarial_reviewer.critical_issues %}
+        - {{ issue }}
+        {% endfor %}
+
+        ---
+
+        ### Aggregate Status
+
+        All three reviewers approved: {{ "YES" if (design_review.outputs.design_technical_reviewer.approved and design_review.outputs.design_readability_reviewer.approved and design_review.outputs.design_adversarial_reviewer.approved) else "NO" }}
+        EOF
+    routes:
+      - to: design_approval_gate
+        when: "{{ design_review.outputs.design_technical_reviewer.approved and design_review.outputs.design_readability_reviewer.approved and design_review.outputs.design_adversarial_reviewer.approved }}"
+      - to: designer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 8. DESIGN APPROVAL GATE (human)
+  # Human steering at the design/plan boundary. Catches misinterpretations of
+  # purpose that no LLM iteration will fix. Cheap insurance.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: design_approval_gate
+    type: human_gate
+    description: Human approval of the design before planning effort begins
+    prompt: |
+      The design has been approved by all three automated reviewers.
+
+      **Design document:** {{ designer.output.file_path }}
+
+      Please review the design before planning begins. After planning starts,
+      changes to the design require redoing the plan.
+
+      How would you like to proceed?
+    options:
+      - label: Approve — proceed to planning
+        value: approve
+        route: planner
+      - label: Request revisions — send back to designer with my feedback
+        value: revise
+        route: designer
+        prompt_for: feedback
+      - label: Abort
+        value: abort
+        route: $end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 9. PLANNER (Claude Opus 4.7 1M)
+  # Produces the implementation plan against the now-finalized design.
+  # Needs codebase access to enumerate affected files accurately.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: planner
+    description: Produces the implementation plan grounded in the approved design and the codebase
+    model: claude-opus-4.7-1m-internal
+    input:
+      - workflow.input.purpose
+      - workflow.input.output_path?
+      - designer.output.file_path
+      - planner.output?
+      - plan_reviewer.output?
+      - consistency_checker.output?
+    system_prompt: |
+      You are a Principal Engineer producing the implementation plan for an
+      already-approved design. The design is settled — do NOT revisit design
+      decisions. Your job is to break the design into actionable epics and
+      tasks that a developer or AI agent can execute.
+
+      You ground the plan in the actual codebase: enumerate affected files
+      accurately, sequence epics by their dependencies, and make every task
+      concrete enough to execute.
+    prompt: |
+      {% if planner is defined and planner.output and ((plan_reviewer is defined and plan_reviewer.output) or (consistency_checker is defined and consistency_checker.output)) %}
+      ## REVISION
+
+      You are revising an existing plan based on reviewer feedback.
+
+      {% if plan_reviewer is defined and plan_reviewer.output and not plan_reviewer.output.approved %}
+      **Plan Reviewer Feedback (score: {{ plan_reviewer.output.score }}):**
+      {{ plan_reviewer.output.feedback }}
+
+      Critical issues:
+      {% for issue in plan_reviewer.output.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% endif %}
+
+      {% if consistency_checker is defined and consistency_checker.output and not consistency_checker.output.passed %}
+      **Consistency Checker Findings:**
+
+      Orphan requirements (in design but not in plan):
+      {% for orphan in consistency_checker.output.orphan_requirements %}
+      - {{ orphan }}
+      {% endfor %}
+
+      Orphan tasks (in plan but not traceable to design):
+      {% for orphan in consistency_checker.output.orphan_tasks %}
+      - {{ orphan }}
+      {% endfor %}
+      {% endif %}
+
+      Read the existing plan at `{{ planner.output.file_path }}` and revise
+      it. Preserve content that is satisfactory.
+
+      ---
+      {% endif %}
+
+      Produce an implementation plan for the approved design.
+
+      **Design document:** {{ designer.output.file_path }}
+
+      Read the design document carefully. The design is approved — do NOT
+      revisit design decisions. Your job is to plan its implementation.
+
+      ## Plan Sections
+
+      1. **Implementation Phases** — break implementation into logical phases
+         with exit criteria
+
+      2. **Files Affected**
+
+         #### New Files
+         | File Path | Purpose |
+         |-----------|---------|
+
+         #### Modified Files
+         | File Path | Changes |
+         |-----------|---------|
+
+         #### Deleted Files
+         | File Path | Reason |
+         |-----------|--------|
+
+         Enumerate accurately by examining the codebase.
+
+      3. **Implementation Plan**
+
+         For each epic:
+         - **ID**: e.g. EPIC-1
+         - **Goal**: what this epic achieves (link to a design requirement)
+         - **Prerequisites**: dependencies on other epics
+         - **Tasks**: table with Task ID, Type (IMPL/TEST), Description, Files, Status (TO DO/IN PROGRESS/DONE)
+         - **Acceptance Criteria**: checkboxes
+         - **Traces to design section(s)**: cite specific design sections
+
+         Constraints:
+         - Each epic should affect ≤ 7 files
+         - Each epic should be completable in 1-2 weeks
+         - Tests are created alongside implementation tasks
+         - Every task must trace to a design requirement
+
+      ## REVISION NOTES
+
+      {% if planner is defined and planner.output %}
+      Provide a concise summary of what you changed and why in `revision_notes`.
+      {% else %}
+      Set `revision_notes` to "Initial draft."
+      {% endif %}
+
+      ## SAVING THE DOCUMENT
+
+      {% if workflow.input.output_path %}
+      Save the plan to: `{{ workflow.input.output_path }}`
+      {% else %}
+      Choose a file path adjacent to the design document, using the convention:
+      - `[design-name].design.md` → `[design-name].plan.md`
+      {% endif %}
+    output:
+      file_path:
+        type: string
+        description: The path where the plan document was saved
+      revision_notes:
+        type: string
+        description: Summary of changes made in this revision
+    routes:
+      - to: plan_reviewer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 10. PLAN REVIEWER (GPT-5.5)
+  # Cross-family review. Single-document task focused on plan structure,
+  # scoping, and sequencing. GPT-5.5 has the strongest base capability of
+  # any non-Claude option in the picker.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: plan_reviewer
+    description: Reviews the implementation plan for scoping, sequencing, and actionability
+    model: gpt-5.5
+    input:
+      - workflow.input.purpose
+      - designer.output.file_path
+      - planner.output.file_path
+      - planner.output.revision_notes
+    system_prompt: |
+      You are a Senior Engineering Manager reviewing implementation plans.
+      You evaluate whether the plan is scoped correctly, sequenced correctly,
+      and actionable enough that a developer or AI agent can execute it
+      without ambiguity.
+
+      You do NOT evaluate the design — that has been approved.
+    prompt: |
+      Review the implementation plan.
+
+      **Plan Location:** {{ planner.output.file_path }}
+      **Design Location (for reference):** {{ designer.output.file_path }}
+
+      Read both documents. Evaluate the plan against the following criteria.
+
+      ## Evaluation Criteria
+
+      | Criterion | Description |
+      |-----------|-------------|
+      | Epic Scoping | Each epic ≤ 7 files, completable in 1-2 weeks |
+      | Sequencing | Prerequisites are correct; no circular dependencies |
+      | Actionability | Tasks concrete enough to execute without further questions |
+      | File Accuracy | Affected files list matches what the tasks would touch |
+      | Test Coverage | Tests are created alongside implementation, not afterthought |
+      | Traceability | Every task traces to a specific design requirement |
+      | Granularity | Tasks are neither too coarse nor too fine-grained |
+      | Risk Sequencing | High-risk work is sequenced early so failure surfaces fast |
+
+      Provide:
+      1. Score 0-100
+      2. Approved if score >= 90
+      3. Specific feedback
+      4. List of critical issues
+    output:
+      score:
+        type: number
+      approved:
+        type: boolean
+      feedback:
+        type: string
+      critical_issues:
+        type: array
+        items:
+          type: string
+    routes:
+      - to: consistency_checker
+        when: "{{ output.approved }}"
+      - to: planner
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 11. CONSISTENCY CHECKER (GPT-5.5 Xhigh)
+  # Cross-document mechanical verification. Xhigh reasoning helps catch
+  # "did I miss any orphan" failures that a less careful model would skim
+  # past. Cross-family vs the Claude-authored design and plan also breaks
+  # same-family blind spots.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: consistency_checker
+    description: Verifies bidirectional traceability between design and plan — every requirement maps to tasks, every task traces to a requirement
+    model: gpt-5.5
+    input:
+      - designer.output.file_path
+      - planner.output.file_path
+    system_prompt: |
+      You are a Consistency Checker. You verify mechanical, cross-document
+      traceability between a design and its implementation plan.
+
+      You do NOT evaluate quality, soundness, or readability. You verify
+      that every design requirement is implemented by at least one plan
+      task, and that every plan task traces to at least one design element.
+    prompt: |
+      Verify traceability between the design and the plan.
+
+      **Design:** {{ designer.output.file_path }}
+      **Plan:** {{ planner.output.file_path }}
+
+      Read both documents in full.
+
+      ## Step 1 — Extract design elements
+
+      From the design, extract:
+      - Every requirement (functional and non-functional)
+      - Every component listed in Proposed Design
+      - Every API contract / interface
+      - Every dependency
+      - Every risk that has a mitigation requiring implementation
+
+      ## Step 2 — Extract plan elements
+
+      From the plan, extract:
+      - Every epic
+      - Every task within each epic
+      - Every file in the Files Affected section
+
+      ## Step 3 — Check bidirectional traceability
+
+      **Design → Plan:** For each design element from Step 1, identify the
+      epic(s) and task(s) that implement it. List anything with no plan coverage
+      as an "orphan requirement".
+
+      **Plan → Design:** For each task from Step 2, identify the design
+      element(s) it traces to. List anything that doesn't trace as an
+      "orphan task".
+
+      ## Step 4 — Output
+
+      Provide:
+      - `passed`: true iff there are zero orphan requirements AND zero orphan tasks
+      - `orphan_requirements`: list of design elements with no plan coverage
+      - `orphan_tasks`: list of plan tasks that don't trace to the design
+      - `summary`: one paragraph summary of findings
+    output:
+      passed:
+        type: boolean
+        description: True iff no orphan requirements and no orphan tasks
+      orphan_requirements:
+        type: array
+        items:
+          type: string
+        description: Design requirements with no corresponding plan task
+      orphan_tasks:
+        type: array
+        items:
+          type: string
+        description: Plan tasks that don't trace to a design element
+      summary:
+        type: string
+        description: One paragraph summary
+    routes:
+      - to: $end
+        when: "{{ output.passed }}"
+      - to: planner
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKFLOW OUTPUT
+# ─────────────────────────────────────────────────────────────────────────────
+output:
+  purpose: "{{ workflow.input.purpose }}"
+  design_file: "{{ designer.output.file_path }}"
+  plan_file: "{{ planner.output.file_path }}"
+  restated_goal: "{{ purpose_interpreter.output.restated_goal }}"
+  ambiguities_count: "{{ purpose_interpreter.output.ambiguities | length }}"
+  design_technical_score: "{{ design_review.outputs.design_technical_reviewer.score }}"
+  design_readability_score: "{{ design_review.outputs.design_readability_reviewer.score }}"
+  design_adversarial_score: "{{ design_review.outputs.design_adversarial_reviewer.score }}"
+  plan_review_score: "{{ plan_reviewer.output.score }}"
+  consistency_passed: "{{ consistency_checker.output.passed }}"
+  iterations: "{{ context.iteration }}"
