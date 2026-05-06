@@ -2,28 +2,21 @@ workflows:
   qa-bot:
     description: "Simple question-answering workflow with a single agent"
     path: workflows/qa-bot/workflow.yaml
-    versions: ["1.0.0", "1.0.1"]
   summarizer:
     description: "Two-stage summarizer — draft then refine"
     path: workflows/summarizer/workflow.yaml
-    versions: ["1.0.0", "1.0.1"]
   code-review:
     description: "Multi-agent code review with reviewer and critic"
     path: workflows/code-review/workflow.yaml
-    versions: ["1.0.0", "1.0.1"]
   sdd-plan:
     description: "Solution design + implementation plan with technical and readability review cycles"
     path: workflows/sdd/plan.yaml
-    versions: ["2.0.0"]
   sdd-plan-v3:
     description: "Quality-first multi-agent solution design and implementation planning workflow with specialized model selection per cognitive task"
     path: workflows/sdd/plan-v3.yaml
-    versions: ["2.0.0"]
   sdd-implement:
     description: "Implement a feature based on an implementation plan document, with epic-level and plan-level review"
     path: workflows/sdd/implement.yaml
-    versions: ["2.0.0"]
   sdd-implement-v3:
     description: "Quality-first multi-agent implementation workflow with adversarial plan-level review and bounded fixer escalation"
     path: workflows/sdd/implement-v3.yaml
-    versions: ["2.0.0"]
