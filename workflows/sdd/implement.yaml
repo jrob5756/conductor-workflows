@@ -168,6 +168,8 @@ agents:
   - name: coder
     description: Implements code changes for a single epic
     model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
     input:
       - workflow.input.plan
       - epic_selector.output
@@ -279,7 +281,9 @@ agents:
 
   - name: epic_reviewer
     description: Reviews the implementation for a single epic
-    model: claude-sonnet-4.6
+    model: gpt-5.5
+    reasoning:
+      effort: medium
     input:
       - coder.output
     system_prompt: |
@@ -477,6 +481,8 @@ agents:
   - name: plan_reviewer
     description: Reviews the entire implementation plan and all commits holistically
     model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: xhigh
     input:
       - workflow.input.plan
       - epic_selector.output
@@ -591,7 +597,9 @@ agents:
 
   - name: fixer
     description: Fixes issues identified by the plan reviewer
-    model: claude-sonnet-4.6
+    model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
     input:
       - workflow.input.plan
       - coder.output

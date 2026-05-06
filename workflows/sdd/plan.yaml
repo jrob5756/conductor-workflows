@@ -69,6 +69,8 @@ agents:
   - name: architect
     description: Researches the codebase and broader context, then authors a solution design document with actionable implementation plan
     model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
     input:
       - workflow.input.purpose
       - workflow.input.output_path?
@@ -314,6 +316,8 @@ agents:
   - name: technical_reviewer
     description: Reviews the plan document for technical accuracy, feasibility, and completeness
     model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
     input:
       - workflow.input.purpose
       - architect.output.file_path
@@ -414,7 +418,9 @@ agents:
 
   - name: readability_reviewer
     description: Reviews the plan document for structure, clarity, and readability
-    model: claude-opus-4.7-1m-internal
+    model: gpt-5.5
+    reasoning:
+      effort: medium
     input:
       - workflow.input.purpose
       - architect.output.file_path

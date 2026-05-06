@@ -61,6 +61,11 @@ workflow:
 
   runtime:
     provider: copilot
+    # Per-agent wall-clock cap. Default is 1800s (30 min) which is too tight
+    # for the heavy implementation agents on real codebases (coder / fixer /
+    # plan_reviewer / plan_adversarial_reviewer) — most of the budget goes
+    # to tool calls (file reads, edits, web search, codebase enumeration).
+    max_session_seconds: 3600
     mcp_servers:
       web-search:
         command: npx

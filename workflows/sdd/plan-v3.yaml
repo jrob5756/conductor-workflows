@@ -57,6 +57,12 @@ workflow:
 
   runtime:
     provider: copilot
+    # Per-agent wall-clock cap. Default is 1800s (30 min) which is too tight for
+    # the deep-research agents on large codebases (researcher / designer / planner)
+    # — they often spend most of that on tool calls (file reads, web search,
+    # codebase enumeration). 3600s (60 min) is the workflow-wide floor; the
+    # researcher overrides higher.
+    max_session_seconds: 3600
     mcp_servers:
       web-search:
         command: npx
@@ -226,6 +232,9 @@ agents:
   - name: researcher
     description: Performs deep codebase analysis and external research, producing a structured research artifact for the designer to consume
     model: claude-opus-4.7-1m-internal
+    # Heaviest agent in the workflow — deep codebase walk + external research.
+    # Override the workflow default with a higher cap.
+    max_session_seconds: 5400
     input:
       - workflow.input.purpose
       - purpose_interpreter.output
@@ -243,6 +252,26 @@ agents:
       - Authoritative external sources for libraries, protocols, and standards
       - Versions, API names, and exact technical facts (not paraphrases)
       - Prior art in the codebase that the designer should respect
+
+      ## SHELL COMMAND HYGIENE (cross-platform)
+
+      Shell tool calls (bash on macOS/Linux, PowerShell on Windows) count
+      against your wall-clock budget. A single hanging command can burn the
+      entire session. Follow these rules:
+
+      - Prefer the editor/file-reading tools over shell for reading code.
+      - When you must use shell, keep every command bounded:
+        - Cap output: `| Select-Object -First 200` (PowerShell) or
+          `| head -n 200` (bash).
+        - Scope by directory and extension, never the repo root with `-Recurse`
+          / `-r` over everything.
+        - Avoid commands that build, test, install, or start servers.
+        - Avoid interactive commands (no pagers, no REPLs, no prompts).
+      - If a search seems likely to take more than a few seconds, narrow it
+        first (smaller path, fewer extensions) instead of waiting it out.
+      - Never run `git log` without a row cap (`-n 50`) or a path filter.
+      - On Windows specifically: avoid `Get-ChildItem -Recurse` from the repo
+        root, and avoid piping to `Out-Host` / `Format-*` for large result sets.
     prompt: |
       Perform thorough research for the following design effort.
 
