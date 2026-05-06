@@ -350,12 +350,20 @@ agents:
 
       Provide your decision: APPROVE or REQUEST_CHANGES.
 
+      The `decision` output field MUST be a single plain string — either the
+      literal string "APPROVE" or the literal string "REQUEST_CHANGES". Do
+      NOT return an object, nested fields, or any other structure for this
+      field.
+
       If REQUEST_CHANGES, provide specific, actionable feedback.
       If changes include scope creep (untraced modifications), this alone is grounds for REQUEST_CHANGES.
     output:
       decision:
         type: string
-        description: Review decision - APPROVE or REQUEST_CHANGES
+        description: |
+          Review decision — a single plain string with one of two exact values:
+          "APPROVE" or "REQUEST_CHANGES". Do NOT return an object or nested
+          fields — just one string.
       feedback:
         type: string
         description: Detailed feedback on the implementation
@@ -563,11 +571,19 @@ agents:
 
       Provide your decision: APPROVE or REQUEST_CHANGES.
 
+      The `decision` output field MUST be a single plain string — either the
+      literal string "APPROVE" or the literal string "REQUEST_CHANGES". Do
+      NOT return an object, nested fields, or any other structure for this
+      field.
+
       If REQUEST_CHANGES, provide specific issues that need to be fixed.
     output:
       decision:
         type: string
-        description: Review decision - APPROVE or REQUEST_CHANGES
+        description: |
+          Review decision — a single plain string with one of two exact values:
+          "APPROVE" or "REQUEST_CHANGES". Do NOT return an object or nested
+          fields — just one string.
       feedback:
         type: string
         description: Detailed holistic feedback on the implementation
