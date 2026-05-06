@@ -11,7 +11,8 @@
 #       (fixer does real implementation work; was under-modeled)
 #   - Added plan_adversarial_reviewer (Opus 4.7 Extra High Reasoning)
 #       (actively tries to break the integrated implementation)
-#   - Added merge_plan_feedback script to consolidate plan-level reviewer outputs
+#   - Plan-level reviewer outputs are consolidated inline by the fixer and
+#       escalation gate (no shell script — keeps the workflow cross-platform)
 #   - Added fixer attempt counter + fixer_escalation_gate (human)
 #       (prevents the fixer ↔ plan_review loop from spinning forever)
 #
@@ -25,8 +26,6 @@
 #   committer (Sonnet 4.6)
 #     ↓ (loops to epic_selector if more epics)
 #   [plan_reviewer (Opus 4.7 1M) || plan_adversarial_reviewer (Opus 4.7 Xhigh)]
-#     ↓
-#   merge_plan_feedback (script)
 #     ↓ (approved → $end)
 #     ↓ (rejected & attempts < 3 → fixer)
 #     ↓ (rejected & attempts >= 3 → fixer_escalation_gate)
@@ -112,7 +111,11 @@ parallel:
       - plan_adversarial_reviewer
     failure_mode: fail_fast
     routes:
-      - to: merge_plan_feedback
+      - to: $end
+        when: "{{ plan_review_parallel.outputs.plan_reviewer.approved and plan_review_parallel.outputs.plan_adversarial_reviewer.approved }}"
+      - to: fixer_escalation_gate
+        when: "{{ fixer is defined and fixer.output and (fixer.output.attempt_count | default(0)) >= (workflow.input.max_fixer_attempts | default(3)) }}"
+      - to: fixer
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENTS
@@ -763,79 +766,16 @@ agents:
           type: string
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 7. MERGE PLAN FEEDBACK (script — no LLM)
-  # Deterministic aggregation of the two reviewers. Also tracks the fixer
-  # attempt count so we can escalate to a human after N tries.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: merge_plan_feedback
-    type: script
-    description: Aggregates plan_reviewer + plan_adversarial_reviewer outputs and routes based on approval and fixer attempt count
-    input:
-      - plan_review_parallel.outputs
-      - fixer.output?
-    command: bash
-    args:
-      - "-c"
-      - |
-        cat <<'EOF'
-        ## Consolidated Plan Review
-
-        ### Holistic Reviewer ({{ "APPROVED" if plan_review_parallel.outputs.plan_reviewer.approved else "REJECTED" }})
-
-        {{ plan_review_parallel.outputs.plan_reviewer.feedback }}
-
-        Architecture issues:
-        {% for issue in plan_review_parallel.outputs.plan_reviewer.architecture_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        Code issues:
-        {% for issue in plan_review_parallel.outputs.plan_reviewer.code_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        Documentation issues:
-        {% for issue in plan_review_parallel.outputs.plan_reviewer.documentation_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        Test gaps:
-        {% for gap in plan_review_parallel.outputs.plan_reviewer.test_gaps %}
-        - {{ gap }}
-        {% endfor %}
-
-        ---
-
-        ### Adversarial Reviewer (score: {{ plan_review_parallel.outputs.plan_adversarial_reviewer.score }} — {{ "APPROVED" if plan_review_parallel.outputs.plan_adversarial_reviewer.approved else "REJECTED" }})
-
-        {{ plan_review_parallel.outputs.plan_adversarial_reviewer.feedback }}
-
-        Critical issues:
-        {% for issue in plan_review_parallel.outputs.plan_adversarial_reviewer.critical_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        ---
-
-        ### Aggregate Status
-
-        Both reviewers approved: {{ "YES" if (plan_review_parallel.outputs.plan_reviewer.approved and plan_review_parallel.outputs.plan_adversarial_reviewer.approved) else "NO" }}
-
-        Fixer attempt count: {{ (fixer.output.attempt_count | default(0)) if fixer is defined and fixer.output else 0 }}
-        Max fixer attempts: {{ workflow.input.max_fixer_attempts | default(3) }}
-        EOF
-    routes:
-      - to: $end
-        when: "{{ plan_review_parallel.outputs.plan_reviewer.approved and plan_review_parallel.outputs.plan_adversarial_reviewer.approved }}"
-      - to: fixer_escalation_gate
-        when: "{{ fixer is defined and fixer.output and (fixer.output.attempt_count | default(0)) >= (workflow.input.max_fixer_attempts | default(3)) }}"
-      - to: fixer
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 8. FIXER (Claude Opus 4.7 1M) — UPGRADED FROM SONNET
+  # 7. FIXER (Claude Opus 4.7 1M) — UPGRADED FROM SONNET
   # The fixer does real implementation work: architecture fixes, test additions,
   # code-quality fixes across multiple files. Was under-modeled at Sonnet in v2.
-  # Tracks attempt_count so the merge_plan_feedback router can escalate.
+  # Tracks attempt_count so the plan_review_parallel router can escalate.
+  #
+  # Routing decision (approved → $end, attempts exhausted → escalation gate,
+  # otherwise → fixer) lives on the plan_review_parallel group. The fixer
+  # and the escalation gate assemble consolidated reviewer feedback inline
+  # from `plan_review_parallel.outputs` — no shell script needed, which keeps
+  # the workflow cross-platform (no bash dependency).
   # ───────────────────────────────────────────────────────────────────────────
   - name: fixer
     description: Fixes issues identified by the plan reviewer and adversarial reviewer
@@ -844,7 +784,6 @@ agents:
       - workflow.input.plan
       - coder.output?
       - plan_review_parallel.outputs
-      - merge_plan_feedback.output
       - fixer.output?
     system_prompt: |
       You are a Senior Software Engineer specializing in fixing issues identified
@@ -981,7 +920,45 @@ agents:
       disagreeing about something fundamental that needs human judgment.
 
       **Most recent consolidated review:**
-      {{ merge_plan_feedback.output.stdout }}
+
+      ### Holistic Reviewer ({{ "APPROVED" if plan_review_parallel.outputs.plan_reviewer.approved else "REJECTED" }})
+
+      {{ plan_review_parallel.outputs.plan_reviewer.feedback }}
+
+      Architecture issues:
+      {% for issue in plan_review_parallel.outputs.plan_reviewer.architecture_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Code issues:
+      {% for issue in plan_review_parallel.outputs.plan_reviewer.code_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Documentation issues:
+      {% for issue in plan_review_parallel.outputs.plan_reviewer.documentation_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Test gaps:
+      {% for gap in plan_review_parallel.outputs.plan_reviewer.test_gaps %}
+      - {{ gap }}
+      {% endfor %}
+
+      ---
+
+      ### Adversarial Reviewer (score: {{ plan_review_parallel.outputs.plan_adversarial_reviewer.score }} — {{ "APPROVED" if plan_review_parallel.outputs.plan_adversarial_reviewer.approved else "REJECTED" }})
+
+      {{ plan_review_parallel.outputs.plan_adversarial_reviewer.feedback }}
+
+      Critical issues:
+      {% for issue in plan_review_parallel.outputs.plan_adversarial_reviewer.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      ---
+
+      Fixer attempt count: {{ fixer.output.attempt_count }} / {{ workflow.input.max_fixer_attempts | default(3) }}
 
       **Most recent fixer notes:**
       {{ fixer.output.fix_notes }}

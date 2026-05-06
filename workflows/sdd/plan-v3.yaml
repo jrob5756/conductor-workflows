@@ -12,9 +12,8 @@
 #   designer (Claude Opus 4.7 1M)  ←──── revision loop
 #     ↓
 #   [design_technical_reviewer || design_readability_reviewer || design_adversarial_reviewer]
-#     ↓
-#   merge_design_feedback (script)
-#     ↓ (loops to designer if any reviewer rejects)
+#     ↓ (loops to designer if any reviewer rejects; designer assembles
+#     ↓  consolidated feedback inline from design_review.outputs)
 #   design_approval_gate (human)
 #     ↓
 #   planner (Claude Opus 4.7 1M)  ←──── revision loop
@@ -104,7 +103,9 @@ parallel:
       - design_adversarial_reviewer
     failure_mode: fail_fast
     routes:
-      - to: merge_design_feedback
+      - to: design_approval_gate
+        when: "{{ design_review.outputs.design_technical_reviewer.approved and design_review.outputs.design_readability_reviewer.approved and design_review.outputs.design_adversarial_reviewer.approved }}"
+      - to: designer
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENTS
@@ -335,7 +336,7 @@ agents:
       - purpose_interpreter.output
       - researcher.output
       - designer.output?
-      - merge_design_feedback.output?
+      - design_review.outputs?
     system_prompt: |
       You are a Principal Software Architect. You author clear, high-level
       technical design documents that are deeply grounded in the codebase
@@ -350,7 +351,7 @@ agents:
       - Honest about trade-offs, risks, and open questions
       - Structured for engineering and architecture audiences
     prompt: |
-      {% if designer is defined and designer.output and merge_design_feedback is defined and merge_design_feedback.output %}
+      {% if designer is defined and designer.output and design_review is defined and design_review.outputs %}
       ## REVISION
 
       You are revising an existing design based on consolidated reviewer feedback.
@@ -361,7 +362,37 @@ agents:
       Preserve content that is satisfactory.
 
       **Consolidated Feedback:**
-      {{ merge_design_feedback.output.stdout }}
+
+      ### Technical Reviewer (score: {{ design_review.outputs.design_technical_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_technical_reviewer.approved else "REJECTED" }})
+
+      {{ design_review.outputs.design_technical_reviewer.feedback }}
+
+      Critical issues:
+      {% for issue in design_review.outputs.design_technical_reviewer.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      ---
+
+      ### Readability Reviewer (score: {{ design_review.outputs.design_readability_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_readability_reviewer.approved else "REJECTED" }})
+
+      {{ design_review.outputs.design_readability_reviewer.feedback }}
+
+      Critical issues:
+      {% for issue in design_review.outputs.design_readability_reviewer.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      ---
+
+      ### Adversarial Reviewer (score: {{ design_review.outputs.design_adversarial_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_adversarial_reviewer.approved else "REJECTED" }})
+
+      {{ design_review.outputs.design_adversarial_reviewer.feedback }}
+
+      Critical issues:
+      {% for issue in design_review.outputs.design_adversarial_reviewer.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
 
       ---
       {% endif %}
@@ -431,7 +462,7 @@ agents:
 
       ## REVISION NOTES
 
-      {% if designer is defined and designer.output and merge_design_feedback is defined and merge_design_feedback.output %}
+      {% if designer is defined and designer.output and design_review is defined and design_review.outputs %}
       Provide a concise summary of what you changed and why in `revision_notes`.
       Structure it as a bullet list.
       {% else %}
@@ -700,69 +731,14 @@ agents:
           type: string
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 7. MERGE DESIGN FEEDBACK (script — no LLM)
-  # Deterministic aggregation. Eliminates an LLM failure mode — the consolidated
-  # feedback is exactly what the reviewers said, with no risk of the merging
-  # agent reinterpreting or losing critical issues.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: merge_design_feedback
-    type: script
-    description: Aggregates the three reviewers' outputs into a structured revision request
-    input:
-      - design_review.outputs
-    command: bash
-    args:
-      - "-c"
-      - |
-        cat <<'EOF'
-        ## Consolidated Design Review
-
-        ### Technical Reviewer (score: {{ design_review.outputs.design_technical_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_technical_reviewer.approved else "REJECTED" }})
-
-        {{ design_review.outputs.design_technical_reviewer.feedback }}
-
-        Critical issues:
-        {% for issue in design_review.outputs.design_technical_reviewer.critical_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        ---
-
-        ### Readability Reviewer (score: {{ design_review.outputs.design_readability_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_readability_reviewer.approved else "REJECTED" }})
-
-        {{ design_review.outputs.design_readability_reviewer.feedback }}
-
-        Critical issues:
-        {% for issue in design_review.outputs.design_readability_reviewer.critical_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        ---
-
-        ### Adversarial Reviewer (score: {{ design_review.outputs.design_adversarial_reviewer.score }} — {{ "APPROVED" if design_review.outputs.design_adversarial_reviewer.approved else "REJECTED" }})
-
-        {{ design_review.outputs.design_adversarial_reviewer.feedback }}
-
-        Critical issues:
-        {% for issue in design_review.outputs.design_adversarial_reviewer.critical_issues %}
-        - {{ issue }}
-        {% endfor %}
-
-        ---
-
-        ### Aggregate Status
-
-        All three reviewers approved: {{ "YES" if (design_review.outputs.design_technical_reviewer.approved and design_review.outputs.design_readability_reviewer.approved and design_review.outputs.design_adversarial_reviewer.approved) else "NO" }}
-        EOF
-    routes:
-      - to: design_approval_gate
-        when: "{{ design_review.outputs.design_technical_reviewer.approved and design_review.outputs.design_readability_reviewer.approved and design_review.outputs.design_adversarial_reviewer.approved }}"
-      - to: designer
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 8. DESIGN APPROVAL GATE (human)
+  # 7. DESIGN APPROVAL GATE (human)
   # Human steering at the design/plan boundary. Catches misinterpretations of
   # purpose that no LLM iteration will fix. Cheap insurance.
+  #
+  # Routing decision (approved → here, otherwise → designer) lives on the
+  # design_review parallel group. The designer agent assembles consolidated
+  # reviewer feedback inline from `design_review.outputs` — no shell script
+  # needed, which keeps the workflow cross-platform (no bash dependency).
   # ───────────────────────────────────────────────────────────────────────────
   - name: design_approval_gate
     type: human_gate
