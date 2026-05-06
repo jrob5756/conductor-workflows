@@ -160,8 +160,10 @@ agents:
 
       Produce a structured interpretation of the purpose:
 
-      1. **Restated Goal**: One paragraph describing what you believe the user
-         is asking for, in your own words, grounded in the repo context.
+      1. **Restated Goal**: One paragraph (plain prose, no nested fields, no
+         JSON object — just a single string of text) describing what you
+         believe the user is asking for, in your own words, grounded in the
+         repo context.
 
       2. **Key Terms**: For each non-trivial term in the purpose, define what
          it most likely means in this specific codebase.
@@ -181,7 +183,9 @@ agents:
     output:
       restated_goal:
         type: string
-        description: One-paragraph restatement of the goal
+        description: |
+          One-paragraph restatement of the goal as a single plain string.
+          Do NOT return an object or nested fields — just one string of prose.
       key_terms:
         type: object
         description: Map of term to its definition in this codebase
