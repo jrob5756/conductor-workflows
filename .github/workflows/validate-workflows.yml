@@ -14,14 +14,12 @@ on:
       - ".github/workflows/validate-workflows.yml"
   workflow_dispatch:
 
-# Pin the conductor version validated against. Bump intentionally when adopting
-# a new release so workflow changes are validated against a known schema.
-env:
-  CONDUCTOR_VERSION: "0.1.15"
-
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      # gh CLI auth — public repo, but `gh` requires a token to be set.
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,10 +29,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install conductor-cli
+      - name: Install latest conductor-cli
         run: |
+          set -euo pipefail
+          mkdir -p /tmp/conductor
+          gh release download --repo microsoft/conductor --pattern '*.whl' --dir /tmp/conductor
           pip install --upgrade pip
-          pip install "https://github.com/microsoft/conductor/releases/download/v${CONDUCTOR_VERSION}/conductor_cli-${CONDUCTOR_VERSION}-py3-none-any.whl"
+          pip install /tmp/conductor/*.whl pyyaml
           conductor --version
 
       - name: Validate every workflow under workflows/
