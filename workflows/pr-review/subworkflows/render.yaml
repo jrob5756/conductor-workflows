@@ -1,0 +1,989 @@
+# Render Sub-workflow
+#
+# Renders the final review report (full or delta), builds the inline_comments
+# array, and writes the complete artifact set (latest + versioned archives) to
+# the output directory.
+#
+# Receives all rich data from the parent workflow via input_mapping (specialist
+# outputs, lens outputs, polish outputs, arbitrator results) — the parent
+# pulls these from the prior sub-workflow outputs and Jinja-tojson's them.
+# This keeps the render sub-workflow self-contained without needing to read
+# JSON files from disk.
+
+workflow:
+  name: pr-review-render
+  description: Final rendering phase of the pr-review workflow — composes the review report, builds inline comments, writes versioned artifacts
+  version: "1.0.0"
+  entry_point: report_writer
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+    max_session_seconds: 1800
+    mcp_servers:
+      filesystem:
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+        tools: ["read_file", "write_file", "create_directory", "list_directory"]
+
+  input:
+    pr_metadata:
+      type: object
+      required: true
+    pr_data_dir:
+      type: string
+      required: true
+
+    # Dispatcher context (passed through from the parent dispatcher)
+    guidelines_content:
+      type: string
+      required: false
+      default: ""
+    prior_feedback_content:
+      type: string
+      required: false
+      default: ""
+
+    # Specialist phase results
+    specialist_outputs:
+      type: object
+      required: true
+      description: "Raw specialist_review.outputs from the parent — keyed by specialist name."
+    valid_count:
+      type: number
+      required: true
+    valid_specialists:
+      type: array
+      required: true
+    invalid_specialists:
+      type: array
+      required: false
+      default: []
+    degraded:
+      type: boolean
+      required: true
+    consolidated_findings:
+      type: array
+      required: true
+    specialist_contributions:
+      type: object
+      required: false
+      default: {}
+    dedupe_summary:
+      type: string
+      required: false
+      default: ""
+    has_consolidator:
+      type: boolean
+      required: false
+      default: true
+
+    # Deliberation phase results (when has_deliberation=false, the related fields are unused)
+    has_deliberation:
+      type: boolean
+      required: false
+      default: true
+    has_lens_review:
+      type: boolean
+      required: false
+      default: true
+    lens_outputs:
+      type: object
+      required: false
+      default: {}
+    agreed_findings:
+      type: array
+      required: false
+      default: []
+    open_disagreements:
+      type: array
+      required: false
+      default: []
+    consensus_reached:
+      type: boolean
+      required: false
+      default: false
+    round_number:
+      type: number
+      required: false
+      default: 0
+    round_summary:
+      type: string
+      required: false
+      default: ""
+    confidence_score:
+      type: number
+      required: false
+      default: 0
+
+    # Polish phase results
+    has_polish_outputs:
+      type: boolean
+      required: false
+      default: true
+    polish_simplifier_output:
+      type: object
+      required: false
+      default: {}
+    polish_dead_code_output:
+      type: object
+      required: false
+      default: {}
+
+    # Workflow inputs forwarded for the report content
+    focus:
+      type: string
+      required: false
+      default: ""
+    exclude:
+      type: array
+      required: false
+      default: []
+    max_rounds:
+      type: number
+      required: false
+      default: 2
+    strictness:
+      type: number
+      required: false
+      default: 2
+    lens_security_model:
+      type: string
+      required: false
+      default: "claude-opus-4.7"
+    lens_robustness_model:
+      type: string
+      required: false
+      default: "gpt-5.5"
+    review_number:
+      type: number
+      required: false
+      default: 1
+    include_polish:
+      type: boolean
+      required: false
+      default: true
+    enabled_specialists:
+      type: array
+      required: false
+      default: ["code", "tests", "errors", "types", "comments"]
+    polish_as_inline:
+      type: boolean
+      required: false
+      default: false
+    output_dir:
+      type: string
+      required: false
+      default: ""
+    previous_review_path:
+      type: string
+      required: false
+      default: ""
+    prior_feedback_path:
+      type: string
+      required: false
+      default: ""
+
+  context:
+    mode: explicit
+
+  limits:
+    # report_writer + inline_comments_writer + output_writer = 3
+    max_iterations: 10
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENTS
+# ─────────────────────────────────────────────────────────────────────────────
+agents:
+
+  - name: report_writer
+    description: Renders the final PR review markdown — consensus + disputed findings, polish section, delta mode, optional impact diagram
+    model: claude-opus-4.7
+    input:
+      - workflow.input.pr_metadata
+      - workflow.input.pr_data_dir
+      - workflow.input.prior_feedback_content?
+      - workflow.input.specialist_outputs
+      - workflow.input.valid_count
+      - workflow.input.valid_specialists
+      - workflow.input.invalid_specialists
+      - workflow.input.degraded
+      - workflow.input.consolidated_findings?
+      - workflow.input.specialist_contributions?
+      - workflow.input.dedupe_summary?
+      - workflow.input.lens_outputs?
+      - workflow.input.agreed_findings?
+      - workflow.input.open_disagreements?
+      - workflow.input.consensus_reached?
+      - workflow.input.round_number?
+      - workflow.input.round_summary?
+      - workflow.input.confidence_score?
+      - workflow.input.polish_simplifier_output?
+      - workflow.input.polish_dead_code_output?
+      - workflow.input.focus
+      - workflow.input.previous_review_path?
+      - workflow.input.prior_feedback_path?
+      - workflow.input.strictness
+      - workflow.input.lens_security_model
+      - workflow.input.lens_robustness_model
+      - workflow.input.review_number
+      - workflow.input.include_polish
+      - workflow.input.enabled_specialists
+    system_prompt: |
+      You are the report writer agent. Your job is to format the
+      multi-agent review results into a polished, readable PR review
+      report. You do NOT add new findings or change existing ones —
+      you format and present the data.
+
+      ## Degraded review mode
+
+      `workflow.input.degraded` is true whenever at least one
+      specialist failed to load the diff. When degraded:
+
+      - The very first content line of the report (right under the
+        title and metadata block, BEFORE `## 📋 Summary`) MUST be a
+        banner of the form:
+
+        > ⚠️ **Degraded review** — only N of M specialists successfully
+        > loaded the diff. Failed: {names with reasons}.
+        > Consider re-running this review.
+
+        Replace `{names with reasons}` with the contents of
+        `workflow.input.invalid_specialists`.
+
+      - Cap `confidence_score` displayed in the report at 60.
+      - Note the failed specialists in the Specialist Contributions table.
+
+      ## Confidence Score Badge
+
+      Display the confidence score from the arbitrator prominently:
+      - **90-100**: 🟢 High — lenses strongly agree, few/no serious findings
+      - **70-89**:  🟡 Moderate — mostly agreed; some disputes or serious findings
+      - **50-69**:  🟠 Low — significant disagreement or many serious findings
+      - **0-49**:   🔴 Very low — degraded review or unresolved disputes
+
+      Always note that this measures the *review's reliability*, not the PR's quality.
+
+      ## Auto-generated impact diagram
+
+      If the PR involves any of:
+      - Multi-service interactions → sequence diagram of call flow
+      - Database/schema changes → ER diagram of affected tables
+      - Class hierarchy changes → class diagram
+      - State machine changes → state diagram
+      - API endpoint changes → request/response flowchart
+
+      Include a `### 📐 Impact Diagram` section with a Mermaid block:
+
+      ```
+      ```mermaid
+      <diagram>
+      ```
+      ```
+
+      Only include if it genuinely helps. Do NOT force a diagram on
+      simple changes (config tweak, typo fix). Set `has_diagram: true`
+      only when one was emitted.
+
+      ## Polish & Cleanup section
+
+      If `include_polish` is true AND polish stages produced any findings
+      (skipped: false AND findings non-empty), include a
+      `### 💡 Polish & Cleanup` section between the Verdict and Model
+      Comparison sections. Render polish_simplifier and polish_dead_code
+      findings in separate subsections. State clearly that these are
+      advisory and do NOT affect merge_readiness.
+
+      If `include_polish` is false OR no polish findings → omit the
+      section entirely (do not say "no polish findings").
+
+      ## Suggested-fix collapsibles
+
+      For each finding with a non-empty `suggested_fix`, include a
+      collapsible section after the recommendation:
+
+      ```
+      <details>
+      <summary>💡 Suggested fix</summary>
+
+      ```diff
+      - old line
+      + new line
+      ```
+      </details>
+      ```
+
+      ## Delta Mode
+
+      If `previous_review_path` is provided, use `read_file` to load the
+      prior report and produce a **delta report** instead of a full one.
+
+      A delta report shows ONLY:
+      - **🆕 New findings** — in current but not in previous review
+      - **✅ Resolved findings** — in previous but not in current
+      - **🔄 Changed findings** — in both with changed severity or recommendation
+      - **📣 Author feedback considered** — when prior_feedback_content is
+        non-empty, list every prior finding that received a human reply or
+        thread status change, and how this review handled it (Dropped /
+        Downgraded / Re-raised)
+      - **Unchanged count** — single line stating how many remain unchanged
+
+      Match findings between reviews by file + line_range (±5 lines) + category.
+
+      In delta mode the report title MUST be exactly:
+      `# 🤖 Multi-Agent PR Review #{{ workflow.input.review_number }} — Update since Review #{{ workflow.input.review_number - 1 }}`
+
+      Compute the three counters in your structured output:
+      - `findings_dropped_via_feedback`
+      - `findings_downgraded_via_feedback`
+      - `findings_reraised_with_acknowledgement`
+
+      ## Output file
+
+      Write the formatted report to `<pr_data_dir>/review-comment.md`
+      using the MCP filesystem tools.
+    prompt: |
+      ## PR Metadata
+      {{ workflow.input.pr_metadata | tojson }}
+
+      ## Specialist Gate Results
+      - valid_count: {{ workflow.input.valid_count }}
+      - valid_specialists: {{ workflow.input.valid_specialists | tojson }}
+      - invalid_specialists: {{ workflow.input.invalid_specialists | tojson }}
+      - degraded: {{ workflow.input.degraded }}
+
+      ## Specialist Outputs
+      ```json
+      {{ workflow.input.specialist_outputs | tojson }}
+      ```
+
+      {% if workflow.input.has_consolidator %}
+      ## Consolidator Output
+      - dedupe_summary: {{ workflow.input.dedupe_summary }}
+      - specialist_contributions: {{ workflow.input.specialist_contributions | tojson }}
+      - consolidated_findings (count): {{ workflow.input.consolidated_findings | length }}
+      {% endif %}
+
+      {% if workflow.input.has_lens_review and workflow.input.lens_outputs %}
+      ## Lens Review Outputs
+      ```json
+      {{ workflow.input.lens_outputs | tojson }}
+      ```
+      {% endif %}
+
+      {% if workflow.input.has_deliberation %}
+      ## Deliberation Outcome
+      - consensus_reached: {{ workflow.input.consensus_reached }}
+      - round_number: {{ workflow.input.round_number }}
+      - confidence_score: {{ workflow.input.confidence_score }}/100
+      - round_summary: {{ workflow.input.round_summary }}
+
+      ### Agreed Findings
+      {{ workflow.input.agreed_findings | tojson }}
+
+      ### Open Disagreements
+      {{ workflow.input.open_disagreements | tojson }}
+      {% else %}
+      ## Single-Lens Mode
+      Lens deliberation did not run. Treat available lens findings as final.
+      Cap displayed confidence_score at 50.
+      {% endif %}
+
+      {% if workflow.input.include_polish %}
+      ## Polish Review
+
+      ### polish_simplifier
+      {% if workflow.input.has_polish_outputs and workflow.input.polish_simplifier_output %}
+      Skipped: {{ workflow.input.polish_simplifier_output.skipped | default(false) }}
+      Summary: {{ workflow.input.polish_simplifier_output.summary }}
+      Findings: {{ workflow.input.polish_simplifier_output.findings | tojson }}
+      {% endif %}
+
+      ### polish_dead_code
+      {% if workflow.input.has_polish_outputs and workflow.input.polish_dead_code_output %}
+      Skipped: {{ workflow.input.polish_dead_code_output.skipped | default(false) }}
+      Summary: {{ workflow.input.polish_dead_code_output.summary }}
+      Findings: {{ workflow.input.polish_dead_code_output.findings | tojson }}
+      {% endif %}
+      {% endif %}
+
+      {% if workflow.input.focus | length > 0 %}
+      ## Review Focus Areas
+      {{ workflow.input.focus }}
+      {% endif %}
+
+      {% if workflow.input.previous_review_path %}
+      ## Previous Review
+      Read previous report from `{{ workflow.input.previous_review_path }}`
+      and produce a DELTA report (see system prompt instructions).
+      {% endif %}
+
+      {% if workflow.input.prior_feedback_content | length > 0 %}
+      ## Prior Author Feedback
+      ```json
+      {{ workflow.input.prior_feedback_content }}
+      ```
+      Use this for the "📣 Author Feedback Considered" section and the
+      `findings_dropped_via_feedback` / `findings_downgraded_via_feedback`
+      / `findings_reraised_with_acknowledgement` counters.
+      {% endif %}
+
+      ---
+
+      Format the review report and write it to
+      `{{ workflow.input.pr_data_dir }}/review-comment.md` using the
+      `write_file` tool.
+
+      {% if workflow.input.previous_review_path %}
+      **DELTA MODE TEMPLATE**:
+
+      ```
+      # 🤖 Multi-Agent PR Review #{{ workflow.input.review_number }} — Update since Review #{{ workflow.input.review_number - 1 }}
+
+      **PR**: #<number> — <title>
+      **Merge readiness**: <verdict>
+      **Review confidence**: <score>/100 <badge> · *reviewer agreement & finding strength — not a PR-quality score*
+      **Models**: {{ workflow.input.lens_security_model }} (Security & Correctness lens), {{ workflow.input.lens_robustness_model }} (Robustness & Completeness lens) over 5 specialists
+      **Deliberation**: <N> round(s), consensus <reached/not reached>
+      **Previous review**: Review #{{ workflow.input.review_number - 1 }}
+
+      ---
+
+      ## 📋 Summary
+      <2-3 sentence summary of what changed since Review #{{ workflow.input.review_number - 1 }}.>
+
+      ## 🆕 New Findings
+      | Severity | File | Finding | Recommendation |
+      |---|---|---|---|
+
+      ## ✅ Resolved Findings
+      | Previous Severity | File | Finding | Status |
+      |---|---|---|---|
+
+      <Optional: 📣 Author Feedback Considered table when prior_feedback non-empty>
+
+      ## 🔄 Changed Findings
+      | Severity | File | Finding | Change |
+      |---|---|---|---|
+
+      ## 📊 Delta Summary
+      - Unchanged findings: N
+      - New findings: N
+      - Resolved findings: N
+      - Changed findings: N
+      - Dropped via author feedback: N
+      - Downgraded via author feedback: N
+      - Re-raised with acknowledgement: N
+
+      ## 🏁 Verdict
+      **Merge readiness**: <verdict> — <one-sentence rationale>
+      **Review confidence**: <score>/100 <badge>
+      ```
+      {% else %}
+      **FULL REPORT TEMPLATE**:
+
+      ```
+      # 🤖 Multi-Agent PR Review #{{ workflow.input.review_number }}
+
+      **PR**: #<number> — <title>
+      **Merge readiness**: <verdict>
+      **Review confidence**: <score>/100 <badge> · *reviewer agreement & finding strength — not a PR-quality score*
+      **Specialists**: {{ workflow.input.enabled_specialists | join(', ') }} ({{ workflow.input.valid_count }}/{{ workflow.input.enabled_specialists | length }} succeeded)
+      **Lenses**: {{ workflow.input.lens_security_model }} (Security & Correctness), {{ workflow.input.lens_robustness_model }} (Robustness & Completeness)
+      **Deliberation**: <N> round(s), consensus <reached/not reached>
+
+      <degraded banner here when degraded>
+
+      ---
+
+      ## 📋 Summary
+      <3-5 sentence synthesis. Highlight findings multiple specialists agreed on
+      (high signal) vs single-specialist findings.>
+
+      ## 🔍 Consensus Findings
+      <Findings both lenses agreed on. High-confidence issues. For each with
+       a suggested_fix, include a collapsible details block.>
+
+      | Severity | File | Specialists | Finding | Recommendation |
+      |---|---|---|---|---|
+      | 🔴/🟡/🔵 | `path:lines` | Code,Tests | Description | Fix |
+
+      ## 🔎 Disputed / Unique Findings
+      <Findings where lenses disagreed or only one raised.>
+
+      | Severity | File | Finding | Status |
+      |---|---|---|---|
+
+      ## 📐 Impact Diagram
+      <Only when warranted; Mermaid block.>
+
+      ## 🏁 Verdict
+      **Merge readiness**: <verdict> — <one-sentence rationale>
+      **Review confidence**: <score>/100 <badge>
+
+      ## 💡 Polish & Cleanup
+      <Only when include_polish AND polish has findings. Subsections per agent.
+       State clearly: "Advisory only — does not affect merge_readiness".>
+
+      ## 📊 Specialist Contributions
+      | Specialist | Raised | Kept after dedupe | Merged into others | Status |
+      |---|---|---|---|---|
+      ```
+      {% endif %}
+
+      IMPORTANT: Render ALL template expressions into actual content.
+    output:
+      review_comment_path:
+        type: string
+        description: "File path where the review comment was written (<pr_data_dir>/review-comment.md)."
+      consensus_count: {type: number}
+      disputed_count: {type: number}
+      critical_count: {type: number}
+      warning_count: {type: number}
+      suggestion_count: {type: number}
+      polish_findings_count: {type: number}
+      merge_readiness: {type: string}
+      confidence_score: {type: number}
+      is_delta: {type: boolean}
+      findings_dropped_via_feedback: {type: number}
+      findings_downgraded_via_feedback: {type: number}
+      findings_reraised_with_acknowledgement: {type: number}
+      has_diagram: {type: boolean}
+      status:
+        type: string
+        description: "Report generation status: 'success' when the review comment was written."
+    routes:
+      - to: inline_comments_writer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # INLINE_COMMENTS_WRITER — Builds the inline_comments array for posting on
+  # specific PR diff lines. Extracted from report_writer (separate model + prompt
+  # to avoid the report writer's long template silently dropping the array).
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: inline_comments_writer
+    description: Builds the inline_comments array from agreed findings (or specialist findings in degraded mode) for posting on specific PR diff lines
+    model: claude-sonnet-4.6
+    input:
+      - workflow.input.pr_metadata
+      - workflow.input.specialist_outputs
+      - workflow.input.valid_specialists
+      - workflow.input.degraded
+      - workflow.input.consolidated_findings?
+      - workflow.input.agreed_findings?
+      - workflow.input.polish_simplifier_output?
+      - workflow.input.polish_dead_code_output?
+      - workflow.input.polish_as_inline
+    system_prompt: |
+      You are the inline-comments writer agent. You have ONE job:
+      produce a populated `inline_comments` array. You do NOT write
+      files, format markdown, or generate other content.
+
+      ## What to include
+
+      Iterate every finding that has BOTH a `file` and a `line_range`
+      (with a numeric start). Source priority:
+
+      1. If `workflow.input.agreed_findings` is non-empty, use it
+         (high-confidence consensus findings).
+      2. Else if `workflow.input.consolidated_findings` is
+         non-empty, use it (lens deliberation didn't complete; fall back
+         to specialist consensus).
+      3. Else (gate caught a near-total failure), use findings ONLY from
+         specialists in `workflow.input.valid_specialists`. Never
+         emit inline comments based on a specialist the gate marked invalid.
+
+      Skip findings without a specific file+line — those belong only in
+      the summary report.
+
+      ## Polish findings
+
+      If `workflow.input.polish_as_inline` is `true`, also include
+      polish_simplifier and polish_dead_code findings with a file+line.
+
+      If false (default), polish findings are summary-only — do NOT
+      include them in inline_comments.
+
+      ## Output format
+
+      Each entry must conform to the schema:
+
+      ```json
+      {
+        "file": "path/to/file.ts",
+        "line": 42,
+        "body": "🔴 **security**: [S-CODE-001] SQL injection risk in user input handling.\n\n**Recommendation**: Use parameterized queries.\n\n```suggestion\nconst query = `SELECT * FROM users WHERE name = ?`;\n```",
+        "severity": "critical",
+        "finding_id": "S-CODE-001"
+      }
+      ```
+
+      Rules:
+      - `line` = numeric `line_range.start` (parse from string like "42-47").
+      - `body` is markdown. Lead with the severity emoji and category, then
+        the bracketed finding ID, then the description, blank line, then
+        `**Recommendation**: <text>`.
+      - **Severity emojis**: 🔴 critical, 🟡 warning, 🔵 suggestion (and 🔵 for polish).
+      - If the finding has a non-empty `suggested_fix`, append a
+        ```` ```suggestion ```` block AFTER the recommendation. The block
+        must contain ONLY the replacement code (not unified-diff
+        `-`/`+` lines):
+        ````
+        ```suggestion
+        <replacement code>
+        ```
+        ````
+      - `severity` is one of: `critical`, `warning`, `suggestion`, `polish`.
+      - `finding_id` is the existing identifier (e.g. `S-CODE-001`, `L1-002`).
+
+      ## Empty result
+
+      If no findings have file+line, return `inline_comments: []`. Do not
+      fabricate locations.
+    prompt: |
+      Build the `inline_comments` array from the findings below, applying
+      the rules in your system prompt.
+
+      ## Gate decision
+      - degraded: {{ workflow.input.degraded }}
+      - valid_specialists: {{ workflow.input.valid_specialists | tojson }}
+
+      ## Source — arbitrator.agreed_findings (preferred when present)
+      {% if workflow.input.has_deliberation and workflow.input.agreed_findings %}
+      ```json
+      {{ workflow.input.agreed_findings | tojson }}
+      ```
+      {% else %}
+      (No arbitrator output.)
+      {% endif %}
+
+      ## Source — consolidator.consolidated_findings (fallback)
+      {% if workflow.input.has_consolidator and workflow.input.consolidated_findings %}
+      ```json
+      {{ workflow.input.consolidated_findings | tojson }}
+      ```
+      {% else %}
+      (No consolidator output.)
+      {% endif %}
+
+      ## Source — specialist outputs (used only in degraded mode if neither above is available)
+      ```json
+      {{ workflow.input.specialist_outputs | tojson }}
+      ```
+
+      ## Polish findings (include only if polish_as_inline is true)
+      polish_as_inline: {{ workflow.input.polish_as_inline }}
+      {% if workflow.input.polish_as_inline %}
+        {% if workflow.input.has_polish_outputs and workflow.input.polish_simplifier_output %}
+        polish_simplifier: {{ workflow.input.polish_simplifier_output.findings | tojson }}
+        {% endif %}
+        {% if workflow.input.has_polish_outputs and workflow.input.polish_dead_code_output %}
+        polish_dead_code: {{ workflow.input.polish_dead_code_output.findings | tojson }}
+        {% endif %}
+      {% endif %}
+
+      ## PR Metadata
+      ```json
+      {{ workflow.input.pr_metadata | tojson }}
+      ```
+
+      Emit the structured `inline_comments` array. Skip findings without
+      `file` and a numeric `line_range.start`.
+    output:
+      inline_comments:
+        type: array
+        description: "Array of inline comment objects for posting on specific PR lines."
+        items:
+          type: object
+          properties:
+            file: {type: string}
+            line: {type: number}
+            body: {type: string}
+            severity: {type: string}
+            finding_id: {type: string}
+    routes:
+      - to: output_writer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # OUTPUT_WRITER — Writes final artifacts to disk: latest pointers + versioned
+  # archives for both the comment and detailed report, plus the inline_comments
+  # JSON file.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: output_writer
+    description: Writes review-comment.md, detailed report, and inline-comments.json (latest + versioned) to the output directory
+    model: claude-sonnet-4.6
+    input:
+      - report_writer.output.review_comment_path
+      - report_writer.output.consensus_count
+      - report_writer.output.disputed_count
+      - report_writer.output.critical_count
+      - report_writer.output.warning_count
+      - report_writer.output.suggestion_count
+      - report_writer.output.polish_findings_count
+      - report_writer.output.merge_readiness
+      - report_writer.output.confidence_score
+      - report_writer.output.is_delta
+      - report_writer.output.findings_dropped_via_feedback?
+      - report_writer.output.findings_downgraded_via_feedback?
+      - report_writer.output.findings_reraised_with_acknowledgement?
+      - report_writer.output.has_diagram
+      - inline_comments_writer.output.inline_comments
+      - workflow.input.agreed_findings?
+      - workflow.input.open_disagreements?
+      - workflow.input.round_number?
+      - workflow.input.consensus_reached?
+      - workflow.input.round_summary?
+      - workflow.input.consolidated_findings?
+      - workflow.input.specialist_contributions?
+      - workflow.input.dedupe_summary?
+      - workflow.input.specialist_outputs
+      - workflow.input.lens_outputs?
+      - deliberation_lens_1.output?
+      - deliberation_lens_2.output?
+      - workflow.input.polish_simplifier_output?
+      - workflow.input.polish_dead_code_output?
+      - workflow.input.pr_metadata
+      - workflow.input.guidelines_content
+      - workflow.input.pr_data_dir
+      - workflow.input.output_dir
+      - workflow.input.focus
+      - workflow.input.exclude
+      - workflow.input.max_rounds
+      - workflow.input.strictness
+      - workflow.input.lens_security_model
+      - workflow.input.lens_robustness_model
+      - workflow.input.review_number
+      - workflow.input.include_polish
+      - workflow.input.enabled_specialists
+    system_prompt: |
+      You are an output writer agent. Your job is to write final artifact
+      files to disk using MCP filesystem tools (`create_directory`,
+      `write_file`, `read_file`). You do NOT review or modify content —
+      you format and write.
+
+      ## Output directory resolution
+
+      - If `output_dir` is non-empty, write files there.
+      - Otherwise write into `workflow.input.pr_data_dir`.
+
+      ## File-naming convention
+
+      Extract PR number from `workflow.input.pr_metadata.number`.
+      Read `review_number` from `workflow.input.review_number` (default 1).
+
+      Write four files per run (latest pointers + versioned archives):
+
+      - `pr-<number>-review.md` — latest comment (what gets posted to the PR)
+      - `pr-<number>-review-v<review_number>.md` — versioned archive
+      - `pr-<number>-review-report.md` — latest detailed report (used as
+        `previous_review_path` on the next run)
+      - `pr-<number>-review-report-v<review_number>.md` — versioned archive
+
+      Plus the inline comments file:
+
+      - `pr-<number>-inline-comments.json` — array of inline comment objects.
+
+      The unversioned files are always overwritten with the most recent
+      review. Versioned files preserve history across runs.
+
+      ## Defensive fallback for inline comments
+
+      If `inline_comments_writer.output.inline_comments` is empty BUT
+      `workflow.input.agreed_findings` (or `workflow.input.consolidated_findings`
+      in fallback) contains entries with `file` and a numeric
+      `line_range.start`, the upstream writer failed. Synthesise a
+      minimal inline_comments array yourself by iterating those findings
+      and emitting one entry per finding with file+line:
+
+      ```json
+      {
+        "file": "<finding.file>",
+        "line": <finding.line_range.start as int>,
+        "body": "<severity-emoji> **<finding.category>**: [<finding.id>] <finding.description>\n\n**Recommendation**: <finding.recommendation>",
+        "severity": "<finding.severity>",
+        "finding_id": "<finding.id>"
+      }
+      ```
+
+      Severity-emoji map: 🔴 critical, 🟡 warning, 🔵 suggestion. If the
+      finding has a non-empty `suggested_fix`, append a `suggestion`
+      block to `body` after the recommendation.
+
+      Log a warning before writing: "WARNING: inline_comments_writer
+      returned empty; synthesised N inline comments from agreed_findings."
+    prompt: |
+      Write final artifact files to disk.
+
+      **PR data directory:** {{ workflow.input.pr_data_dir }}
+      **Output directory override:** {{ workflow.input.output_dir }}
+      **PR metadata:** {{ workflow.input.pr_metadata | tojson }}
+
+      {% if workflow.input.output_dir %}
+      Use the specified output directory: `{{ workflow.input.output_dir }}`
+      {% else %}
+      Write into `{{ workflow.input.pr_data_dir }}` (output_dir is empty).
+      {% endif %}
+
+      ---
+
+      ## File 1: Review Comment (latest + versioned archive)
+
+      The formatted comment is at `{{ report_writer.output.review_comment_path }}`.
+      Use `read_file` to load it, then `write_file` to write it twice:
+      1. As `pr-<number>-review.md` (latest pointer — overwrites prior)
+      2. As `pr-<number>-review-v{{ workflow.input.review_number }}.md` (archive)
+
+      ## File 2: Detailed Review Report (latest + versioned archive)
+
+      Compose the detailed report using the format below, then `write_file` twice:
+      1. As `pr-<number>-review-report.md` (latest — used as
+         previous_review_path next run)
+      2. As `pr-<number>-review-report-v{{ workflow.input.review_number }}.md` (archive)
+
+      Detailed report format:
+
+      ```
+      # PR Review Report: #<number> — <title>
+
+      - **Workflow version**: 1.0.0
+      - **Review number**: {{ workflow.input.review_number }}
+      - **Confidence score**: {{ report_writer.output.confidence_score }}/100
+      - **Report type**: Review #{{ workflow.input.review_number }} — {% if report_writer.output.is_delta %}Delta update{% else %}Full review{% endif %}
+
+      ## Summary
+      <Outcome, consensus status, rounds, key findings.>
+
+      ## Review Configuration
+      - **Specialists enabled**: {{ workflow.input.enabled_specialists | join(', ') }}
+      - **Polish stage**: {{ workflow.input.include_polish }}
+      - **Focus areas**: {{ workflow.input.focus }}
+      - **Excluded areas**: {{ workflow.input.exclude | tojson }}
+      - **Strictness**: {{ workflow.input.strictness }}
+      {% if workflow.input.has_deliberation %}
+      - **Rounds completed**: {{ workflow.input.round_number }} of {{ workflow.input.max_rounds }} maximum
+      - **Consensus reached**: {{ workflow.input.consensus_reached }}
+      {% else %}
+      - **Mode**: Single-lens (deliberation skipped)
+      {% endif %}
+      {% if workflow.input.guidelines_content %}- **Guidelines**: Loaded{% else %}- **Guidelines**: Not provided{% endif %}
+
+      ## Models
+      | Agent | Model |
+      |---|---|
+      | dispatcher | claude-sonnet-4.6 |
+      | specialist_code | (see workflow input) |
+      | specialist_tests | (see workflow input) |
+      | specialist_errors | (see workflow input) |
+      | specialist_types | (see workflow input) |
+      | specialist_comments | (see workflow input) |
+      | consolidator | claude-sonnet-4.6 |
+      | lens_security_correctness | {{ workflow.input.lens_security_model }} |
+      | lens_robustness_completeness | {{ workflow.input.lens_robustness_model }} |
+      | arbitrator | claude-opus-4.7 |
+      | report_writer | claude-opus-4.7 |
+      | inline_comments_writer | claude-sonnet-4.6 |
+      | output_writer | claude-sonnet-4.6 |
+
+      ## Specialist Contributions
+      {% if workflow.input.has_consolidator %}
+      {{ workflow.input.specialist_contributions | tojson }}
+
+      Dedupe summary: {{ workflow.input.dedupe_summary }}
+      {% endif %}
+
+      ## Initial Specialist Reviews
+      <Format each specialist's findings with status, count, top findings.>
+
+      {% if workflow.input.has_lens_review and workflow.input.lens_outputs %}
+      ## Lens Reviews
+      <Format Lens 1 / Lens 2 dispositions and new findings.>
+      {% endif %}
+
+      {% if workflow.input.has_deliberation %}
+      ## Deliberation Summary
+      {{ workflow.input.round_summary }}
+
+      ### Agreed Findings
+      <Format each.>
+
+      ### Unresolved Disagreements
+      <Format with each lens's final position.>
+      {% endif %}
+
+      {% if workflow.input.include_polish %}
+      ## Polish Stage
+      ### Simplifier
+      <Format polish_simplifier output if present.>
+
+      ### Dead Code
+      <Format polish_dead_code output if present.>
+      {% endif %}
+
+      ## Finding Summary
+      Consensus findings: {{ report_writer.output.consensus_count }}
+      Disputed findings: {{ report_writer.output.disputed_count }}
+      Critical: {{ report_writer.output.critical_count }}, Warnings: {{ report_writer.output.warning_count }}, Suggestions: {{ report_writer.output.suggestion_count }}
+      Polish findings: {{ report_writer.output.polish_findings_count }}
+      Confidence score: {{ report_writer.output.confidence_score }}/100
+      Merge readiness: {{ report_writer.output.merge_readiness }}
+      ```
+
+      ## File 3: Inline Comments JSON (`pr-<number>-inline-comments.json`)
+
+      a. If `inline_comments_writer.output.inline_comments` is non-empty,
+         write that JSON array to `pr-<number>-inline-comments.json`.
+
+      b. **Defensive fallback**: if the array IS empty but
+         `workflow.input.agreed_findings` (or
+         `workflow.input.consolidated_findings`) has entries with
+         `file` + numeric `line_range.start`, synthesise a minimal
+         inline_comments array per the rules in your system prompt and
+         write it. Log the warning.
+
+      c. If both empty AND no findings with file+line, skip writing the
+         file (legitimate empty result — nothing to post inline).
+
+      ## Output
+
+      Set `review_path` = path of `pr-<number>-review.md` (latest pointer).
+      Set `review_report_path` = path of `pr-<number>-review-report.md`.
+      Set `review_archive_path` = path of versioned review.
+      Set `review_report_archive_path` = path of versioned report.
+      Set `inline_comments_path` = path of `pr-<number>-inline-comments.json`
+        (or "" if skipped).
+      Set `status` = "success" if all writes succeeded.
+
+      IMPORTANT: Render ALL template expressions into actual content.
+    output:
+      review_path: {type: string}
+      review_report_path: {type: string}
+      review_archive_path: {type: string}
+      review_report_archive_path: {type: string}
+      inline_comments_path: {type: string}
+      status: {type: string}
+    routes:
+      - to: $end
+      - to: $end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKFLOW OUTPUT
+# ─────────────────────────────────────────────────────────────────────────────
+output:
+  review_path: "{{ output_writer.output.review_path if output_writer is defined and output_writer.output is defined else '' }}"
+  review_report_path: "{{ output_writer.output.review_report_path if output_writer is defined and output_writer.output is defined else '' }}"
+  review_archive_path: "{{ output_writer.output.review_archive_path if output_writer is defined and output_writer.output is defined else '' }}"
+  review_report_archive_path: "{{ output_writer.output.review_report_archive_path if output_writer is defined and output_writer.output is defined else '' }}"
+  inline_comments_path: "{{ output_writer.output.inline_comments_path if output_writer is defined and output_writer.output is defined else '' }}"
+  consensus_count: "{{ report_writer.output.consensus_count if report_writer is defined and report_writer.output is defined else 0 }}"
+  disputed_count: "{{ report_writer.output.disputed_count if report_writer is defined and report_writer.output is defined else 0 }}"
+  critical_count: "{{ report_writer.output.critical_count if report_writer is defined and report_writer.output is defined else 0 }}"
+  warning_count: "{{ report_writer.output.warning_count if report_writer is defined and report_writer.output is defined else 0 }}"
+  suggestion_count: "{{ report_writer.output.suggestion_count if report_writer is defined and report_writer.output is defined else 0 }}"
+  polish_findings_count: "{{ report_writer.output.polish_findings_count if report_writer is defined and report_writer.output is defined else 0 }}"
+  merge_readiness: "{{ report_writer.output.merge_readiness if report_writer is defined and report_writer.output is defined else 'unknown' }}"
+  confidence_score: "{{ report_writer.output.confidence_score if report_writer is defined and report_writer.output is defined else 0 }}"
+  is_delta: "{{ report_writer.output.is_delta if report_writer is defined and report_writer.output is defined else false }}"
+  findings_dropped_via_feedback: "{{ report_writer.output.findings_dropped_via_feedback if report_writer is defined and report_writer.output is defined else 0 }}"
+  findings_downgraded_via_feedback: "{{ report_writer.output.findings_downgraded_via_feedback if report_writer is defined and report_writer.output is defined else 0 }}"
+  findings_reraised_with_acknowledgement: "{{ report_writer.output.findings_reraised_with_acknowledgement if report_writer is defined and report_writer.output is defined else 0 }}"
+  has_diagram: "{{ report_writer.output.has_diagram if report_writer is defined and report_writer.output is defined else false }}"
+  status: "{{ output_writer.output.status if output_writer is defined and output_writer.output is defined else 'failure' }}"
