@@ -125,8 +125,6 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 | `custom_rules_dir` | string | `""` | Path to a `.pr-review/` directory |
 | `guidelines_path` | string | `""` | Path to a single team guidelines markdown file |
 | `codebase_context_path` | string | `""` | Path to a precomputed codebase-context markdown |
-| `work_items_path` | string | `""` | Path to a precomputed linked-work-items markdown |
-| `ignore_work_items` | bool | `false` | Suppress work-items context entirely |
 | `previous_review_path` | string | `""` | Path to a prior `pr-N-review-report.md` for **delta mode** |
 | `prior_feedback_path` | string | `""` | JSON of PR-author / maintainer replies to the most recent prior bot review |
 | `review_number` | int | `1` | Sequential review number for archive filenames + delta header |
@@ -344,8 +342,6 @@ problems." `merge_readiness` is the separate, PR-quality verdict.
 | `custom_rules_dir` | string | `""` | Path to a `.pr-review/` directory (`config.json`, `rules.md`, `files.json`) |
 | `guidelines_path` | string | `""` | Path to a single team guidelines markdown file |
 | `codebase_context_path` | string | `""` | Path to a precomputed codebase-context markdown |
-| `work_items_path` | string | `""` | Path to a precomputed linked-work-items markdown |
-| `ignore_work_items` | bool | `false` | Suppress work-items context entirely |
 | `previous_review_path` | string | `""` | Path to a prior `pr-N-review-report.md` for **delta mode** |
 | `prior_feedback_path` | string | `""` | JSON of PR-author / maintainer replies to the most recent prior bot review |
 | `review_number` | int | `1` | Sequential review number for archive filenames + delta header |

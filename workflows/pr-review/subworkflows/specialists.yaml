@@ -61,11 +61,6 @@ workflow:
       required: false
       default: ""
       description: "Codebase context for the changed files (passed through)."
-    work_items_context:
-      type: string
-      required: false
-      default: ""
-      description: "Linked work-items context (passed through)."
     prior_feedback_content:
       type: string
       required: false
@@ -152,7 +147,6 @@ agents:
       - workflow.input.guidelines_content
       - workflow.input.custom_rules?
       - workflow.input.codebase_context?
-      - workflow.input.work_items_context?
       - workflow.input.prior_feedback_content?
       - workflow.input.strictness
       - workflow.input.focus
@@ -286,13 +280,6 @@ agents:
       {{ workflow.input.codebase_context }}
       {% endif %}
 
-      {% if workflow.input.work_items_context | length > 0 %}
-      ## Linked Work Items (intent / acceptance criteria)
-
-      Treat these as the source of truth for the PR's intent:
-
-      {{ workflow.input.work_items_context }}
-      {% endif %}
 
       {% if workflow.input.focus | length > 0 %}
       ## Focus Areas
@@ -355,7 +342,6 @@ agents:
       - workflow.input.guidelines_content
       - workflow.input.custom_rules?
       - workflow.input.codebase_context?
-      - workflow.input.work_items_context?
       - workflow.input.prior_feedback_content?
       - workflow.input.strictness
       - workflow.input.focus
@@ -468,11 +454,6 @@ agents:
       {{ workflow.input.codebase_context }}
       {% endif %}
 
-      {% if workflow.input.work_items_context | length > 0 %}
-      ## Linked Work Items (acceptance criteria — verify tests cover stated scope)
-
-      {{ workflow.input.work_items_context }}
-      {% endif %}
 
       {% if workflow.input.focus | length > 0 %}
       ## Focus Areas
@@ -526,7 +507,6 @@ agents:
       - workflow.input.guidelines_content
       - workflow.input.custom_rules?
       - workflow.input.codebase_context?
-      - workflow.input.work_items_context?
       - workflow.input.prior_feedback_content?
       - workflow.input.strictness
       - workflow.input.focus
@@ -689,7 +669,6 @@ agents:
       - workflow.input.guidelines_content
       - workflow.input.custom_rules?
       - workflow.input.codebase_context?
-      - workflow.input.work_items_context?
       - workflow.input.prior_feedback_content?
       - workflow.input.strictness
       - workflow.input.focus

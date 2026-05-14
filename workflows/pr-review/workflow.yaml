@@ -135,18 +135,6 @@ workflow:
       default: ""
       description: "Path to a precomputed codebase-context markdown."
 
-    work_items_path:
-      type: string
-      required: false
-      default: ""
-      description: "Path to a precomputed work-items markdown."
-
-    ignore_work_items:
-      type: boolean
-      required: false
-      default: false
-      description: "When true, work-items context is unconditionally suppressed."
-
     previous_review_path:
       type: string
       required: false
@@ -276,8 +264,6 @@ agents:
       - workflow.input.max_rounds
       - workflow.input.strictness
       - workflow.input.codebase_context_path?
-      - workflow.input.work_items_path?
-      - workflow.input.ignore_work_items?
       - workflow.input.custom_rules_dir?
       - workflow.input.previous_review_path?
       - workflow.input.prior_feedback_path?
@@ -301,7 +287,7 @@ agents:
       convert backslashes to forward slashes), then verify it does NOT contain
       `../` or `..\\`. Validate every path-typed input that is non-empty:
       pr_data_dir, output_dir, guidelines_path, codebase_context_path,
-      work_items_path, custom_rules_dir, previous_review_path,
+      custom_rules_dir, previous_review_path,
       prior_feedback_path. If traversal is detected anywhere, set the
       offending path to an empty string and record the error in metadata.
 
@@ -348,14 +334,6 @@ agents:
       Combine into a single `custom_rules` string with clear section headers
       so reviewers know which rules apply where. Missing files are not errors.
 
-      ### Linked Work Items
-
-      If `ignore_work_items` is true, skip work-item context entirely — set
-      `work_items_context` to "" and record the suppression in metadata.
-
-      Otherwise, if `work_items_path` is non-empty, read it and pass through
-      verbatim as `work_items_context`. Missing or unreadable file → "" plus
-      a metadata note (best-effort, non-fatal).
     prompt: |
       Read the PR metadata and prepare files for review.
 
@@ -401,17 +379,11 @@ agents:
       9. {% if workflow.input.codebase_context_path %}Read codebase context from
          `{{ workflow.input.codebase_context_path }}` into `codebase_context`.{% else %}Set
          `codebase_context` to "".{% endif %}
-      10. {% if workflow.input.work_items_path and not workflow.input.ignore_work_items %}Read
-          linked work items from `{{ workflow.input.work_items_path }}` into
-          `work_items_context`.{% elif workflow.input.ignore_work_items %}Skip
-          work-item context — set `work_items_context` to "" and record the
-          `ignore_work_items` suppression in metadata.{% else %}Set
-          `work_items_context` to "".{% endif %}
-      11. {% if workflow.input.prior_feedback_path %}Read prior author feedback
+      10. {% if workflow.input.prior_feedback_path %}Read prior author feedback
           from `{{ workflow.input.prior_feedback_path }}` into
           `prior_feedback_content` (verbatim).{% else %}Set
           `prior_feedback_content` to "".{% endif %}
-      12. Output the parsed PR metadata, the data directory path, the
+      11. Output the parsed PR metadata, the data directory path, the
           loaded content blobs, the nonce, the validated strictness, and
           any metadata notes.
           Do NOT output the diff content — downstream agents read
@@ -435,21 +407,6 @@ agents:
       codebase_context:
         type: string
         description: "Codebase context for the changed files (callers, related functions, patterns). Empty if not provided."
-      work_items_context:
-        type: string
-        description: "Linked work-item context (title, type, state, description, acceptance criteria). Empty if no items linked, fetch failed, or ignore_work_items=true."
-      prior_feedback_content:
-        type: string
-        description: "Verbatim contents of the prior_feedback_path JSON (per-finding human responses + thread resolution status). Empty if not provided or unreadable."
-      strictness:
-        type: number
-        description: "Validated strictness level (1-3, defaulted to 2 if invalid)."
-      max_rounds:
-        type: number
-        description: "Validated max_rounds (clamped to [1, 10])."
-      metadata:
-        type: object
-        description: "Workflow metadata (validation results, clamping notes, suppression flags, any read errors)."
     routes:
       - to: specialists
 
@@ -469,7 +426,6 @@ agents:
       - dispatcher.output.guidelines_content
       - dispatcher.output.custom_rules
       - dispatcher.output.codebase_context
-      - dispatcher.output.work_items_context
       - dispatcher.output.prior_feedback_content
       - dispatcher.output.strictness
       - workflow.input.focus
@@ -487,7 +443,6 @@ agents:
       guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
       custom_rules: "{{ dispatcher.output.custom_rules | default('') }}"
       codebase_context: "{{ dispatcher.output.codebase_context | default('') }}"
-      work_items_context: "{{ dispatcher.output.work_items_context | default('') }}"
       prior_feedback_content: "{{ dispatcher.output.prior_feedback_content | default('') }}"
       strictness: "{{ dispatcher.output.strictness }}"
       focus: "{{ workflow.input.focus }}"
@@ -518,7 +473,6 @@ agents:
       - dispatcher.output.guidelines_content
       - dispatcher.output.custom_rules
       - dispatcher.output.codebase_context
-      - dispatcher.output.work_items_context
       - dispatcher.output.prior_feedback_content
       - dispatcher.output.strictness
       - dispatcher.output.max_rounds
@@ -535,7 +489,6 @@ agents:
       guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
       custom_rules: "{{ dispatcher.output.custom_rules | default('') }}"
       codebase_context: "{{ dispatcher.output.codebase_context | default('') }}"
-      work_items_context: "{{ dispatcher.output.work_items_context | default('') }}"
       prior_feedback_content: "{{ dispatcher.output.prior_feedback_content | default('') }}"
       strictness: "{{ dispatcher.output.strictness }}"
       max_rounds: "{{ dispatcher.output.max_rounds }}"

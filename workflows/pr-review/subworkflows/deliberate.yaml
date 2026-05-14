@@ -52,10 +52,6 @@ workflow:
       type: string
       required: false
       default: ""
-    work_items_context:
-      type: string
-      required: false
-      default: ""
     prior_feedback_content:
       type: string
       required: false
@@ -135,7 +131,6 @@ agents:
       - workflow.input.guidelines_content
       - workflow.input.custom_rules?
       - workflow.input.codebase_context?
-      - workflow.input.work_items_context?
       - workflow.input.prior_feedback_content?
       - workflow.input.strictness
       - workflow.input.consolidated_findings
@@ -259,10 +254,6 @@ agents:
       {{ workflow.input.codebase_context }}
       {% endif %}
 
-      {% if workflow.input.work_items_context | length > 0 %}
-      ## Linked Work Items
-      {{ workflow.input.work_items_context }}
-      {% endif %}
 
       {% if workflow.input.prior_feedback_content | length > 0 %}
       ## Prior Author Feedback (re-review)
@@ -333,7 +324,6 @@ agents:
       - workflow.input.guidelines_content
       - workflow.input.custom_rules?
       - workflow.input.codebase_context?
-      - workflow.input.work_items_context?
       - workflow.input.prior_feedback_content?
       - workflow.input.strictness
       - workflow.input.consolidated_findings
@@ -409,10 +399,6 @@ agents:
       {{ workflow.input.codebase_context }}
       {% endif %}
 
-      {% if workflow.input.work_items_context | length > 0 %}
-      ## Linked Work Items
-      {{ workflow.input.work_items_context }}
-      {% endif %}
 
       {% if workflow.input.prior_feedback_content | length > 0 %}
       ## Prior Author Feedback (re-review)
