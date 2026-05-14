@@ -90,7 +90,7 @@ workflow:
     enabled_specialists:
       type: array
       required: false
-      default: ["code", "tests", "errors", "types", "comments"]
+      default: ["code", "security", "tests", "errors", "types", "comments"]
       description: "Which specialists to run (informational in v1; the gate filters by validity)."
 
     include_polish:
@@ -171,22 +171,27 @@ workflow:
       default: false
       description: "Post the rendered comment + inline comments back to the PR via gh CLI when complete."
 
-    lens_security_model:
+    lens_skeptic_model:
       type: string
       required: false
       default: "claude-opus-4.7"
-      description: "Model for the Security & Correctness lens."
+      description: "Model for the Skeptic lens."
 
-    lens_robustness_model:
+    lens_completeness_model:
       type: string
       required: false
       default: "gpt-5.5"
-      description: "Model for the Robustness & Completeness lens (cross-family)."
+      description: "Model for the Completeness lens (cross-family)."
 
     specialist_code_model:
       type: string
       required: false
       default: "claude-opus-4.7"
+    specialist_security_model:
+      type: string
+      required: false
+      default: "claude-opus-4.7"
+      description: "Model for specialist_security (CVSS-style vulnerability review). Defaults to opus because security balancing of true-positives vs false-positives benefits from strong reasoning."
     specialist_tests_model:
       type: string
       required: false
@@ -432,6 +437,7 @@ agents:
       - workflow.input.exclude
       - workflow.input.enabled_specialists
       - workflow.input.specialist_code_model
+      - workflow.input.specialist_security_model
       - workflow.input.specialist_tests_model
       - workflow.input.specialist_errors_model
       - workflow.input.specialist_types_model
@@ -449,6 +455,7 @@ agents:
       exclude: "{{ workflow.input.exclude | tojson }}"
       enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
       specialist_code_model: "{{ workflow.input.specialist_code_model }}"
+      specialist_security_model: "{{ workflow.input.specialist_security_model }}"
       specialist_tests_model: "{{ workflow.input.specialist_tests_model }}"
       specialist_errors_model: "{{ workflow.input.specialist_errors_model }}"
       specialist_types_model: "{{ workflow.input.specialist_types_model }}"
@@ -480,8 +487,8 @@ agents:
       - specialists.output.specialist_contributions
       - workflow.input.focus
       - workflow.input.exclude
-      - workflow.input.lens_security_model
-      - workflow.input.lens_robustness_model
+      - workflow.input.lens_skeptic_model
+      - workflow.input.lens_completeness_model
     input_mapping:
       pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
       pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
@@ -496,8 +503,8 @@ agents:
       exclude: "{{ workflow.input.exclude | tojson }}"
       consolidated_findings: "{{ specialists.output.consolidated_findings }}"
       specialist_contributions: "{{ specialists.output.specialist_contributions }}"
-      lens_security_model: "{{ workflow.input.lens_security_model }}"
-      lens_robustness_model: "{{ workflow.input.lens_robustness_model }}"
+      lens_skeptic_model: "{{ workflow.input.lens_skeptic_model }}"
+      lens_completeness_model: "{{ workflow.input.lens_completeness_model }}"
     routes:
       - to: polish
 
@@ -549,8 +556,8 @@ agents:
       - workflow.input.exclude
       - workflow.input.max_rounds
       - workflow.input.strictness
-      - workflow.input.lens_security_model
-      - workflow.input.lens_robustness_model
+      - workflow.input.lens_skeptic_model
+      - workflow.input.lens_completeness_model
       - workflow.input.review_number
       - workflow.input.include_polish
       - workflow.input.enabled_specialists
@@ -596,8 +603,8 @@ agents:
       exclude: "{{ workflow.input.exclude | tojson }}"
       max_rounds: "{{ workflow.input.max_rounds }}"
       strictness: "{{ workflow.input.strictness }}"
-      lens_security_model: "{{ workflow.input.lens_security_model }}"
-      lens_robustness_model: "{{ workflow.input.lens_robustness_model }}"
+      lens_skeptic_model: "{{ workflow.input.lens_skeptic_model }}"
+      lens_completeness_model: "{{ workflow.input.lens_completeness_model }}"
       review_number: "{{ workflow.input.review_number }}"
       include_polish: "{{ workflow.input.include_polish }}"
       enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"

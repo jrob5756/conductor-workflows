@@ -147,11 +147,11 @@ workflow:
       type: number
       required: false
       default: 2
-    lens_security_model:
+    lens_skeptic_model:
       type: string
       required: false
       default: "claude-opus-4.7"
-    lens_robustness_model:
+    lens_completeness_model:
       type: string
       required: false
       default: "gpt-5.5"
@@ -224,8 +224,8 @@ agents:
       - workflow.input.previous_review_path?
       - workflow.input.prior_feedback_path?
       - workflow.input.strictness
-      - workflow.input.lens_security_model
-      - workflow.input.lens_robustness_model
+      - workflow.input.lens_skeptic_model
+      - workflow.input.lens_completeness_model
       - workflow.input.review_number
       - workflow.input.include_polish
       - workflow.input.enabled_specialists
@@ -443,7 +443,7 @@ agents:
       **PR**: #<number> — <title>
       **Merge readiness**: <verdict>
       **Review confidence**: <score>/100 <badge> · *reviewer agreement & finding strength — not a PR-quality score*
-      **Models**: {{ workflow.input.lens_security_model }} (Security & Correctness lens), {{ workflow.input.lens_robustness_model }} (Robustness & Completeness lens) over 5 specialists
+      **Models**: {{ workflow.input.lens_skeptic_model }} (Skeptic lens), {{ workflow.input.lens_completeness_model }} (Completeness lens) over 5 specialists
       **Deliberation**: <N> round(s), consensus <reached/not reached>
       **Previous review**: Review #{{ workflow.input.review_number - 1 }}
 
@@ -489,7 +489,7 @@ agents:
       **Merge readiness**: <verdict>
       **Review confidence**: <score>/100 <badge> · *reviewer agreement & finding strength — not a PR-quality score*
       **Specialists**: {{ workflow.input.enabled_specialists | join(', ') }} ({{ workflow.input.valid_count }}/{{ workflow.input.enabled_specialists | length }} succeeded)
-      **Lenses**: {{ workflow.input.lens_security_model }} (Security & Correctness), {{ workflow.input.lens_robustness_model }} (Robustness & Completeness)
+      **Lenses**: {{ workflow.input.lens_skeptic_model }} (Skeptic), {{ workflow.input.lens_completeness_model }} (Completeness)
       **Deliberation**: <N> round(s), consensus <reached/not reached>
 
       <degraded banner here when degraded>
@@ -749,8 +749,8 @@ agents:
       - workflow.input.exclude
       - workflow.input.max_rounds
       - workflow.input.strictness
-      - workflow.input.lens_security_model
-      - workflow.input.lens_robustness_model
+      - workflow.input.lens_skeptic_model
+      - workflow.input.lens_completeness_model
       - workflow.input.review_number
       - workflow.input.include_polish
       - workflow.input.enabled_specialists
@@ -876,8 +876,8 @@ agents:
       | specialist_types | (see workflow input) |
       | specialist_comments | (see workflow input) |
       | consolidator | claude-sonnet-4.6 |
-      | lens_security_correctness | {{ workflow.input.lens_security_model }} |
-      | lens_robustness_completeness | {{ workflow.input.lens_robustness_model }} |
+      | lens_skeptic | {{ workflow.input.lens_skeptic_model }} |
+      | lens_completeness | {{ workflow.input.lens_completeness_model }} |
       | arbitrator | claude-opus-4.7 |
       | report_writer | claude-opus-4.7 |
       | inline_comments_writer | claude-sonnet-4.6 |
