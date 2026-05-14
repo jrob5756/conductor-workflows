@@ -1,13 +1,4 @@
 workflows:
-  qa-bot:
-    description: "Simple question-answering workflow with a single agent"
-    path: workflows/qa-bot/workflow.yaml
-  summarizer:
-    description: "Two-stage summarizer — draft then refine"
-    path: workflows/summarizer/workflow.yaml
-  code-review:
-    description: "Multi-agent code review with reviewer and critic"
-    path: workflows/code-review/workflow.yaml
   sdd-plan:
     description: "Solution design + implementation plan with technical and readability review cycles"
     path: workflows/sdd/plan.yaml
