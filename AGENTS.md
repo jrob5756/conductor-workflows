@@ -14,7 +14,7 @@ This is a sample workflow registry for [Conductor](https://github.com/microsoft/
 
 - Workflow files live under `workflows/` and are referenced from `index.yaml`.
 - Keep `README.md` in sync with `index.yaml` when adding, removing, or renaming workflows.
-- Use lowercase, hyphen-separated names for workflow ids (e.g., `sdd-plan-v3`).
+- Use lowercase, hyphen-separated names for workflow ids (e.g., `sdd-design`).
 - Prefer YAML over JSON for workflow definitions.
 
 ## Validating changes

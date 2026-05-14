@@ -1,42 +1,40 @@
-# Plan Workflow
+# Design Workflow
 #
-# This workflow creates a comprehensive solution design and implementation plan
-# that is closely grounded in the codebase. It combines high-level architectural
-# design (decisions, trade-offs, alternatives) with actionable implementation
-# planning (epics, tasks, file changes).
+# This workflow creates a comprehensive solution design document that is
+# closely grounded in the codebase. It focuses on high-level architectural
+# design (decisions, trade-offs, alternatives) WITHOUT a detailed
+# implementation plan — that is the job of the `sdd-plan` workflow, which
+# can be run separately with this design as input.
 #
-# When an existing solution design document is provided via the `design`
-# input, the workflow skips the design phase and produces ONLY an
-# implementation plan grounded in that design (a typical pairing with the
-# `sdd-design` workflow, which authors the design document on its own).
-#
-# The plan is reviewed by the `document-review` sub-workflow, which scores it
-# on technical accuracy and readability. If either score is below the
+# The design is reviewed by the `document-review` sub-workflow, which scores
+# it on technical accuracy and readability. If either score is below the
 # threshold (90), the workflow loops back to the architect for revision.
 #
 # Usage:
-#   conductor run workflows/sdd/plan.yaml --input purpose="Build a user authentication system with OAuth2"
+#   conductor run workflows/sdd/design.yaml --input purpose="Build a user authentication system with OAuth2"
 #
 # With explicit output path:
-#   conductor run workflows/sdd/plan.yaml --input purpose="..." --input output_path="docs/auth-migration.plan.md"
-#
-# Plan-only mode (consume an existing design):
-#   conductor run workflows/sdd/plan.yaml \
-#     --input purpose="..." \
-#     --input design="docs/auth-migration.design.md"
+#   conductor run workflows/sdd/design.yaml --input purpose="..." --input output_path="docs/auth-migration.design.md"
 #
 # With verbose output:
-#   conductor -V run workflows/sdd/plan.yaml --input purpose="..."
+#   conductor -V run workflows/sdd/design.yaml --input purpose="..."
 #
 # Flow:
 #   architect → document_review (sub-workflow)
 #     → $end                  (when both reviews are approved)
 #     → architect             (when either review is not approved)
+#
+# Composing with sdd-plan:
+#   Once this workflow produces an approved design document, you can feed it
+#   into sdd-plan to author the implementation plan separately:
+#     conductor run workflows/sdd/plan.yaml \
+#       --input purpose="..." \
+#       --input design="docs/auth-migration.design.md"
 
 workflow:
-  name: plan
-  description: Create a comprehensive solution design with implementation plan grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability. Accepts an optional `design` input to produce only the implementation plan from an existing design document.
-  version: "2.2.0"
+  name: design
+  description: Create a comprehensive solution design document grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability
+  version: "1.0.0"
   entry_point: architect
 
   runtime:
@@ -63,15 +61,11 @@ workflow:
     purpose:
       type: string
       required: true
-      description: A clear description of the feature, change, or initiative to design and plan
+      description: A clear description of the feature, change, or initiative to design
     output_path:
       type: string
       required: false
-      description: Optional file path for the plan document (e.g. docs/my-feature.plan.md)
-    design:
-      type: string
-      required: false
-      description: Optional path to an existing solution design document. When provided, the workflow skips the design phase and produces only an implementation plan grounded in that design.
+      description: Optional file path for the design document (e.g. docs/my-feature.design.md)
 
   context:
     mode: explicit
@@ -81,20 +75,18 @@ workflow:
 
 agents:
   - name: architect
-    description: Researches the codebase and broader context, then authors a solution design document with actionable implementation plan
+    description: Researches the codebase and broader context, then authors a solution design document
     model: claude-opus-4.7-1m-internal
     reasoning:
       effort: high
     input:
       - workflow.input.purpose
       - workflow.input.output_path?
-      - workflow.input.design?
       - architect.output?
       - document_review.output?
     system_prompt: |
       You are a Principal Software Architect. You analyze requirements deeply, research the
-      existing codebase, and produce clear, high-level technical design documents with
-      actionable implementation plans.
+      existing codebase, and produce clear, high-level technical design documents.
 
       Your core capabilities include:
       - Designing scalable, maintainable architectures
@@ -103,22 +95,15 @@ agents:
       - Writing precise, fact-based design documents for cross-team alignment
       - Documenting APIs, data flows, and component interactions
       - Identifying risks, dependencies, and open questions
-      - Breaking complex designs into discrete, actionable epics
-      - Identifying file changes, dependencies, and prerequisites
-      - Creating task breakdowns with effort estimates
 
       Your documents are:
       - High-level but grounded in the actual codebase (not abstract hand-waving)
-      - Focused on *what* and *why* for design sections, with concrete *how* in the implementation plan
+      - Focused on *what* and *why* — leave detailed implementation breakdown
+        (epics, tasks, file-by-file changes) to a separate planning step
       - Structured for engineering and architecture audiences
       - Honest about trade-offs, risks, and open questions
-      - Actionable — a developer or AI agent should be able to execute the plan
     prompt: |
-      {% if workflow.input.design %}
-      Create an implementation plan for an existing solution design.
-      {% else %}
-      Create a solution design and implementation plan based on the following purpose:
-      {% endif %}
+      Create a solution design based on the following purpose:
 
       **Purpose:** {{ workflow.input.purpose }}
 
@@ -142,36 +127,6 @@ agents:
 
       ---
 
-      {% if workflow.input.design %}
-      ## Source Design Document
-
-      You are producing the implementation plan for an existing, already-reviewed
-      solution design. Read the design at:
-
-      `{{ workflow.input.design }}`
-
-      Treat the design as the authoritative source of truth:
-
-      - Do **not** re-derive design decisions, alternatives, or trade-offs — the
-        design has already settled them.
-      - Do **not** duplicate design content in your output. Reference the design
-        by section/heading when explaining what each task delivers.
-      - Do **not** re-litigate the design. If you discover genuine gaps,
-        ambiguities, or inconsistencies that block planning, surface them in
-        the **Open Questions** section instead of silently choosing.
-
-      You should still browse the codebase as needed to:
-
-      - Confirm concrete file paths, existing patterns, and naming conventions
-      - Verify task feasibility against the current code
-      - Identify prerequisites and sequencing constraints
-
-      ---
-
-      ## Implementation Plan Document
-
-      Write the document with the following sections:
-      {% else %}
       ## Phase 1: Research
 
       Before drafting, perform thorough research:
@@ -191,9 +146,11 @@ agents:
 
       ---
 
-      ## Phase 2: Design & Plan Document
+      ## Phase 2: Design Document
 
-      Write the document with the following sections:
+      Write the document with the following sections. Do **not** include an
+      implementation plan, epic breakdown, or task tables — those belong to
+      the separate planning step that consumes this design.
 
       ### Executive Summary
       One paragraph describing the proposal, its motivation, and expected outcome.
@@ -259,46 +216,12 @@ agents:
 
       Include this section when the design carries meaningful technical, operational,
       or schedule risks. Skip for low-risk changes.
-      {% endif %}
 
       ### Open Questions
       Items requiring further discussion, investigation, or decision from stakeholders.
-      {% if workflow.input.design %}In plan-only mode, surface any gaps,
-      ambiguities, or inconsistencies in the source design that prevented
-      confident planning.{% endif %}
-
-      ### Implementation Phases
-      Break down the implementation into logical phases with exit criteria.
-
-      ### Files Affected
-
-      #### New Files
-      | File Path | Purpose |
-      |-----------|---------|
-
-      #### Modified Files
-      | File Path | Changes |
-      |-----------|---------|
-
-      #### Deleted Files
-      | File Path | Reason |
-      |-----------|--------|
-
-      ### Implementation Plan
-
-      For each epic, provide:
-      - **Goal**: What this epic achieves
-      - **Prerequisites**: Dependencies on other epics
-      - **Tasks**: Table with Task ID, Type (IMPL/TEST), Description, Files, and Status (TO DO/IN PROGRESS/DONE)
-      - **Acceptance Criteria**: Checkboxes for completion
-
-      Keep epics focused—ideally affecting no more than 7 files and completable within 1-2 weeks.
-      Tests should be created alongside implementation tasks.
 
       ### References
       Links to relevant documentation, prior art, RFCs, or external resources.
-      {% if workflow.input.design %} Include a reference to the source design
-      document at `{{ workflow.input.design }}`.{% endif %}
 
       ---
 
@@ -329,35 +252,24 @@ agents:
 
       {% if workflow.input.output_path %}
       Save the document to: `{{ workflow.input.output_path }}`
-      {% elif workflow.input.design %}
-      Derive the file path from the source design document at
-      `{{ workflow.input.design }}`:
-
-      - If the design path ends in `.design.md`, replace that suffix with
-        `.plan.md` and save in the same directory. Examples:
-        - `docs/auth-migration.design.md` → `docs/auth-migration.plan.md`
-        - `jwt-rotation.design.md` → `jwt-rotation.plan.md`
-      - Otherwise, save next to the design with the same base name and a
-        `.plan.md` suffix. Example:
-        - `docs/auth-migration.md` → `docs/auth-migration.plan.md`
       {% else %}
       Choose a file path using the following convention:
 
       - If the purpose input references a document path, derive the name from that document
         and save it in the same directory. Examples:
-        - `upgrade-database-v2.brainstorm.md` → `upgrade-database-v2.plan.md`
-        - `add-user-authentication.md` → `add-user-authentication.plan.md`
+        - `upgrade-database-v2.brainstorm.md` → `upgrade-database-v2.design.md`
+        - `add-user-authentication.md` → `add-user-authentication.design.md`
       - Otherwise:
         - Save the document in the current working directory.
-        - Use the naming convention: `[descriptive-slug].plan.md`
+        - Use the naming convention: `[descriptive-slug].design.md`
         - Examples:
-          - `jwt-authentication-migration.plan.md`
-          - `event-sourcing-pipeline.plan.md`
+          - `jwt-authentication-migration.design.md`
+          - `event-sourcing-pipeline.design.md`
       {% endif %}
     output:
       file_path:
         type: string
-        description: The path where the plan document was saved
+        description: The path where the design document was saved
       revision_notes:
         type: string
         description: Summary of changes made in this revision (empty on first draft)
@@ -365,7 +277,7 @@ agents:
       - to: document_review
 
   - name: document_review
-    description: Reviews the plan document for technical accuracy and readability via the document-review sub-workflow
+    description: Reviews the design document for technical accuracy and readability via the document-review sub-workflow
     type: workflow
     workflow: ../document-review/workflow.yaml
     input:
@@ -383,7 +295,7 @@ agents:
 
 output:
   purpose: "{{ workflow.input.purpose }}"
-  plan_file: "{{ architect.output.file_path }}"
+  design_file: "{{ architect.output.file_path }}"
   technical_review_score: "{{ document_review.output.technical_review_score }}"
   readability_review_score: "{{ document_review.output.readability_review_score }}"
   technical_review_feedback: "{{ document_review.output.technical_review_feedback }}"

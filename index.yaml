@@ -2,15 +2,12 @@ workflows:
   document-review:
     description: "Review-only workflow that scores a markdown document on technical accuracy and readability, short-circuiting if the technical score is below the threshold"
     path: workflows/document-review/workflow.yaml
+  sdd-design:
+    description: "Solution design document with technical and readability review cycles (no implementation plan)"
+    path: workflows/sdd/design.yaml
   sdd-plan:
-    description: "Solution design + implementation plan with technical and readability review cycles"
+    description: "Solution design + implementation plan with technical and readability review cycles. Accepts an optional `design` input to skip the design phase and produce only the implementation plan from an existing design document"
     path: workflows/sdd/plan.yaml
-  sdd-plan-v3:
-    description: "Quality-first multi-agent solution design and implementation planning workflow with specialized model selection per cognitive task"
-    path: workflows/sdd/plan-v3.yaml
   sdd-implement:
     description: "Implement a feature based on an implementation plan document, with epic-level and plan-level review"
     path: workflows/sdd/implement.yaml
-  sdd-implement-v3:
-    description: "Quality-first multi-agent implementation workflow with adversarial plan-level review and bounded fixer escalation"
-    path: workflows/sdd/implement-v3.yaml
