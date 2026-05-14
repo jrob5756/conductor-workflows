@@ -1,0 +1,76 @@
+name: Validate workflows
+
+on:
+  pull_request:
+    paths:
+      - "workflows/**"
+      - "index.yaml"
+      - ".github/workflows/validate-workflows.yml"
+  push:
+    branches: [main]
+    paths:
+      - "workflows/**"
+      - "index.yaml"
+      - ".github/workflows/validate-workflows.yml"
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      # gh CLI auth — public repo, but `gh` requires a token to be set.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install latest conductor-cli
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/conductor
+          gh release download --repo microsoft/conductor --pattern '*.whl' --dir /tmp/conductor
+          pip install --upgrade pip
+          pip install /tmp/conductor/*.whl pyyaml
+          conductor --version
+
+      - name: Validate every workflow under workflows/
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          failures=0
+          for f in workflows/**/*.yaml workflows/**/*.yml; do
+            echo "::group::$f"
+            if conductor validate "$f"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error file=$f::conductor validate failed"
+              failures=$((failures + 1))
+            fi
+          done
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures workflow(s) failed validation"
+            exit 1
+          fi
+
+      - name: Verify index.yaml entries point to existing files
+        run: |
+          python3 - <<'PY'
+          import sys, yaml, pathlib
+          idx = yaml.safe_load(open("index.yaml"))
+          missing = []
+          for name, meta in (idx.get("workflows") or {}).items():
+              path = meta.get("path")
+              if not path or not pathlib.Path(path).is_file():
+                  missing.append((name, path))
+          if missing:
+              for name, path in missing:
+                  print(f"::error::index.yaml entry '{name}' references missing path: {path}")
+              sys.exit(1)
+          print(f"OK — all {len(idx.get('workflows') or {})} index.yaml entries resolve")
+          PY

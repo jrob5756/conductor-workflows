@@ -21,9 +21,12 @@ This is a sample workflow registry for [Conductor](https://github.com/microsoft/
 
 When modifying workflows:
 
-1. Ensure YAML is valid.
-2. Confirm the workflow id in the file matches its entry in `index.yaml`.
-3. Update `README.md` if the public-facing list or description changes.
+1. Run `conductor validate <path-to-workflow.yaml>` for **every** workflow you change. This catches schema, routing, agent-reference, and template errors before commit.
+2. If you add, remove, or rename a workflow, validate every workflow listed in `index.yaml` to confirm nothing else regressed.
+3. Confirm the workflow id in the file matches its entry in `index.yaml`.
+4. Update `README.md` if the public-facing list or description changes.
+
+CI runs `conductor validate` on every YAML under `workflows/` for each pull request (`.github/workflows/validate-workflows.yml`). Passing locally is a prerequisite for opening a PR.
 
 ## Commit guidance
 
