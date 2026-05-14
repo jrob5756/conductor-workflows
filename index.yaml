@@ -1,4 +1,7 @@
 workflows:
+  document-review:
+    description: "Review-only workflow that scores a markdown document on technical accuracy and readability, short-circuiting if the technical score is below the threshold"
+    path: workflows/document-review/workflow.yaml
   sdd-plan:
     description: "Solution design + implementation plan with technical and readability review cycles"
     path: workflows/sdd/plan.yaml

@@ -1,0 +1,269 @@
+# Document Review Workflow
+#
+# Reviews an existing markdown document with two independent reviewers:
+#   1. Technical Reviewer  — accuracy, factual correctness, completeness, soundness
+#   2. Readability Reviewer — structure, clarity, formatting, audience fit
+#
+# Reviewers do NOT modify the document. They produce scores and feedback.
+#
+# Flow:
+#   technical_reviewer
+#     → readability_reviewer  (only if technical score >= technical_threshold)
+#     → $end                  (otherwise short-circuits and returns)
+#
+# Usage:
+#   conductor run document-review --input document_path="docs/my-design.md"
+#
+# With purpose context:
+#   conductor run document-review \
+#     --input document_path="docs/my-design.md" \
+#     --input purpose="Migrate auth to OAuth2"
+#
+# With custom thresholds:
+#   conductor run document-review \
+#     --input document_path="docs/my-design.md" \
+#     --input technical_threshold=80 \
+#     --input readability_threshold=70
+
+workflow:
+  name: document-review
+  description: Review-only workflow that scores an existing markdown document on technical accuracy and readability, short-circuiting if the technical score is below the technical threshold
+  version: "1.0.0"
+  entry_point: technical_reviewer
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["search"]
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+      ms-learn:
+        type: http
+        url: https://learn.microsoft.com/api/mcp
+        tools: ["*"]
+
+  input:
+    document_path:
+      type: string
+      required: true
+      description: Path to the markdown document to review
+    purpose:
+      type: string
+      required: false
+      description: Optional context describing what the document is meant to accomplish, used to ground both reviews
+    technical_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Minimum score (0-100) the technical review must reach for the readability review to run, and for the technical review to be considered approved
+    readability_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Minimum score (0-100) the readability review must reach to be considered approved
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: technical_reviewer
+    description: Reviews the document for technical accuracy, factual correctness, and completeness
+    model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.document_path
+      - workflow.input.purpose?
+      - workflow.input.technical_threshold
+    system_prompt: |
+      You are a Senior Engineering Reviewer with broad expertise across software
+      architecture, distributed systems, cloud-native development, and general
+      technical writing. You review documents for technical accuracy, factual
+      correctness, and completeness.
+
+      You are especially attentive to:
+      - Factual accuracy of technical claims (versions, API names, behavior, compatibility)
+      - Whether claims about a codebase, system, or external technology hold up under verification
+      - Completeness of the analysis — gaps, missing considerations, hand-waving
+      - Soundness of any decisions, recommendations, or conclusions
+      - Realistic assessment of risks, trade-offs, and alternatives
+      - Whether assumptions are explicit and ambiguities are flagged
+    prompt: |
+      Review the document for **technical accuracy and completeness**.
+
+      **Document Location:**
+      {{ workflow.input.document_path }}
+
+      Read the document from the file path above.
+
+      {% if workflow.input.purpose %}
+      **Stated Purpose / Context:**
+      {{ workflow.input.purpose }}
+
+      Use this to judge whether the document actually accomplishes what it sets
+      out to do.
+      {% else %}
+      No explicit purpose was provided. Infer the document's intent from its
+      content and judge it on its own terms.
+      {% endif %}
+
+      **Approval Threshold:** {{ workflow.input.technical_threshold }}/100
+
+      ---
+
+      ## Fact-Checking
+
+      Independently verify the document's claims:
+      - Read referenced source files and project files in the codebase, if any
+      - Search the web to verify version numbers, API names, library capabilities, and external facts
+      - Confirm that descriptions of current state match reality
+      - Check that proposed approaches are feasible given the constraints described
+
+      ---
+
+      ## Evaluation Criteria
+
+      Focus exclusively on **technical content** — accuracy, correctness, and
+      completeness. Do NOT evaluate structure, formatting, or readability — a
+      separate reviewer handles that.
+
+      | Criteria | Description |
+      |----------|-------------|
+      | **Factual Accuracy** | Are technical claims, versions, names, and behavior described correctly? |
+      | **Grounding** | Are claims about code, systems, or external sources supported by evidence rather than aspirational? |
+      | **Completeness** | Are all relevant aspects addressed? Are there obvious gaps? |
+      | **Soundness** | Are recommendations, decisions, or conclusions well-reasoned and defensible? |
+      | **Alternatives & Trade-offs** | Where applicable, are alternatives fairly considered with honest trade-offs? |
+      | **Impact & Side Effects** | Are downstream effects, dependencies, and compatibility considerations identified? |
+      | **Risk Assessment** | Are risks realistic and mitigations concrete (when the document discusses risk)? |
+      | **Feasibility** | Can what the document proposes actually be done given the described system? |
+      | **Simplicity** | Is the proposed approach the minimum viable one? Flag unnecessary abstraction, configurability, or scope creep. |
+      | **Assumption Transparency** | Are assumptions explicitly stated? Are ambiguities flagged with the chosen interpretation? |
+
+      Provide:
+      1. A score from 0-100
+      2. Whether the technical content is approved (score >= {{ workflow.input.technical_threshold }})
+      3. Specific feedback on technical issues
+      4. List of critical technical issues that must be addressed
+    output:
+      score:
+        type: number
+        description: Technical accuracy score from 0-100
+      approved:
+        type: boolean
+        description: Whether the technical content meets the threshold
+      feedback:
+        type: string
+        description: Detailed feedback on technical issues
+      critical_issues:
+        type: array
+        description: List of critical technical issues that must be addressed
+    routes:
+      - to: readability_reviewer
+        when: "{{ output.approved }}"
+      - to: $end
+
+  - name: readability_reviewer
+    description: Reviews the document for structure, clarity, and readability
+    model: gpt-5.5
+    reasoning:
+      effort: medium
+    input:
+      - workflow.input.document_path
+      - workflow.input.purpose?
+      - workflow.input.readability_threshold
+      - technical_reviewer.output
+    system_prompt: |
+      You are a Senior Technical Writer and Document Reviewer. You evaluate
+      documents for structure, clarity, and readability, ensuring they are
+      well-organized, appropriately detailed for their audience, and ready for
+      review by their intended readers.
+
+      You focus on:
+      - Document structure and logical flow
+      - Clarity of writing and precision of language
+      - Appropriate detail level for the target audience
+      - Effective use of tables, diagrams, lists, and section organization
+      - Whether key ideas, decisions, and open questions are clearly framed
+    prompt: |
+      Review the document for **structure, clarity, and readability**.
+
+      **Document Location:**
+      {{ workflow.input.document_path }}
+
+      Read the document from the file path above.
+
+      {% if workflow.input.purpose %}
+      **Stated Purpose / Context:**
+      {{ workflow.input.purpose }}
+      {% endif %}
+
+      **Approval Threshold:** {{ workflow.input.readability_threshold }}/100
+
+      **Technical Review Status:** This document scored
+      {{ technical_reviewer.output.score }}/100 on technical accuracy.
+
+      ---
+
+      ## Evaluation Criteria
+
+      Focus exclusively on **structure and readability** — not technical
+      accuracy. Judge the document on its own terms; do not require sections it
+      does not need.
+
+      | Criteria | Description |
+      |----------|-------------|
+      | **Structure** | Is information logically organized with a clear flow? |
+      | **Clarity** | Is the writing clear, precise, and free of ambiguity? |
+      | **Audience Fit** | Is the detail level appropriate for the document's apparent audience? |
+      | **Framing** | Are key ideas, decisions, and open questions clearly framed with context? |
+      | **Cohesion** | Does the document read as a unified work with connected sections? |
+      | **Formatting** | Are headings, tables, lists, code blocks, and links used effectively and consistently? |
+      | **Conciseness** | Is the document free of redundancy, filler, and unnecessary verbosity? |
+      | **Actionability** | After reading, would the intended audience know what to think, decide, or do? |
+
+      Provide:
+      1. A score from 0-100
+      2. Whether the structure/readability is approved (score >= {{ workflow.input.readability_threshold }})
+      3. Specific feedback on structure and clarity issues
+      4. List of critical readability issues that must be addressed
+    output:
+      score:
+        type: number
+        description: Structure and readability score from 0-100
+      approved:
+        type: boolean
+        description: Whether the document structure meets the threshold
+      feedback:
+        type: string
+        description: Detailed feedback on structure and readability
+      critical_issues:
+        type: array
+        description: List of critical structure/readability issues that must be addressed
+    routes:
+      - to: $end
+
+output:
+  document_path: "{{ workflow.input.document_path }}"
+  technical_threshold: "{{ workflow.input.technical_threshold }}"
+  readability_threshold: "{{ workflow.input.readability_threshold }}"
+  technical_review_score: "{{ technical_reviewer.output.score }}"
+  technical_review_approved: "{{ technical_reviewer.output.approved }}"
+  technical_review_feedback: "{{ technical_reviewer.output.feedback }}"
+  technical_review_critical_issues: "{{ technical_reviewer.output.critical_issues }}"
+  readability_review_score: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.score }}{% endif %}"
+  readability_review_approved: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.approved }}{% endif %}"
+  readability_review_feedback: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.feedback }}{% endif %}"
+  readability_review_critical_issues: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.critical_issues }}{% endif %}"
