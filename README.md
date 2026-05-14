@@ -7,10 +7,9 @@ Sample workflow registry for [Conductor](https://github.com/microsoft/conductor)
 | Name | Description |
 |------|-------------|
 | `document-review` | Review-only scoring of a markdown document on technical accuracy and readability, with threshold short-circuit |
-| `sdd-plan` | Solution design + implementation plan with technical and readability review cycles |
-| `sdd-plan-v3` | Quality-first design+plan workflow with research split, parallel reviewers, adversarial review, design/plan separation, and human gate |
+| `sdd-design` | Solution design document with technical and readability review cycles (no implementation plan) |
+| `sdd-plan` | Solution design + implementation plan with technical and readability review cycles. Optional `design` input switches it to plan-only mode, consuming an existing design document (e.g. one produced by `sdd-design`) |
 | `sdd-implement` | Implement a plan epic-by-epic with epic-level and plan-level review |
-| `sdd-implement-v3` | Quality-first implement workflow with cross-family epic review, adversarial plan review, and bounded fixer escalation |
 
 ## Usage
 
