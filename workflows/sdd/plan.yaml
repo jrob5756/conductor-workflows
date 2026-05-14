@@ -5,9 +5,9 @@
 # design (decisions, trade-offs, alternatives) with actionable implementation
 # planning (epics, tasks, file changes).
 #
-# The plan passes through two independent review cycles:
-#   1. Technical Reviewer — validates accuracy, feasibility, and completeness
-#   2. Readability Reviewer — ensures clarity, structure, and audience fit
+# The plan is reviewed by the `document-review` sub-workflow, which scores it
+# on technical accuracy and readability. If either score is below the
+# threshold (90), the workflow loops back to the architect for revision.
 #
 # Usage:
 #   conductor run workflows/plan.yaml --input purpose="Build a user authentication system with OAuth2"
@@ -19,14 +19,14 @@
 #   conductor -V run workflows/plan.yaml --input purpose="..."
 #
 # Flow:
-#   architect → technical_reviewer
-#     → readability_reviewer → (loop back to architect if either < 90)
-#       → $end
+#   architect → document_review (sub-workflow)
+#     → $end                  (when both reviews are approved)
+#     → architect             (when either review is not approved)
 
 workflow:
   name: plan
-  description: Create a comprehensive solution design with implementation plan grounded in the codebase, with technical and readability review cycles
-  version: "2.0.0"
+  description: Create a comprehensive solution design with implementation plan grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability
+  version: "2.1.0"
   entry_point: architect
 
   runtime:
@@ -75,8 +75,7 @@ agents:
       - workflow.input.purpose
       - workflow.input.output_path?
       - architect.output?
-      - technical_reviewer.output?
-      - readability_reviewer.output?
+      - document_review.output?
     system_prompt: |
       You are a Principal Software Architect. You analyze requirements deeply, research the
       existing codebase, and produce clear, high-level technical design documents with
@@ -104,32 +103,18 @@ agents:
 
       **Purpose:** {{ workflow.input.purpose }}
 
-      {% if technical_reviewer is defined and technical_reviewer.output and technical_reviewer.output.score < 90 %}
-      **Technical Review Feedback (Score: {{ technical_reviewer.output.score }}/100):**
-      {{ technical_reviewer.output.feedback }}
-
-      {% if technical_reviewer.output.critical_issues %}
-      **Critical Issues:**
-      {% for issue in technical_reviewer.output.critical_issues %}
-      - {{ issue }}
-      {% endfor %}
-      {% endif %}
+      {% if document_review.output and document_review.output.technical_review_score and document_review.output.technical_review_approved != 'True' %}
+      **Technical Review Feedback (Score: {{ document_review.output.technical_review_score }}/100):**
+      {{ document_review.output.technical_review_feedback }}
 
       **IMPORTANT:** You are revising an existing document. Read the document at
       `{{ architect.output.file_path }}` and update it to address the feedback.
       Preserve content that is satisfactory.
       {% endif %}
 
-      {% if readability_reviewer is defined and readability_reviewer.output and readability_reviewer.output.score < 90 %}
-      **Readability Review Feedback (Score: {{ readability_reviewer.output.score }}/100):**
-      {{ readability_reviewer.output.feedback }}
-
-      {% if readability_reviewer.output.critical_issues %}
-      **Critical Issues:**
-      {% for issue in readability_reviewer.output.critical_issues %}
-      - {{ issue }}
-      {% endfor %}
-      {% endif %}
+      {% if document_review.output and document_review.output.readability_review_score and document_review.output.readability_review_approved != 'True' %}
+      **Readability Review Feedback (Score: {{ document_review.output.readability_review_score }}/100):**
+      {{ document_review.output.readability_review_feedback }}
 
       **IMPORTANT:** You are revising an existing document. Read the document at
       `{{ architect.output.file_path }}` and update it to address the feedback.
@@ -269,7 +254,7 @@ agents:
 
       ## REVISION NOTES
 
-      {% if technical_reviewer is defined or readability_reviewer is defined %}
+      {% if document_review is defined and document_review.output %}
       After revising the document, provide a concise summary of what you changed and why
       in your `revision_notes` output. Structure it as a bullet list, e.g.:
       - Corrected gRPC version numbers per technical reviewer feedback
@@ -311,232 +296,30 @@ agents:
         type: string
         description: Summary of changes made in this revision (empty on first draft)
     routes:
-      - to: technical_reviewer
+      - to: document_review
 
-  - name: technical_reviewer
-    description: Reviews the plan document for technical accuracy, feasibility, and completeness
-    model: claude-opus-4.7-1m-internal
-    reasoning:
-      effort: high
+  - name: document_review
+    description: Reviews the plan document for technical accuracy and readability via the document-review sub-workflow
+    type: workflow
+    workflow: ../document-review/workflow.yaml
     input:
       - workflow.input.purpose
       - architect.output.file_path
-      - architect.output.revision_notes
-    system_prompt: |
-      You are a Senior Engineering Reviewer with broad expertise in software architecture,
-      distributed systems, and cloud-native development. You review design and planning
-      documents for technical accuracy, feasibility, and completeness.
-
-      You are especially attentive to:
-      - Factual accuracy of technical claims (versions, API names, compatibility)
-      - Whether the design is grounded in the actual codebase (not aspirational)
-      - Completeness of the problem analysis and proposed solution
-      - Soundness of design decisions and whether alternatives were fairly evaluated
-      - Practical feasibility of the proposed architecture
-      - Whether the implementation plan is actionable and properly sequenced
-      - Whether risks are realistically assessed
-    prompt: |
-      Review the plan document for **technical accuracy and completeness**.
-
-      **Original Purpose:**
-      {{ workflow.input.purpose }}
-
-      **Plan Document Location:**
-      {{ architect.output.file_path }}
-
-      Read the plan document from the file path above.
-
-      {% if architect.output.revision_notes and architect.output.revision_notes != "Initial draft." %}
-      **Architect's Revision Notes:**
-      {{ architect.output.revision_notes }}
-
-      The architect has revised the document based on prior feedback. Use these notes to
-      focus your review on the changed areas, while still checking overall technical soundness.
-      {% endif %}
-
-      ---
-
-      ## Fact-Checking
-
-      To verify the document's claims, independently check:
-      - Technical claims by reading referenced source files and project files in the codebase
-      - Version numbers, API names, and library capabilities by searching the web
-      - Whether the described current state actually matches the codebase
-      - Whether the proposed design is feasible given the existing architecture
-
-      ---
-
-      ## Evaluation Criteria
-
-      Focus exclusively on **technical content** — accuracy, correctness, and completeness:
-
-      | Criteria | Description |
-      |----------|-------------|
-      | **Technical Accuracy** | Are technical claims, version numbers, and API details correct? |
-      | **Codebase Grounding** | Is the design grounded in the actual codebase, not aspirational? |
-      | **Completeness** | Are all aspects of the problem addressed? Are there gaps? |
-      | **Design Soundness** | Are the architectural decisions well-reasoned and defensible? |
-      | **Alternatives Analysis** | Were alternatives fairly evaluated with honest trade-offs? |
-      | **Impact Analysis** | Are all affected components identified? Are side effects considered? |
-      | **Risk Assessment** | Are risks realistic? Are mitigations concrete and actionable? |
-      | **Feasibility** | Can this design actually be implemented given the existing system? |
-      | **Plan Actionability** | Are epics properly scoped, sequenced, and actionable? |
-      | **Dependency Management** | Are prerequisites clearly identified between epics? |
-      | **Simplicity** | Is this the minimum viable design? Could any EPICs be merged or eliminated? Are there unnecessary abstractions, configurability, or flexibility? |
-      | **Assumption Transparency** | Are assumptions explicitly stated? Are ambiguities in the original purpose flagged with the chosen interpretation and alternatives? |
-
-      Do NOT evaluate structure, readability, or formatting — a separate reviewer handles that.
-
-      **Simplicity check:** For each EPIC, verify it traces to an explicit requirement or goal.
-      Flag EPICs that add flexibility, abstractions, or features not in the stated purpose.
-      Ask: "Would a senior engineer say this plan is overcomplicated?" If yes, deduct points.
-
-      Provide:
-      1. A score from 0-100
-      2. Whether the technical content is approved (score >= 90)
-      3. Specific feedback on technical issues
-      4. List of critical technical issues that must be addressed
-    output:
-      score:
-        type: number
-        description: Technical accuracy score from 0-100
-      approved:
-        type: boolean
-        description: Whether the technical content meets quality threshold (score >= 90)
-      feedback:
-        type: string
-        description: Detailed feedback on technical issues
-      critical_issues:
-        type: array
-        description: List of critical technical issues that must be addressed
-    routes:
-      - to: readability_reviewer
-        when: "{{ output.approved }}"
-      - to: architect
-        when: "{{ output.score < 90 }}"
-      - to: readability_reviewer
-
-  - name: readability_reviewer
-    description: Reviews the plan document for structure, clarity, and readability
-    model: gpt-5.5
-    reasoning:
-      effort: medium
-    input:
-      - workflow.input.purpose
-      - architect.output.file_path
-      - architect.output.revision_notes
-      - technical_reviewer.output
-    system_prompt: |
-      You are a Senior Technical Writer and Document Reviewer. You specialize in
-      evaluating design and planning documents for structure, clarity, and readability.
-      You ensure documents are well-organized, appropriately detailed for their audience,
-      and ready for cross-team review.
-
-      You focus on:
-      - Document structure and logical flow
-      - Clarity of writing and precision of language
-      - Appropriate detail level for the target audience
-      - Effective use of tables, diagrams, lists, and section organization
-      - Whether design decisions and open questions are clearly framed
-      - Whether the implementation plan is clearly structured and easy to follow
-    prompt: |
-      Review the plan document for **structure, clarity, and readability**.
-
-      **Original Purpose:**
-      {{ workflow.input.purpose }}
-
-      **Plan Document Location:**
-      {{ architect.output.file_path }}
-
-      Read the plan document from the file path above.
-
-      **Technical Review Status:** This document scored {{ technical_reviewer.output.score }}/100
-      on technical accuracy.
-
-      {% if architect.output.revision_notes and architect.output.revision_notes != "Initial draft." %}
-      **Architect's Revision Notes:**
-      {{ architect.output.revision_notes }}
-
-      The architect has revised the document based on prior feedback. Use these notes to
-      focus your review on the changed areas, while still checking overall structure and clarity.
-      {% endif %}
-
-      ---
-
-      ## Expected Document Structure
-
-      The document should contain the following sections:
-      1. Executive Summary (one paragraph)
-      2. Background (current state, motivation, prior art)
-      3. Problem Statement (specific problems being solved)
-      4. Goals and Non-Goals
-      5. Requirements (functional and non-functional)
-      6. Proposed Design (architecture overview, key components, data flow, API contracts, design decisions)
-      7. Alternatives Considered *(optional — include when non-obvious choices exist)*
-      8. Dependencies
-      9. Impact Analysis *(optional — include for multi-component or compatibility-sensitive changes)*
-      10. Security Considerations *(optional — include when security boundaries are affected)*
-      11. Risks and Mitigations *(optional — include for meaningful risks)*
-      12. Open Questions
-      13. Implementation Phases
-      14. Files Affected (new, modified, deleted)
-      15. Implementation Plan (epics with tasks, acceptance criteria)
-      16. References
-
-      The audience is engineers and architects involved in the design review,
-      and developers or AI agents who will execute the implementation plan.
-
-      ---
-
-      ## Evaluation Criteria
-
-      Focus exclusively on **structure and readability** — not technical accuracy:
-
-      | Criteria | Description |
-      |----------|-------------|
-      | **Document Structure** | Does it follow the expected sections? Is information logically organized? |
-      | **Clarity** | Is the writing clear, precise, and free of ambiguity? |
-      | **Audience Fit** | Is the detail level appropriate for engineers and architects? |
-      | **Decision Framing** | Are design decisions and open questions clearly framed with context? |
-      | **Cohesion** | Does the document read as a unified work with connected sections? |
-      | **Formatting** | Are tables, lists, diagrams, and code references used effectively? |
-      | **Executive Summary** | Does it convey the problem, approach, and outcome in one paragraph? |
-      | **Plan Readability** | Are epics, tasks, and acceptance criteria clearly structured and easy to follow? |
-      | **Traceability** | Do tasks trace back to requirements and design goals? |
-      | **Actionability** | After reading, would a developer or AI agent know exactly what to evaluate, decide, and build? |
-
-      Do NOT evaluate technical correctness — that has been handled by a separate reviewer.
-
-      Provide:
-      1. A score from 0-100
-      2. Whether the structure/readability is approved (score >= 90)
-      3. Specific feedback on structure and clarity issues
-      4. List of critical readability issues that must be addressed
-    output:
-      score:
-        type: number
-        description: Structure and readability score from 0-100
-      approved:
-        type: boolean
-        description: Whether the document structure meets quality threshold (score >= 90)
-      feedback:
-        type: string
-        description: Detailed feedback on structure and readability
-      critical_issues:
-        type: array
-        description: List of critical structure/readability issues that must be addressed
+    input_mapping:
+      document_path: "{{ architect.output.file_path }}"
+      purpose: "{{ workflow.input.purpose }}"
+      technical_threshold: "90"
+      readability_threshold: "90"
     routes:
       - to: $end
-        when: "{{ output.approved }}"
+        when: "{{ document_review.output.technical_review_approved == 'True' and document_review.output.readability_review_approved == 'True' }}"
       - to: architect
-        when: "{{ output.score < 90 }}"
-      - to: $end
 
 output:
   purpose: "{{ workflow.input.purpose }}"
   plan_file: "{{ architect.output.file_path }}"
-  technical_review_score: "{{ technical_reviewer.output.score }}"
-  readability_review_score: "{{ readability_reviewer.output.score }}"
-  technical_review_feedback: "{{ technical_reviewer.output.feedback }}"
-  readability_review_feedback: "{{ readability_reviewer.output.feedback }}"
+  technical_review_score: "{{ document_review.output.technical_review_score }}"
+  readability_review_score: "{{ document_review.output.readability_review_score }}"
+  technical_review_feedback: "{{ document_review.output.technical_review_feedback }}"
+  readability_review_feedback: "{{ document_review.output.readability_review_feedback }}"
   iterations: "{{ context.iteration }}"
