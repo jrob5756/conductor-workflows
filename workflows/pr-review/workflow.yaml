@@ -1,14 +1,20 @@
 # PR Review Workflow
 #
 # Multi-agent PR review combining specialist depth with structured deliberation.
-# Composed of four sub-workflows for separation of concerns:
+# Composed of five sub-workflows for separation of concerns:
 #
 #   pr_fetcher (gh CLI script — self-contained)
 #     ↓
 #   dispatcher (validates inputs, prepares nonce-wrapped diff, loads context)
 #     ↓
+#   triage (sub-workflow: subworkflows/triage.yaml)
+#     Heuristic file-pattern classifier + cheap LLM pass + resolver. Decides
+#     which specialists are actually needed for THIS PR. Skipped specialists
+#     short-circuit via Jinja early-exit (no model load, ~50 tokens).
+#     ↓
 #   specialists (sub-workflow: subworkflows/specialists.yaml)
-#     5 deep-domain specialists run in parallel → gate → consolidator
+#     6 deep-domain specialists run in parallel (each with early-exit if not
+#     in triage's recommended list) → gate → consolidator
 #     ↓
 #   deliberate (sub-workflow: subworkflows/deliberate.yaml)
 #     2 cross-cutting lens reviewers run in parallel over the consolidated set,
@@ -25,7 +31,7 @@
 #     ↓
 #   $end
 #
-# The four sub-workflows can also be invoked directly for debugging — each
+# The five sub-workflows can also be invoked directly for debugging — each
 # accepts the parent dispatcher's outputs as workflow inputs.
 #
 # Each sub-workflow persists its raw outputs to <pr_data_dir>/*.json so
@@ -55,8 +61,8 @@
 
 workflow:
   name: pr-review
-  description: Multi-agent PR review combining specialist depth (code, tests, errors, types, comments) with cross-lens deliberation, consensus arbitration, and a non-blocking polish stage. Composed of four sub-workflows.
-  version: "1.1.0"
+  description: Multi-agent PR review combining specialist depth (code, security, tests, errors, types, comments) with cross-lens deliberation, consensus arbitration, smart per-PR triage, and a non-blocking polish stage. Composed of five sub-workflows.
+  version: "1.2.0"
   entry_point: pr_fetcher
 
   runtime:
@@ -91,7 +97,25 @@ workflow:
       type: array
       required: false
       default: ["code", "security", "tests", "errors", "types", "comments"]
-      description: "Which specialists to run (informational in v1; the gate filters by validity)."
+      description: "User-facing whitelist of specialists. Triage intersects its recommendation with this list. Use to permanently exclude a specialist from all PRs."
+
+    triage_mode:
+      type: string
+      required: false
+      default: "auto"
+      description: "How to choose which specialists run. 'auto' = run heuristic + LLM triage and skip non-applicable specialists (recommended). 'all' = bypass triage and run every specialist in enabled_specialists (safest, most expensive)."
+
+    force_specialists:
+      type: array
+      required: false
+      default: []
+      description: "Specialists that must always run, bypassing triage's skip decision (but still subject to enabled_specialists)."
+
+    triage_model:
+      type: string
+      required: false
+      default: "claude-haiku-4.5"
+      description: "Cheap model for the triage_llm step that refines the heuristic's specialist recommendation. Only ~3K tokens of context, ~200 tokens out — keep it cheap."
 
     include_polish:
       type: boolean
@@ -221,7 +245,7 @@ workflow:
     mode: explicit
 
   limits:
-    # Slim parent: pr_fetcher + dispatcher + 4 sub-workflow calls + poster = 7
+    # Slim parent: pr_fetcher + dispatcher + 5 sub-workflow calls + poster = 8
     # Sub-workflows have their own iteration budgets internally.
     max_iterations: 30
 
@@ -413,15 +437,50 @@ agents:
         type: string
         description: "Codebase context for the changed files (callers, related functions, patterns). Empty if not provided."
     routes:
+      - to: triage
+
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # TRIAGE SUB-WORKFLOW — Decides which specialists need to run for this PR.
+  # Heuristic file-pattern classifier + cheap LLM refinement + resolver.
+  # Persists triage.json to pr_data_dir for the render sub-workflow.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: triage
+    description: Specialist triage — heuristic + cheap LLM that decides which specialists run for this PR
+    type: workflow
+    workflow: ./subworkflows/triage.yaml
+    input:
+      - dispatcher.output.pr_metadata
+      - dispatcher.output.pr_data_dir
+      - dispatcher.output.diff_boundary_nonce
+      - workflow.input.focus
+      - workflow.input.exclude
+      - workflow.input.enabled_specialists
+      - workflow.input.force_specialists
+      - workflow.input.triage_mode
+      - workflow.input.triage_model
+    input_mapping:
+      pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
+      pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
+      diff_boundary_nonce: "{{ dispatcher.output.diff_boundary_nonce }}"
+      focus: "{{ workflow.input.focus }}"
+      exclude: "{{ workflow.input.exclude | tojson }}"
+      enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
+      force_specialists: "{{ workflow.input.force_specialists | tojson }}"
+      triage_mode: "{{ workflow.input.triage_mode }}"
+      triage_model: "{{ workflow.input.triage_model }}"
+    routes:
       - to: specialists
 
 
   # ───────────────────────────────────────────────────────────────────────────
-  # SPECIALISTS SUB-WORKFLOW — 5 specialists in parallel + gate + consolidator.
+  # SPECIALISTS SUB-WORKFLOW — 6 specialists in parallel + gate + consolidator.
+  # Each specialist short-circuits via Jinja early-exit if not in
+  # triage.output.recommended_specialists.
   # Persists raw outputs to pr_data_dir for the render sub-workflow to read.
   # ───────────────────────────────────────────────────────────────────────────
   - name: specialists
-    description: Specialist review phase — runs 5 deep-domain specialists in parallel, validates them, normalises and dedupes findings
+    description: Specialist review phase — runs 6 deep-domain specialists in parallel (gated by triage), validates them, normalises and dedupes findings
     type: workflow
     workflow: ./subworkflows/specialists.yaml
     input:
@@ -436,6 +495,8 @@ agents:
       - workflow.input.focus
       - workflow.input.exclude
       - workflow.input.enabled_specialists
+      - triage.output.recommended_specialists
+      - triage.output.skipped_specialists
       - workflow.input.specialist_code_model
       - workflow.input.specialist_security_model
       - workflow.input.specialist_tests_model
@@ -454,6 +515,8 @@ agents:
       focus: "{{ workflow.input.focus }}"
       exclude: "{{ workflow.input.exclude | tojson }}"
       enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
+      recommended_specialists: "{{ triage.output.recommended_specialists }}"
+      skipped_specialists: "{{ triage.output.skipped_specialists }}"
       specialist_code_model: "{{ workflow.input.specialist_code_model }}"
       specialist_security_model: "{{ workflow.input.specialist_security_model }}"
       specialist_tests_model: "{{ workflow.input.specialist_tests_model }}"
@@ -549,6 +612,7 @@ agents:
       - dispatcher.output.pr_data_dir
       - dispatcher.output.guidelines_content
       - dispatcher.output.prior_feedback_content
+      - triage.output
       - specialists.output
       - deliberate.output
       - polish.output
@@ -561,6 +625,7 @@ agents:
       - workflow.input.review_number
       - workflow.input.include_polish
       - workflow.input.enabled_specialists
+      - workflow.input.triage_mode
       - workflow.input.polish_as_inline
       - workflow.input.output_dir
       - workflow.input.previous_review_path
@@ -570,6 +635,14 @@ agents:
       pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
       guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
       prior_feedback_content: "{{ dispatcher.output.prior_feedback_content | default('') }}"
+
+      # triage.output.* — what ran vs what was skipped, and why.
+      has_triage: "true"
+      triage_mode: "{{ triage.output.triage_mode }}"
+      recommended_specialists: "{{ triage.output.recommended_specialists }}"
+      skipped_specialists: "{{ triage.output.skipped_specialists }}"
+      triage_rationale: "{{ triage.output.rationale | default('') }}"
+      triage_persisted_path: "{{ triage.output.triage_persisted_path | default('') }}"
 
       # specialists.output.* — read from sub-workflow output (already JSON-typed)
       specialist_outputs: "{{ specialists.output.specialist_outputs_path }}"
@@ -661,6 +734,9 @@ output:
   polish_findings_count: "{{ polish.output.total_polish_findings if polish is defined and polish.output is defined else 0 }}"
   strictness: "{{ workflow.input.strictness }}"
   enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
+  triage_mode: "{{ workflow.input.triage_mode }}"
+  recommended_specialists: "{{ triage.output.recommended_specialists if triage is defined and triage.output is defined else '[]' }}"
+  skipped_specialists: "{{ triage.output.skipped_specialists if triage is defined and triage.output is defined else '[]' }}"
   include_polish: "{{ workflow.input.include_polish }}"
   posted_comment_url: "{{ poster.output.posted_comment_url if poster is defined and poster.output is defined else '' }}"
   status: "{{ render.output.status if render is defined and render.output is defined else 'failure' }}"

@@ -13,7 +13,7 @@
 workflow:
   name: pr-review-render
   description: Final rendering phase of the pr-review workflow — composes the review report, builds inline comments, writes versioned artifacts
-  version: "1.0.0"
+  version: "1.1.0"
   entry_point: report_writer
 
   runtime:
@@ -166,7 +166,39 @@ workflow:
     enabled_specialists:
       type: array
       required: false
-      default: ["code", "tests", "errors", "types", "comments"]
+      default: ["code", "security", "tests", "errors", "types", "comments"]
+
+    # Triage phase results
+    has_triage:
+      type: boolean
+      required: false
+      default: false
+      description: "True when the parent ran the triage sub-workflow."
+    triage_mode:
+      type: string
+      required: false
+      default: "auto"
+      description: "auto or all — for the report header."
+    recommended_specialists:
+      type: array
+      required: false
+      default: []
+      description: "Specialists triage decided to run."
+    skipped_specialists:
+      type: array
+      required: false
+      default: []
+      description: "Specialists triage decided to skip — surfaced in the report header."
+    triage_rationale:
+      type: string
+      required: false
+      default: ""
+      description: "Human-readable explanation of triage's decision."
+    triage_persisted_path:
+      type: string
+      required: false
+      default: ""
+      description: "Path to <pr_data_dir>/triage.json with the full triage record."
     polish_as_inline:
       type: boolean
       required: false
@@ -297,6 +329,30 @@ agents:
       If `include_polish` is false OR no polish findings → omit the
       section entirely (do not say "no polish findings").
 
+      ## Specialist Triage section
+
+      When `has_triage` is true, include a small `### 🎯 Specialist Triage`
+      section near the top of the report (right after the Summary and any
+      Degraded banner, BEFORE the consolidated findings) showing which
+      specialists ran vs were skipped, and why.
+
+      Render it as a blockquote with the actual `triage_mode`,
+      `recommended_specialists`, and `skipped_specialists` values from the
+      workflow input — for example:
+
+      ```
+      > **Mode:** auto · **Ran:** code, tests · **Skipped:** security, types
+      >
+      > _Rationale:_ Source changes in 2 files, no security-sensitive paths,
+      > no TypeScript.
+      ```
+
+      If the rationale is empty, omit the rationale line. If `has_triage`
+      is false, omit the entire section.
+
+      Skipped specialists are NOT a degraded review — do not double-count
+      them in the degraded banner.
+
       ## Suggested-fix collapsibles
 
       For each finding with a non-empty `suggested_fix`, include a
@@ -351,6 +407,14 @@ agents:
       - valid_specialists: {{ workflow.input.valid_specialists | tojson }}
       - invalid_specialists: {{ workflow.input.invalid_specialists | tojson }}
       - degraded: {{ workflow.input.degraded }}
+
+      {% if workflow.input.has_triage %}
+      ## Specialist Triage Results
+      - triage_mode: {{ workflow.input.triage_mode }}
+      - recommended_specialists: {{ workflow.input.recommended_specialists | tojson }}
+      - skipped_specialists: {{ workflow.input.skipped_specialists | tojson }}
+      - triage_rationale: {{ workflow.input.triage_rationale }}
+      {% endif %}
 
       ## Specialist Outputs
       ```json

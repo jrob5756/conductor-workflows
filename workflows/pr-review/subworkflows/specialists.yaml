@@ -84,8 +84,18 @@ workflow:
     enabled_specialists:
       type: array
       required: false
-      default: ["code", "tests", "errors", "types", "comments"]
-      description: "Subset of specialists to run. Currently informational only — all 6 run regardless; the gate filters by validity. Future versions may use this to skip specialists at definition time."
+      default: ["code", "security", "tests", "errors", "types", "comments"]
+      description: "Subset of specialists the user is willing to run. The triage's recommendation is intersected with this list before passing in as recommended_specialists."
+    recommended_specialists:
+      type: array
+      required: false
+      default: ["code", "security", "tests", "errors", "types", "comments"]
+      description: "Final list of specialists to actually execute (post-triage). Specialists NOT in this list short-circuit via Jinja early-exit and emit only a tiny 'skipped' response — model still spins up but cost is ~5% of a full review."
+    skipped_specialists:
+      type: array
+      required: false
+      default: []
+      description: "Specialists that triage decided to skip. Informational — passed through to the consolidator's metadata for the report header."
     specialist_code_model:
       type: string
       required: false
@@ -147,6 +157,7 @@ agents:
     model: "{{ workflow.input.specialist_code_model }}"
     input:
       - workflow.input.pr_metadata
+      - workflow.input.recommended_specialists
       - workflow.input.pr_data_dir
       - workflow.input.diff_boundary_nonce
       - workflow.input.guidelines_content
@@ -158,6 +169,13 @@ agents:
       - workflow.input.exclude
       - workflow.input.specialist_code_model
     system_prompt: |
+      {% if 'code' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       You are an expert code reviewer specialising in project-guideline
       compliance, bug detection, and code quality. Your single mission is
       to find high-confidence issues that genuinely matter.
@@ -238,7 +256,15 @@ agents:
       comment accuracy to specialist_comments. Where domains overlap, defer
       to the more specialist agent and only flag issues that materially
       affect general code quality.
+      {% endif %}
     prompt: |
+      {% if 'code' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       Review the following pull request for code quality, bugs, and
       project-guideline compliance.
 
@@ -315,6 +341,7 @@ agents:
       4. `merge_readiness` — ✅ Ready to merge / ⚠️ Needs minor fixes / ❌ Requires significant rework.
 
       Use IDs prefixed `S-CODE-` (e.g. `S-CODE-001`).
+      {% endif %}
     output:
       status:
         type: string
@@ -351,6 +378,7 @@ agents:
       effort: high
     input:
       - workflow.input.pr_metadata
+      - workflow.input.recommended_specialists
       - workflow.input.pr_data_dir
       - workflow.input.diff_boundary_nonce
       - workflow.input.guidelines_content
@@ -362,6 +390,13 @@ agents:
       - workflow.input.exclude
       - workflow.input.specialist_security_model
     system_prompt: |
+      {% if 'security' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       You are a senior application-security reviewer. Your single mission is
       to find real, exploitable security vulnerabilities in the PR diff.
       You think like an attacker AND a defender — you look for ways the
@@ -489,7 +524,15 @@ agents:
       general code-quality bugs to specialist_code, error-handling gaps
       to specialist_errors, test-coverage gaps to specialist_tests. Your
       lane is "exploitable vulnerabilities and security hardening" only.
+      {% endif %}
     prompt: |
+      {% if 'security' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       Review the following pull request for security vulnerabilities.
 
       ## PR Metadata
@@ -538,6 +581,7 @@ agents:
       Provide an `overall_assessment` summarising the security posture of
       this diff (2-3 paragraphs) and a `merge_readiness` verdict from a
       security perspective.
+      {% endif %}
     output:
       status:
         type: string
@@ -580,6 +624,7 @@ agents:
     model: "{{ workflow.input.specialist_tests_model }}"
     input:
       - workflow.input.pr_metadata
+      - workflow.input.recommended_specialists
       - workflow.input.pr_data_dir
       - workflow.input.diff_boundary_nonce
       - workflow.input.guidelines_content
@@ -591,6 +636,13 @@ agents:
       - workflow.input.exclude
       - workflow.input.specialist_tests_model
     system_prompt: |
+      {% if 'tests' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       You are an expert test coverage analyst. Your single mission is to
       ensure the PR's tests adequately cover critical functionality
       WITHOUT being pedantic about 100% line coverage.
@@ -662,7 +714,15 @@ agents:
       bug-finding to specialist_code, error-handling audits to
       specialist_errors. Flag missing tests for dangerous code paths;
       don't re-litigate the dangerous code itself.
+      {% endif %}
     prompt: |
+      {% if 'tests' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       Analyse test coverage for the following pull request.
 
       ## PR Metadata
@@ -715,6 +775,7 @@ agents:
       Emit `findings` per the schema in your system prompt. Use IDs
       prefixed `S-TESTS-`. Provide an `overall_assessment` and
       `merge_readiness`.
+      {% endif %}
     output:
       status: {type: string}
       findings:
@@ -745,6 +806,7 @@ agents:
     model: "{{ workflow.input.specialist_errors_model }}"
     input:
       - workflow.input.pr_metadata
+      - workflow.input.recommended_specialists
       - workflow.input.pr_data_dir
       - workflow.input.diff_boundary_nonce
       - workflow.input.guidelines_content
@@ -756,6 +818,13 @@ agents:
       - workflow.input.exclude
       - workflow.input.specialist_errors_model
     system_prompt: |
+      {% if 'errors' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       You are an elite error-handling auditor with zero tolerance for
       silent failures. Your mission is to ensure every error is
       surfaced, logged, and actionable.
@@ -835,7 +904,15 @@ agents:
       around error paths to specialist_tests; defer general bugs to
       specialist_code. Your focus is the structure and surface of
       error handling itself.
+      {% endif %}
     prompt: |
+      {% if 'errors' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       Audit error handling in the following pull request.
 
       ## PR Metadata
@@ -874,6 +951,7 @@ agents:
       For each issue: location, severity, issue description, hidden errors,
       user impact, recommendation, corrected example. Use IDs prefixed
       `S-ERR-`. Provide `overall_assessment` and `merge_readiness`.
+      {% endif %}
     output:
       status: {type: string}
       findings:
@@ -907,6 +985,7 @@ agents:
     model: "{{ workflow.input.specialist_types_model }}"
     input:
       - workflow.input.pr_metadata
+      - workflow.input.recommended_specialists
       - workflow.input.pr_data_dir
       - workflow.input.diff_boundary_nonce
       - workflow.input.guidelines_content
@@ -918,6 +997,13 @@ agents:
       - workflow.input.exclude
       - workflow.input.specialist_types_model
     system_prompt: |
+      {% if 'types' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       You are a type-design expert. Your single mission is to evaluate
       the PR's new and modified types for invariant strength,
       encapsulation, and practical usefulness. Well-designed types are
@@ -991,7 +1077,15 @@ agents:
       You are the **type design** specialist. Stay in your lane — defer
       runtime bugs in type usage to specialist_code. Your focus is the
       shape and contract of the types themselves.
+      {% endif %}
     prompt: |
+      {% if 'types' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       Review type design in the following pull request.
 
       ## PR Metadata
@@ -1019,6 +1113,7 @@ agents:
       the four dimensions, identify invariants, flag weak dimensions per
       the strictness rules in your system prompt. Use IDs prefixed
       `S-TYPES-`. Provide `overall_assessment` and `merge_readiness`.
+      {% endif %}
     output:
       status: {type: string}
       findings:
@@ -1059,6 +1154,7 @@ agents:
     model: "{{ workflow.input.specialist_comments_model }}"
     input:
       - workflow.input.pr_metadata
+      - workflow.input.recommended_specialists
       - workflow.input.pr_data_dir
       - workflow.input.diff_boundary_nonce
       - workflow.input.guidelines_content
@@ -1070,6 +1166,13 @@ agents:
       - workflow.input.exclude
       - workflow.input.specialist_comments_model
     system_prompt: |
+      {% if 'comments' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       You are a meticulous code-comment analyst. Your single mission is
       to protect the codebase from comment rot — verify every comment in
       the diff is factually accurate, useful, and won't mislead future
@@ -1135,7 +1238,15 @@ agents:
       You are the **comment** specialist. Stay in your lane — defer code
       bugs flagged by comments to specialist_code; defer test-coverage
       gaps to specialist_tests.
+      {% endif %}
     prompt: |
+      {% if 'comments' not in workflow.input.recommended_specialists %}
+      EARLY-EXIT (triage skip): output exactly the JSON below and stop. Do not call any tools.
+      
+      ```json
+      {"status": "skipped", "findings": [], "overall_assessment": "Skipped by triage — not applicable to this PR.", "merge_readiness": "ready"}
+      ```
+      {% else %}
       Analyse comments in the following pull request.
 
       ## PR Metadata
@@ -1162,6 +1273,7 @@ agents:
       Removals, Positive Findings. Emit `findings` per the schema in your
       system prompt. Use IDs prefixed `S-COMM-`. Provide
       `overall_assessment` and `merge_readiness`.
+      {% endif %}
     output:
       status: {type: string}
       findings:
@@ -1200,9 +1312,12 @@ agents:
       workflow's degraded-mode logic and the consolidator's input set.
 
       For each specialist key in `specialist_review.outputs` (e.g.
-      `specialist_code`, `specialist_tests`, `specialist_errors`,
-      `specialist_types`, `specialist_comments`), classify the
-      specialist as **invalid** if ANY of these hold:
+      `specialist_code`, `specialist_security`, `specialist_tests`,
+      `specialist_errors`, `specialist_types`, `specialist_comments`),
+      classify the specialist as **skipped** if `status` equals `"skipped"`
+      (triage decided this specialist isn't applicable to this PR — emit
+      it under `skipped_specialists` and do not include it in
+      valid/invalid). Otherwise classify as **invalid** if ANY of these hold:
 
       1. `status` is present and equals `"failed_to_load_diff"`.
       2. `overall_assessment` contains (case-insensitive) any sentinel
@@ -1224,9 +1339,11 @@ agents:
       - `valid_count`: integer (0..N)
       - `valid_specialists`: array of specialist names that are valid
       - `invalid_specialists`: array of {name, reason} entries
-      - `degraded`: boolean — true when valid_count < total_specialists
-        (i.e. at least one specialist failed). The report writer uses
-        this to emit a "⚠️ Degraded review" banner.
+      - `skipped_specialists`: array of specialist names with status='skipped'
+      - `degraded`: boolean — true when invalid_specialists is non-empty
+        (i.e. at least one specialist *that was supposed to run* failed —
+        does NOT include triage-skipped specialists). The report writer
+        uses this to emit a "⚠️ Degraded review" banner.
 
       Do NOT emit any other fields. Do NOT call any tools. Be deterministic.
     prompt: |
@@ -1252,14 +1369,18 @@ agents:
           properties:
             name: {type: string}
             reason: {type: string}
+      skipped_specialists:
+        type: array
+        items: {type: string}
+        description: "Specialists with status='skipped' (triage decided they don't apply to this PR)."
       degraded:
         type: boolean
-        description: "True when at least one specialist failed."
+        description: "True when at least one specialist that was supposed to run failed (excludes triage-skipped)."
     routes:
       - to: consolidator
         when: "{{ specialist_gate.output.valid_count >= 1 }}"
       - to: $end
-        # All specialists failed. Workflow ends with status='failure'.
+        # All specialists failed or were skipped. Workflow ends with status='failure'.
 
   # ───────────────────────────────────────────────────────────────────────────
   # CONSOLIDATOR — Normalises specialists' native severities into the unified
@@ -1357,6 +1478,9 @@ agents:
       ## Valid specialists
       {{ specialist_gate.output.valid_specialists | tojson }}
 
+      ## Skipped specialists (triage decided not to run these)
+      {{ specialist_gate.output.skipped_specialists | tojson if specialist_gate.output.skipped_specialists is defined else '[]' }}
+
       ## Specialist outputs
       ```json
       {{ specialist_review.outputs | tojson }}
@@ -1366,7 +1490,8 @@ agents:
       {{ workflow.input.pr_data_dir }}
 
       Steps:
-      1. Iterate findings ONLY from valid specialists.
+      1. Iterate findings ONLY from valid specialists (skip the ones in
+         skipped_specialists — their `findings: []` is by design, not a failure).
       2. Normalise each into the unified schema (see system prompt).
       3. Dedupe across specialists per the rules above.
       4. Rank.
@@ -1375,6 +1500,8 @@ agents:
          containing the consolidated list.
       6. Emit `consolidated_findings`, `specialist_contributions`,
          `dedupe_summary` as structured output.
+         **Do NOT include skipped specialists in `specialist_contributions`** —
+         they didn't actually attempt to review and would distort the metrics.
     output:
       consolidated_findings:
         type: array
@@ -1437,6 +1564,7 @@ output:
   valid_count: "{{ specialist_gate.output.valid_count if specialist_gate is defined and specialist_gate.output is defined else 0 }}"
   valid_specialists: "{{ specialist_gate.output.valid_specialists | tojson if specialist_gate is defined and specialist_gate.output is defined else '[]' }}"
   invalid_specialists: "{{ specialist_gate.output.invalid_specialists | tojson if specialist_gate is defined and specialist_gate.output is defined else '[]' }}"
+  skipped_by_triage: "{{ specialist_gate.output.skipped_specialists | tojson if specialist_gate is defined and specialist_gate.output is defined and specialist_gate.output.skipped_specialists is defined else (workflow.input.skipped_specialists | tojson) }}"
   degraded: "{{ specialist_gate.output.degraded if specialist_gate is defined and specialist_gate.output is defined else true }}"
   consolidated_findings: "{{ consolidator.output.consolidated_findings | tojson if consolidator is defined and consolidator.output is defined else '[]' }}"
   specialist_contributions: "{{ consolidator.output.specialist_contributions | tojson if consolidator is defined and consolidator.output is defined else '{}' }}"

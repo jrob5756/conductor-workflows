@@ -4,7 +4,8 @@ Multi-agent PR review combining specialist depth with structured deliberation.
 
 This workflow runs **6 deep-domain specialists** (general code, security,
 tests, error handling, type design, comments) in parallel against a GitHub
-PR diff, consolidates their findings, then deliberates the consolidated set
+PR diff — but only the ones a per-PR triage step decides are actually needed.
+It then consolidates their findings, deliberates the consolidated set
 through **2 cross-family adversarial lens reviewers** (Skeptic vs
 Completeness) until they reach consensus or exhaust the round budget.
 Finally, a **non-blocking polish stage** (code-simplifier + dead-code-finder)
@@ -13,7 +14,7 @@ surfaces advisory cleanup opportunities.
 The result is one rendered review comment plus a JSON list of inline comments
 ready to post on the PR — optionally posted automatically via the `gh` CLI.
 
-The workflow is composed of **four sub-workflows** (one per phase) plus a slim
+The workflow is composed of **five sub-workflows** (one per phase) plus a slim
 parent that orchestrates them. Each sub-workflow can also be invoked directly
 for debugging.
 
@@ -23,15 +24,18 @@ for debugging.
 
 ```
 workflows/pr-review/
-├── workflow.yaml              # Slim parent — pr_fetcher → dispatcher → 4 sub-workflows → poster
+├── workflow.yaml              # Slim parent — pr_fetcher → dispatcher → 5 sub-workflows → poster
 ├── README.md                  # This file
 ├── scripts/
 │   ├── fetch-pr.sh            # gh CLI: fetch PR metadata + diff + changed files
 │   ├── post-review.sh         # gh CLI: post comment + inline comments back to PR
+│   ├── triage-heuristic.sh    # bash + py: file-pattern classifier (no LLM)
+│   ├── triage-resolve.sh      # bash + py: combine heuristic + LLM + user inputs into final list
 │   ├── persist-json.sh        # Writes a JSON string to a file
 │   └── persist-multi-json.sh  # Writes multiple JSON strings to multiple files
 └── subworkflows/
-    ├── specialists.yaml       # 5 specialists in parallel + gate + consolidator + persist
+    ├── triage.yaml            # heuristic + cheap LLM + resolver — picks specialists per PR
+    ├── specialists.yaml       # 6 specialists in parallel + gate + consolidator + persist
     ├── deliberate.yaml        # 2 lens reviewers in parallel + deliberation rounds + arbitrator + persist
     ├── polish.yaml            # 2 polish agents in parallel + persist
     └── render.yaml            # report_writer + inline_comments_writer + output_writer
@@ -44,16 +48,21 @@ pr_fetcher (gh CLI script — no MCP, no LLM)
   ↓
 dispatcher (validate, nonce-wrap diff, load context)
   ↓
+triage (sub-workflow)
+  ├─ triage_heuristic           (file-pattern bucketing — no LLM call)
+  ├─ triage_llm                 (cheap claude-haiku-4.5 — refines for ambiguous intent; skipped on trivial PRs)
+  └─ triage_resolver            (combines heuristic + LLM + user inputs into a final list)
+  ↓
 specialists (sub-workflow)
-  ├─ specialist_code         (project-guideline compliance, bugs, quality)
-  ├─ specialist_security     (CVSS-style vulnerability review — injection, auth, crypto, secrets, …)
-  ├─ specialist_tests        (behavioural coverage, edge cases)
-  ├─ specialist_errors       (silent failures, broad catches, hidden errors)
-  ├─ specialist_types        (encapsulation, invariants × 4 dimensions)
-  ├─ specialist_comments     (comment accuracy, doc rot)
-  ├─ specialist_gate         (phantom-reviewer detection)
-  ├─ consolidator            (normalise native severities, dedupe, rank)
-  └─ persist_specialist_outputs  (writes specialist-outputs.json + gate-output.json + …)
+  ├─ specialist_code            (project-guideline compliance, bugs, quality)         ← Jinja early-exit if not in triage list
+  ├─ specialist_security        (CVSS-style vulnerability review — injection, auth …) ← Jinja early-exit if not in triage list
+  ├─ specialist_tests           (behavioural coverage, edge cases)                    ← Jinja early-exit if not in triage list
+  ├─ specialist_errors          (silent failures, broad catches, hidden errors)       ← Jinja early-exit if not in triage list
+  ├─ specialist_types           (encapsulation, invariants × 4 dimensions)            ← Jinja early-exit if not in triage list
+  ├─ specialist_comments        (comment accuracy, doc rot)                           ← Jinja early-exit if not in triage list
+  ├─ specialist_gate            (phantom-reviewer detection; treats triage-skip as 'skipped' not 'invalid')
+  ├─ consolidator               (normalise native severities, dedupe, rank — ignores skipped specialists)
+  └─ persist_specialist_outputs (writes specialist-outputs.json + gate-output.json + …)
   ↓
 deliberate (sub-workflow)
   ├─ lens_skeptic                 (claude-opus-4.7 default — "are these findings real?")
@@ -69,7 +78,7 @@ polish (sub-workflow — non-blocking, advisory only)
   └─ persist_polish_outputs  (writes polish-outputs.json)
   ↓
 render (sub-workflow)
-  ├─ report_writer          (composes review markdown — full or delta)
+  ├─ report_writer          (composes review markdown — full or delta; includes 🎯 Triage section)
   ├─ inline_comments_writer (builds inline_comments JSON array)
   └─ output_writer          (writes pr-N-review.md + versioned archives + inline JSON)
   ↓
@@ -78,11 +87,48 @@ render (sub-workflow)
 $end
 ```
 
+## Specialist triage
+
+By default (`triage_mode: auto`), the workflow does **not** run every
+specialist on every PR. The triage sub-workflow inspects the changed-files
+list and a brief diff preview, then picks a subset:
+
+- A **deterministic heuristic** (no LLM) buckets files by extension/path:
+  docs, tests, security-sensitive (lockfiles, Dockerfiles, workflows, auth
+  paths), TypeScript-eligible, source, config, binary. It produces the
+  initial recommendation and flags trivial cases.
+- A **cheap LLM pass** (`claude-haiku-4.5`, ~3K-token context, ~200-token
+  output) refines the recommendation by reasoning about intent the heuristic
+  can't see: e.g. "this Python diff adds an unauthenticated public endpoint —
+  needs `security` even though no security-sensitive paths appear."
+  Skipped entirely on trivial-docs-only PRs.
+- A **resolver** combines heuristic + LLM with the user's
+  `enabled_specialists` (whitelist), `force_specialists` (always-run override)
+  and `triage_mode` to produce the final list. **Never returns empty** —
+  falls back to `["code"]` as a safety net.
+
+Specialists not in the final list are **not removed from the parallel
+group** — Conductor's schema doesn't support that. Instead, each specialist's
+prompt has a Jinja early-exit at the top: when the specialist's name is not
+in `recommended_specialists`, the model is instructed to emit a tiny
+`{"status": "skipped", "findings": [], …}` response and stop. Token cost
+drops ~95% for skipped specialists (~50 tokens vs ~10K for a full review),
+parallelism is preserved, and downstream agents (gate, consolidator) treat
+`status: "skipped"` distinctly from a failure.
+
+To bypass triage entirely and run every enabled specialist:
+
+```bash
+conductor run workflows/pr-review/workflow.yaml \
+  --input pr_url=… \
+  --input triage_mode=all
+```
+
 ## Why sub-workflows?
 
-The original v1.0.0 workflow was a single 3,470-line YAML. v1.1.0 splits it
-into a slim parent orchestrator plus four phase-specific sub-workflows for
-several reasons:
+The original v1.0.0 workflow was a single 3,470-line YAML. Splitting into a
+slim parent orchestrator plus phase-specific sub-workflows has several
+benefits:
 
 1. **Each file has one responsibility** — easier to reason about, edit, and review.
 2. **Sub-workflows are independently invokable for debugging** — you can run
@@ -105,7 +151,7 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 
 - **`gh` (GitHub CLI)** on PATH, authenticated (`gh auth status`). Install
   from <https://cli.github.com/>.
-- **`python3`** on PATH (used by the fetcher / poster / persist helpers).
+- **`python3`** on PATH (used by the fetcher / poster / persist / triage helpers).
 - **Node.js 18+** (used by the `@modelcontextprotocol/server-filesystem` MCP
   server).
 - **Conductor v0.1.12+** (script agents, `type: workflow` sub-workflows, and
@@ -116,9 +162,12 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 | Input | Type | Default | Purpose |
 |---|---|---|---|
 | `pr_url` | string | _required_ | GitHub PR URL (`https://github.com/<owner>/<repo>/pull/<n>`) |
-| `focus` | string | `""` | Free-text guidance to direct reviewer attention |
+| `focus` | string | `""` | Free-text guidance to direct reviewer attention (and bias triage) |
 | `exclude` | array | `[]` | Aspects to de-prioritise: `correctness`, `security`, `error_handling`, `performance`, `testing`, `completeness` |
-| `enabled_specialists` | array | `[code, security, tests, errors, types, comments]` | Subset of specialists to run |
+| `enabled_specialists` | array | `[code, security, tests, errors, types, comments]` | Whitelist of specialists. Triage's recommendation is intersected with this. |
+| `triage_mode` | string | `auto` | `auto` = run heuristic + LLM triage and skip non-applicable specialists. `all` = bypass triage and run every enabled specialist. |
+| `force_specialists` | array | `[]` | Specialists that always run, bypassing triage's skip decision. Subject to `enabled_specialists`. |
+| `triage_model` | string | `claude-haiku-4.5` | Model for the cheap triage LLM step. |
 | `include_polish` | bool | `true` | Run the polish sub-workflow |
 | `polish_as_inline` | bool | `false` | Promote polish findings to inline PR comments |
 | `strictness` | int | `2` | 1 = critical only, 2 = standard, 3 = thorough |
@@ -151,6 +200,7 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 | `merge_readiness` | string | ✅ Ready to merge / ⚠️ Needs minor fixes / ❌ Requires significant rework |
 | `confidence_score` | int | 0-100, **review reliability** (not PR quality) |
 | `is_delta` | bool | Whether this run produced a delta report |
+| `triage_mode`, `recommended_specialists`, `skipped_specialists` | mixed | What triage decided |
 | `findings_dropped_via_feedback` | int | Delta mode: prior findings dropped because the human reply addressed them |
 | `findings_downgraded_via_feedback` | int | Delta mode: severity lowered relative to prior |
 | `findings_reraised_with_acknowledgement` | int | Delta mode: re-raised over prior reply |
@@ -165,6 +215,22 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 ```bash
 conductor run workflows/pr-review/workflow.yaml \
   --input pr_url="https://github.com/owner/repo/pull/123"
+```
+
+### Force every specialist to run (bypass triage)
+
+```bash
+conductor run workflows/pr-review/workflow.yaml \
+  --input pr_url="https://github.com/owner/repo/pull/123" \
+  --input triage_mode=all
+```
+
+### Always run security regardless of what triage says
+
+```bash
+conductor run workflows/pr-review/workflow.yaml \
+  --input pr_url="https://github.com/owner/repo/pull/123" \
+  --input force_specialists='["security"]'
 ```
 
 ### Focused review with auto-post
@@ -241,9 +307,10 @@ diff.patch                      # unified diff from `gh pr diff`
 changed-files.json              # per-file patches from gh API
 prepared-diff.txt               # nonce-wrapped diff that specialists/lenses read
 specialist-outputs.json         # raw outputs from each specialist (after the gate)
-gate-output.json                # specialist_gate's routing decision
+gate-output.json                # specialist_gate's routing decision (incl. skipped_specialists)
 specialist-contributions.json   # consolidator's per-specialist counts
 consolidated-findings.json      # the deduped finding set the lenses deliberate over
+triage.json                     # full triage record: heuristic + LLM + resolver outputs
 lens-outputs.json               # raw lens initial dispositions + new findings
 deliberation-outputs.json       # per-round lens responses
 arbitrator-output.json          # full arbitrator output (consensus + scores)
@@ -279,17 +346,27 @@ agent invokes when `auto_post: true`.
 
 ## Cost controls
 
-The heaviest configuration (5 specialists × 1 round + 2 lenses × 2 rounds + 2
-polish agents + writers + persisters) runs ~16 LLM calls and a handful of
-script steps. To reduce cost:
+The default configuration with triage typically runs **2-4 specialists**
+instead of all 6, dropping cost by 30-60% relative to running everything.
+For a docs-only PR, only `comments` runs and the LLM triage step is skipped
+entirely. Additional levers:
 
-- **Trim `enabled_specialists`** to the ones you need. `code` + `security` is
-  the strongest two-specialist combo for general PRs.
+- **Leave `triage_mode: auto` (default)** — single biggest cost optimisation.
+  Skipped specialists still spin up the model (Conductor's parallel groups
+  can't be made dynamic) but emit a ~50-token "skipped" response instead of
+  a full ~10K-token review.
+- **Trim `enabled_specialists`** to permanently exclude specialists you
+  don't want regardless of triage. `code` + `security` is the strongest
+  two-specialist combo for general PRs.
 - **Set `include_polish: false`** for routine PRs.
 - **Set `max_rounds: 1`** for low-stakes PRs.
 - **Set `strictness: 1`** to report only critical findings.
 - **Override per-specialist models** to cheaper options (the defaults already
   put cheaper sonnet-class models on the easier specialists).
+
+If you suspect triage is dropping a specialist you wanted, add it to
+`force_specialists` to override the skip. If you don't trust triage at all
+for a particular run, set `triage_mode: all` to bypass it entirely.
 
 ## Confidence score formula
 
