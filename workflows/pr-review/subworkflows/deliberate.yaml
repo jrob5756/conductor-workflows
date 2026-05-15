@@ -912,10 +912,10 @@ agents:
   - name: persist_deliberation_outputs
     description: Persists raw lens_review outputs, deliberation responses, and arbitrator output to pr_data_dir as JSON files
     type: script
-    command: bash
+    command: python3
     timeout: 60
     args:
-      - "workflows/pr-review/scripts/persist-multi-json.sh"
+      - "workflows/pr-review/scripts/persist_multi_json.py"
       - "{{ workflow.input.pr_data_dir }}"
       - "lens-outputs.json"
       - "{{ lens_review.outputs | tojson }}"

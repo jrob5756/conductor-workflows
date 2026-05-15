@@ -267,10 +267,10 @@ agents:
   - name: pr_fetcher
     description: Fetches PR metadata, diff, and changed files from GitHub using the gh CLI
     type: script
-    command: bash
+    command: python3
     timeout: 120
     args:
-      - "workflows/pr-review/scripts/fetch-pr.sh"
+      - "workflows/pr-review/scripts/fetch_pr.py"
       - "{{ workflow.input.pr_url }}"
       - "{{ workflow.input.output_dir }}"
     routes:
@@ -697,10 +697,10 @@ agents:
   - name: poster
     description: Posts the rendered review comment and inline comments back to the PR via the gh CLI
     type: script
-    command: bash
+    command: python3
     timeout: 180
     args:
-      - "workflows/pr-review/scripts/post-review.sh"
+      - "workflows/pr-review/scripts/post_review.py"
       - "{{ pr_fetcher.output.owner }}"
       - "{{ pr_fetcher.output.repo }}"
       - "{{ pr_fetcher.output.pr_number }}"

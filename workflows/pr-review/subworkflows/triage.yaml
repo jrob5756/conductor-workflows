@@ -105,10 +105,10 @@ agents:
   - name: triage_heuristic
     description: Classifies the PR's changed files into specialist buckets using deterministic file-pattern rules — no LLM call
     type: script
-    command: bash
+    command: python3
     timeout: 30
     args:
-      - "workflows/pr-review/scripts/triage-heuristic.sh"
+      - "workflows/pr-review/scripts/triage_heuristic.py"
       - "{{ workflow.input.pr_data_dir }}"
     routes:
       # Bypass mode: skip both LLM and gate, go straight to resolver.
@@ -264,10 +264,10 @@ agents:
   - name: triage_resolver
     description: Combines heuristic + LLM outputs with user inputs into the final recommended specialists list — never returns empty
     type: script
-    command: bash
+    command: python3
     timeout: 30
     args:
-      - "workflows/pr-review/scripts/triage-resolve.sh"
+      - "workflows/pr-review/scripts/triage_resolve.py"
       - "{{ workflow.input.triage_mode }}"
       - "{{ workflow.input.enabled_specialists | tojson }}"
       - "{{ workflow.input.force_specialists | tojson }}"

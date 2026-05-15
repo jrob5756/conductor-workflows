@@ -359,10 +359,10 @@ agents:
   - name: persist_polish_outputs
     description: Persists raw polish_review outputs to pr_data_dir as a JSON file
     type: script
-    command: bash
+    command: python3
     timeout: 60
     args:
-      - "workflows/pr-review/scripts/persist-json.sh"
+      - "workflows/pr-review/scripts/persist_json.py"
       - "{{ workflow.input.pr_data_dir }}/polish-outputs.json"
       - "{{ polish_review.outputs | tojson }}"
     routes:

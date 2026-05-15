@@ -24,21 +24,21 @@ for debugging.
 
 ```
 workflows/pr-review/
-├── workflow.yaml              # Slim parent — pr_fetcher → dispatcher → 5 sub-workflows → poster
-├── README.md                  # This file
+├── workflow.yaml                # Slim parent — pr_fetcher → dispatcher → 5 sub-workflows → poster
+├── README.md                    # This file
 ├── scripts/
-│   ├── fetch-pr.sh            # gh CLI: fetch PR metadata + diff + changed files
-│   ├── post-review.sh         # gh CLI: post comment + inline comments back to PR
-│   ├── triage-heuristic.sh    # bash + py: file-pattern classifier (no LLM)
-│   ├── triage-resolve.sh      # bash + py: combine heuristic + LLM + user inputs into final list
-│   ├── persist-json.sh        # Writes a JSON string to a file
-│   └── persist-multi-json.sh  # Writes multiple JSON strings to multiple files
+│   ├── fetch_pr.py              # gh CLI: fetch PR metadata + diff + changed files
+│   ├── post_review.py           # gh CLI: post comment + inline comments back to PR
+│   ├── triage_heuristic.py      # File-pattern classifier (no LLM)
+│   ├── triage_resolve.py        # Combine heuristic + LLM + user inputs into final list
+│   ├── persist_json.py          # Writes a JSON string to a file
+│   └── persist_multi_json.py    # Writes multiple JSON strings to multiple files
 └── subworkflows/
-    ├── triage.yaml            # heuristic + cheap LLM + resolver — picks specialists per PR
-    ├── specialists.yaml       # 6 specialists in parallel + gate + consolidator + persist
-    ├── deliberate.yaml        # 2 lens reviewers in parallel + deliberation rounds + arbitrator + persist
-    ├── polish.yaml            # 2 polish agents in parallel + persist
-    └── render.yaml            # report_writer + inline_comments_writer + output_writer
+    ├── triage.yaml              # heuristic + cheap LLM + resolver — picks specialists per PR
+    ├── specialists.yaml         # 6 specialists in parallel + gate + consolidator + persist
+    ├── deliberate.yaml          # 2 lens reviewers in parallel + deliberation rounds + arbitrator + persist
+    ├── polish.yaml              # 2 polish agents in parallel + persist
+    └── render.yaml              # report_writer + inline_comments_writer + output_writer
 ```
 
 ## Pipeline
@@ -151,7 +151,12 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 
 - **`gh` (GitHub CLI)** on PATH, authenticated (`gh auth status`). Install
   from <https://cli.github.com/>.
-- **`python3`** on PATH (used by the fetcher / poster / persist / triage helpers).
+- **`python3`** on PATH (used by the fetcher, poster, persist, and triage
+  helpers — all cross-platform pure-Python with stdlib only). On Windows the
+  python.org installer ships `python.exe`; ensure `python3` resolves too —
+  either alias `py -3` to `python3`, install via the Microsoft Store (which
+  adds `python3.exe`), or run conductor inside a venv (where the `python3`
+  symlink exists by default).
 - **Node.js 18+** (used by the `@modelcontextprotocol/server-filesystem` MCP
   server).
 - **Conductor v0.1.12+** (script agents, `type: workflow` sub-workflows, and

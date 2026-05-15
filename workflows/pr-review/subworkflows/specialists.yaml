@@ -1542,10 +1542,10 @@ agents:
   - name: persist_specialist_outputs
     description: Persists raw specialist outputs, gate output, and consolidator output to pr_data_dir as JSON files
     type: script
-    command: bash
+    command: python3
     timeout: 60
     args:
-      - "workflows/pr-review/scripts/persist-multi-json.sh"
+      - "workflows/pr-review/scripts/persist_multi_json.py"
       - "{{ workflow.input.pr_data_dir }}"
       - "specialist-outputs.json"
       - "{{ specialist_review.outputs | tojson }}"
