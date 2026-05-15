@@ -107,7 +107,7 @@ agents:
 
       **Purpose:** {{ workflow.input.purpose }}
 
-      {% if document_review is defined and document_review.output and document_review.output.technical_review_score and document_review.output.technical_review_approved != 'True' %}
+      {% if document_review is defined and document_review.output and document_review.output.technical_review_score and not document_review.output.technical_review_approved %}
       **Technical Review Feedback (Score: {{ document_review.output.technical_review_score }}/100):**
       {{ document_review.output.technical_review_feedback }}
 
@@ -116,7 +116,7 @@ agents:
       Preserve content that is satisfactory.
       {% endif %}
 
-      {% if document_review is defined and document_review.output and document_review.output.readability_review_score and document_review.output.readability_review_approved != 'True' %}
+      {% if document_review is defined and document_review.output and document_review.output.readability_review_score and not document_review.output.readability_review_approved %}
       **Readability Review Feedback (Score: {{ document_review.output.readability_review_score }}/100):**
       {{ document_review.output.readability_review_feedback }}
 
@@ -290,7 +290,7 @@ agents:
       readability_threshold: "90"
     routes:
       - to: $end
-        when: "{{ document_review.output.technical_review_approved == 'True' and document_review.output.readability_review_approved == 'True' }}"
+        when: "{{ document_review.output.technical_review_approved and document_review.output.readability_review_approved }}"
       - to: architect
 
 output:
