@@ -374,12 +374,9 @@ agents:
       strengths:
         type: array
         description: List of things done well in the implementation
-      approved:
-        type: boolean
-        description: Whether the implementation is approved
     routes:
       - to: committer
-        when: "{{ output.approved }}"
+        when: "{{ output.decision == 'APPROVE' }}"
       - to: coder
 
   - name: committer
@@ -603,12 +600,9 @@ agents:
       strengths:
         type: array
         description: List of things done well across the implementation
-      approved:
-        type: boolean
-        description: Whether the overall implementation is approved
     routes:
       - to: $end
-        when: "{{ output.approved }}"
+        when: "{{ output.decision == 'APPROVE' }}"
       - to: fixer
         when: "{{ output.decision == 'REQUEST_CHANGES' }}"
 
