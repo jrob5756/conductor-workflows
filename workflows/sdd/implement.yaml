@@ -32,6 +32,7 @@ workflow:
 
   runtime:
     provider: copilot
+    max_session_seconds: 3600  # 1 hour per agent session
     mcp_servers:
       web-search:
         command: npx
