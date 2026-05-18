@@ -6,6 +6,7 @@ Sample workflow registry for [Conductor](https://github.com/microsoft/conductor)
 
 | Name | Description |
 |------|-------------|
+| `document-create` | Create a new markdown document grounded in the codebase, with a structure inferred from the stated purpose, with technical and readability review cycles (loops back to the author until both thresholds are met) |
 | `document-review` | Review-only scoring of a markdown document on technical accuracy and readability, with threshold short-circuit |
 | `document-update` | Update an existing markdown document to incorporate a stated purpose, with technical and readability review cycles (loops back to the editor until both thresholds are met) |
 | `pr-review` | Multi-agent PR review with smart per-PR triage: a heuristic + cheap LLM decides which of 6 specialists (code, security, tests, errors, types, comments) need to run for this PR, then cross-lens deliberation and a non-blocking polish stage. Self-contained via the `gh` CLI; GitHub-only in v1 |

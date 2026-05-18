@@ -367,7 +367,7 @@ agents:
   - name: document_review
     description: Reviews the plan document for technical accuracy and readability via the document-review sub-workflow
     type: workflow
-    workflow: ../document-review/workflow.yaml
+    workflow: ../document/review.yaml
     input:
       - workflow.input.purpose
       - architect.output.file_path

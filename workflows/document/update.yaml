@@ -235,7 +235,7 @@ agents:
   - name: document_review
     description: Reviews the updated document for technical accuracy and readability via the document-review sub-workflow
     type: workflow
-    workflow: ../document-review/workflow.yaml
+    workflow: ./review.yaml
     input:
       - workflow.input.purpose
       - workflow.input.technical_threshold

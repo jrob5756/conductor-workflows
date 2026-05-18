@@ -263,7 +263,12 @@ output:
   technical_review_approved: "{{ technical_reviewer.output.approved }}"
   technical_review_feedback: "{{ technical_reviewer.output.feedback }}"
   technical_review_critical_issues: "{{ technical_reviewer.output.critical_issues }}"
-  readability_review_score: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.score }}{% endif %}"
-  readability_review_approved: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.approved }}{% endif %}"
-  readability_review_feedback: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.feedback }}{% endif %}"
-  readability_review_critical_issues: "{% if readability_reviewer is defined %}{{ readability_reviewer.output.critical_issues }}{% endif %}"
+  # Each readability output is a single bare {{ ... }} ternary so Conductor
+  # preserves the native type (number/bool/string/list) when the readability
+  # reviewer ran. When technical review short-circuits the workflow before
+  # readability runs, defaults are returned so downstream parents can safely
+  # use idiomatic truthiness/`and`/`not` checks without string-vs-bool bugs.
+  readability_review_score: "{{ readability_reviewer.output.score if readability_reviewer is defined else 0 }}"
+  readability_review_approved: "{{ readability_reviewer.output.approved if readability_reviewer is defined else false }}"
+  readability_review_feedback: "{{ readability_reviewer.output.feedback if readability_reviewer is defined else '' }}"
+  readability_review_critical_issues: "{{ readability_reviewer.output.critical_issues if readability_reviewer is defined else [] }}"

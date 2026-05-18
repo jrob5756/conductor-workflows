@@ -1,0 +1,283 @@
+# Document Create Workflow
+#
+# This workflow creates a new markdown document from scratch based on a stated
+# purpose. The author researches the codebase and external context as needed,
+# infers an appropriate structure from the purpose, and writes the document.
+# The document is then reviewed by the `document-review` sub-workflow for
+# technical accuracy and readability; if either score is below the threshold
+# (default 90), the workflow loops back to the author for revision.
+#
+# Unlike domain-specific authoring workflows (e.g. `sdd-design`, `sdd-plan`),
+# this workflow does not prescribe sections, headings, or structure — the
+# author chooses what fits the purpose.
+#
+# Usage:
+#   conductor run document-create --input purpose="Explain the caching layer"
+#
+# With explicit output path:
+#   conductor run document-create \
+#     --input purpose="..." \
+#     --input output_path="docs/caching.md"
+#
+# With custom thresholds:
+#   conductor run document-create \
+#     --input purpose="..." \
+#     --input technical_threshold=80 \
+#     --input readability_threshold=80
+#
+# Flow:
+#   author → document_review (sub-workflow)
+#     → $end                  (when both reviews are approved)
+#     → author                (when either review is not approved)
+
+workflow:
+  name: document-create
+  description: Create a new markdown document grounded in the codebase, with a structure inferred from the stated purpose, reviewed by the document-review sub-workflow for technical accuracy and readability
+  version: "1.0.0"
+  entry_point: author
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["search"] # others use playwright
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+      ms-learn:
+        type: http
+        url: https://learn.microsoft.com/api/mcp
+        tools: ["*"]
+
+  input:
+    purpose:
+      type: string
+      required: true
+      description: A clear description of what the document should communicate, to whom, and why
+    output_path:
+      type: string
+      required: false
+      description: Optional file path for the document (e.g. docs/my-topic.md)
+    technical_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Minimum score (0-100) the technical review must reach to be considered approved
+    readability_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Minimum score (0-100) the readability review must reach to be considered approved
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 50
+
+agents:
+  - name: author
+    description: Researches the codebase and broader context, then authors a markdown document whose structure is inferred from the stated purpose
+    model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.purpose
+      - workflow.input.output_path?
+      - author.output?
+      - document_review.output?
+    system_prompt: |
+      You are a Senior Technical Writer. You take a stated purpose, research
+      the codebase and external context as needed, and produce a clear,
+      well-structured markdown document that accomplishes that purpose.
+
+      Your core capabilities include:
+      - Inferring the right shape for a document from its purpose and audience
+      - Choosing the appropriate structure, headings, length, and level of
+        detail for the document at hand
+      - Grounding claims in the codebase and authoritative external sources
+      - Writing precise, fact-based prose that reads as if it were always
+        part of the documentation set it lives in
+      - Surfacing uncertainty as explicit open questions instead of hand-waving
+
+      Your documents are:
+      - Structured for the document's actual audience and purpose
+      - Grounded in evidence — never speculative or aspirational
+      - Honest about trade-offs, risks, and open questions when relevant
+      - As long as they need to be, and no longer
+
+      You do NOT impose a one-size-fits-all template. A reference doc, a
+      how-to guide, a postmortem, and a design rationale all look different,
+      and you write each in the form that best serves the reader.
+    prompt: |
+      Create a markdown document based on the following purpose:
+
+      **Purpose:** {{ workflow.input.purpose }}
+
+      {% if document_review is defined and document_review.output and not document_review.output.technical_review_approved %}
+      **Technical Review Feedback (Score: {{ document_review.output.technical_review_score }}/100):**
+      {{ document_review.output.technical_review_feedback }}
+
+      **IMPORTANT:** You are revising an existing document. Read the document at
+      `{{ author.output.file_path }}` and update it to address the feedback.
+      Preserve content that is satisfactory.
+      {% endif %}
+
+      {% if document_review is defined and document_review.output and not document_review.output.readability_review_approved %}
+      **Readability Review Feedback (Score: {{ document_review.output.readability_review_score }}/100):**
+      {{ document_review.output.readability_review_feedback }}
+
+      **IMPORTANT:** You are revising an existing document. Read the document at
+      `{{ author.output.file_path }}` and update it to address the feedback.
+      Preserve content that is satisfactory.
+      {% endif %}
+
+      ---
+
+      ## Phase 1: Understand the Purpose
+
+      Before researching or writing:
+      - Identify what the reader needs to learn, decide, or do after reading.
+      - Identify the document's audience (their role, background, and goals).
+      - Identify the document's apparent type (e.g. reference, how-to,
+        explainer, design rationale, postmortem, runbook) — this determines
+        the shape.
+      - Note any constraints the purpose implies (scope, depth, tone).
+
+      ---
+
+      ## Phase 2: Research
+
+      Ground every claim in evidence before writing:
+
+      ### Codebase Analysis
+      - Explore the parts of the codebase the document discusses.
+      - Verify file paths, type names, API signatures, configuration keys,
+        and runtime behavior by reading the code, not guessing.
+      - Note existing conventions, patterns, and prior documentation that
+        the new document should align with.
+
+      ### External Research
+      - Search the web, context7, and ms-learn for authoritative information
+        on third-party libraries, services, protocols, and standards the
+        document depends on.
+      - Verify version numbers, deprecations, and current best practice.
+
+      Skip a research category only if it is plainly irrelevant to the
+      purpose. Err on the side of doing more research, not less.
+
+      ---
+
+      ## Phase 3: Choose the Structure
+
+      Pick the section structure that best serves the purpose and audience.
+      Do **not** default to a generic template. Examples of fits:
+
+      - A reference doc usually opens with an overview, then a structured
+        catalog of items (APIs, options, fields).
+      - A how-to guide opens with the goal and prerequisites, then numbered
+        steps, then validation and troubleshooting.
+      - An explainer opens with motivation and context, then concepts in
+        the order they build on each other.
+      - A design rationale opens with the problem, then constraints,
+        decisions, and trade-offs.
+
+      Use the structure that fits. Include only the sections the document
+      actually needs.
+
+      ---
+
+      ## Phase 4: Write the Document
+
+      Write the document with the structure you chose. While writing:
+
+      - Lead with the most important information.
+      - Be specific. Replace vague claims with concrete facts and examples.
+      - Use tables, lists, code blocks, and diagrams where they help the
+        reader — not for decoration.
+      - Keep the voice consistent and the tone calibrated to the audience.
+      - When something is genuinely uncertain, call it out explicitly
+        (e.g. an "Open Questions" section or inline note).
+
+      ---
+
+      ## REVISION NOTES
+
+      {% if document_review is defined and document_review.output %}
+      After revising the document, provide a concise summary of what you
+      changed and why in your `revision_notes` output. Structure it as a
+      bullet list, e.g.:
+      - Corrected gRPC version numbers per technical reviewer feedback
+      - Rewrote the Overview for clarity per readability feedback
+      - Added a missing prerequisite step
+
+      This helps reviewers understand what changed.
+      {% else %}
+      This is the first draft. Set `revision_notes` to "Initial draft."
+      {% endif %}
+
+      ---
+
+      ## SAVING THE DOCUMENT
+
+      After creating the document, save it to a file.
+
+      {% if workflow.input.output_path %}
+      Save the document to: `{{ workflow.input.output_path }}`
+      {% else %}
+      Choose a file path using the following convention:
+
+      - If the purpose references an existing document path, derive the
+        name from that document and save it in the same directory.
+      - Otherwise:
+        - Save the document in the current working directory, or in a
+          `docs/` subdirectory if one exists in the repository root.
+        - Use the naming convention: `[descriptive-slug].md`
+        - Examples:
+          - `caching-layer-overview.md`
+          - `rate-limiting-how-to.md`
+      {% endif %}
+    output:
+      file_path:
+        type: string
+        description: The path where the document was saved
+      revision_notes:
+        type: string
+        description: Summary of changes made in this revision (empty on first draft)
+    routes:
+      - to: document_review
+
+  - name: document_review
+    description: Reviews the document for technical accuracy and readability via the document-review sub-workflow
+    type: workflow
+    workflow: ./review.yaml
+    input:
+      - workflow.input.purpose
+      - workflow.input.technical_threshold
+      - workflow.input.readability_threshold
+      - author.output.file_path
+    input_mapping:
+      document_path: "{{ author.output.file_path }}"
+      purpose: "{{ workflow.input.purpose }}"
+      technical_threshold: "{{ workflow.input.technical_threshold }}"
+      readability_threshold: "{{ workflow.input.readability_threshold }}"
+    routes:
+      - to: $end
+        when: "{{ document_review.output.technical_review_approved and document_review.output.readability_review_approved }}"
+      - to: author
+
+output:
+  purpose: "{{ workflow.input.purpose }}"
+  document_file: "{{ author.output.file_path }}"
+  technical_review_score: "{{ document_review.output.technical_review_score }}"
+  readability_review_score: "{{ document_review.output.readability_review_score }}"
+  technical_review_feedback: "{{ document_review.output.technical_review_feedback }}"
+  readability_review_feedback: "{{ document_review.output.readability_review_feedback }}"
+  iterations: "{{ context.iteration }}"
