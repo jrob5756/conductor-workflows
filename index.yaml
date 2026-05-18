@@ -2,6 +2,9 @@ workflows:
   document-review:
     description: "Review-only workflow that scores a markdown document on technical accuracy and readability, short-circuiting if the technical score is below the threshold"
     path: workflows/document-review/workflow.yaml
+  document-update:
+    description: "Update an existing markdown document according to a stated purpose, with technical and readability review cycles via the document-review sub-workflow"
+    path: workflows/document-update/workflow.yaml
   pr-review:
     description: "Multi-agent PR review with smart per-PR specialist triage: heuristic + LLM picks which of 6 deep-domain specialists (code, security, tests, errors, types, comments) need to run, then cross-lens deliberation, consensus arbitration, and a non-blocking polish stage. Self-contained via the gh CLI; GitHub-only in v1."
     path: workflows/pr-review/workflow.yaml

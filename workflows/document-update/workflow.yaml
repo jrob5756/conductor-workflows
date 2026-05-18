@@ -1,0 +1,262 @@
+# Document Update Workflow
+#
+# This workflow updates an existing markdown document according to a stated
+# purpose, then runs the `document-review` sub-workflow to score the result
+# on technical accuracy and readability. If either score is below the
+# threshold (default 90), the workflow loops back to the editor for
+# revision.
+#
+# This is the symmetric companion to `document-review`: review-only is the
+# `document-review` workflow; update-then-review is this one.
+#
+# Usage:
+#   conductor run document-update \
+#     --input document_path="docs/architecture.md" \
+#     --input purpose="Add a section describing the new rate-limiting layer"
+#
+# With explicit output path (write to a new file instead of in-place):
+#   conductor run document-update \
+#     --input document_path="docs/architecture.md" \
+#     --input purpose="..." \
+#     --input output_path="docs/architecture.v2.md"
+#
+# With custom thresholds:
+#   conductor run document-update \
+#     --input document_path="docs/my-doc.md" \
+#     --input purpose="..." \
+#     --input technical_threshold=80 \
+#     --input readability_threshold=80
+#
+# Flow:
+#   editor → document_review (sub-workflow)
+#     → $end                  (when both reviews are approved)
+#     → editor                (when either review is not approved)
+
+workflow:
+  name: document-update
+  description: Update an existing markdown document according to a stated purpose, reviewed by the document-review sub-workflow for technical accuracy and readability
+  version: "1.0.0"
+  entry_point: editor
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["search"]
+      context7:
+        command: npx
+        args: ["-y", "@upstash/context7-mcp@latest"]
+        tools: ["*"]
+      ms-learn:
+        type: http
+        url: https://learn.microsoft.com/api/mcp
+        tools: ["*"]
+
+  input:
+    document_path:
+      type: string
+      required: true
+      description: Path to the existing markdown document to update
+    purpose:
+      type: string
+      required: true
+      description: A clear description of the change, addition, or refinement the document should incorporate
+    output_path:
+      type: string
+      required: false
+      description: Optional file path to write the updated document to. If omitted, the document is updated in place at document_path.
+    technical_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Minimum score (0-100) the technical review must reach to be considered approved
+    readability_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Minimum score (0-100) the readability review must reach to be considered approved
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 50
+
+agents:
+  - name: editor
+    description: Reads the existing document and applies updates according to the stated purpose, optionally addressing reviewer feedback on subsequent iterations
+    model: claude-opus-4.7-1m-internal
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.document_path
+      - workflow.input.purpose
+      - workflow.input.output_path?
+      - editor.output?
+      - document_review.output?
+    system_prompt: |
+      You are a Senior Technical Editor. You take an existing document and
+      revise it to incorporate a stated change while preserving everything
+      else that is good about the document.
+
+      Your core capabilities include:
+      - Reading and deeply understanding an existing document before editing
+      - Making targeted, surgical edits that achieve the stated purpose
+      - Preserving the document's voice, structure, formatting conventions,
+        and content that is unrelated to the requested change
+      - Researching the codebase and external sources to ground new or
+        updated content in evidence
+      - Addressing reviewer feedback precisely without overcorrecting
+      - Producing edits that read as if they were always part of the document
+
+      You are precise and conservative. You do NOT rewrite content the user
+      did not ask to change. You do NOT add scope creep, drive-by
+      "improvements", or unrelated refactors of prose.
+    prompt: |
+      Update the following document to incorporate the stated purpose.
+
+      **Document to Update:** `{{ workflow.input.document_path }}`
+
+      **Purpose of Update:** {{ workflow.input.purpose }}
+
+      {% if document_review is defined and document_review.output and document_review.output.technical_review_score and not document_review.output.technical_review_approved %}
+      **Technical Review Feedback (Score: {{ document_review.output.technical_review_score }}/100):**
+      {{ document_review.output.technical_review_feedback }}
+
+      **IMPORTANT:** You are revising a document you already updated. Read the
+      document at `{{ editor.output.file_path }}` and update it to address the
+      feedback above. Preserve content that is satisfactory.
+      {% endif %}
+
+      {% if document_review is defined and document_review.output and document_review.output.readability_review_score and not document_review.output.readability_review_approved %}
+      **Readability Review Feedback (Score: {{ document_review.output.readability_review_score }}/100):**
+      {{ document_review.output.readability_review_feedback }}
+
+      **IMPORTANT:** You are revising a document you already updated. Read the
+      document at `{{ editor.output.file_path }}` and update it to address the
+      feedback above. Preserve content that is satisfactory.
+      {% endif %}
+
+      ---
+
+      ## Phase 1: Read and Understand
+
+      1. Open and read the **entire** current document at the path above.
+      2. Identify the document's purpose, audience, structure, voice, and
+         formatting conventions.
+      3. Locate the sections most relevant to the stated update purpose.
+      4. Note any content that should be preserved as-is.
+
+      ---
+
+      ## Phase 2: Research (only when the update requires it)
+
+      If the update involves new or changed technical content, ground your
+      edits in evidence before writing:
+
+      - **Codebase analysis** — read the relevant source files, configs, or
+        existing docs that the update touches. Verify versions, API names,
+        behavior, and conventions.
+      - **External research** — use web search, context7, or ms-learn to
+        verify facts about third-party libraries, services, or standards
+        that the update relies on.
+
+      Skip this phase if the update is purely editorial (clarity,
+      formatting, organization).
+
+      ---
+
+      ## Phase 3: Apply the Update
+
+      Make the **minimum set of changes** needed to achieve the stated
+      purpose:
+
+      - Add, modify, or remove content as the purpose requires.
+      - Match the document's existing voice, terminology, and formatting.
+      - Preserve unrelated sections and content verbatim — do not rewrite
+        prose the purpose does not call out.
+      - Keep cross-references, links, and tables of contents consistent if
+        you add, remove, or rename sections.
+      - If you remove content, ensure nothing else in the document depends
+        on it.
+
+      **Surgical-change constraint:** Every changed line MUST trace to the
+      stated purpose (or, on revision iterations, to specific reviewer
+      feedback). If you notice unrelated issues, mention them in
+      `revision_notes` — do not fix them.
+
+      ---
+
+      ## Phase 4: Save the Document
+
+      {% if workflow.input.output_path %}
+      Save the updated document to: `{{ workflow.input.output_path }}`
+      (The original document at `{{ workflow.input.document_path }}` should
+      be left untouched.)
+      {% else %}
+      Save the updated document **in place**, overwriting
+      `{{ workflow.input.document_path }}`.
+      {% endif %}
+
+      ---
+
+      ## REVISION NOTES
+
+      {% if document_review is defined and document_review.output %}
+      After saving, provide a concise summary of what you changed in this
+      iteration and why in your `revision_notes` output. Structure it as a
+      bullet list, e.g.:
+      - Corrected gRPC version numbers per technical reviewer feedback
+      - Rewrote the new "Rate limiting" section opener for clarity per readability feedback
+      - Updated the table of contents to reflect the added section
+      {% else %}
+      This is the first update pass. In your `revision_notes` output,
+      summarize what you changed to incorporate the stated purpose, e.g.:
+      - Added a new "Rate limiting" section after "Authentication"
+      - Updated the architecture diagram caption to reference the new layer
+      - Refreshed the "Open Questions" list to remove the rate-limiting item
+      {% endif %}
+    output:
+      file_path:
+        type: string
+        description: The path where the updated document was saved (equal to output_path if provided, otherwise document_path)
+      revision_notes:
+        type: string
+        description: Bullet-list summary of changes made in this iteration
+    routes:
+      - to: document_review
+
+  - name: document_review
+    description: Reviews the updated document for technical accuracy and readability via the document-review sub-workflow
+    type: workflow
+    workflow: ../document-review/workflow.yaml
+    input:
+      - workflow.input.purpose
+      - workflow.input.technical_threshold
+      - workflow.input.readability_threshold
+      - editor.output.file_path
+    input_mapping:
+      document_path: "{{ editor.output.file_path }}"
+      purpose: "{{ workflow.input.purpose }}"
+      technical_threshold: "{{ workflow.input.technical_threshold }}"
+      readability_threshold: "{{ workflow.input.readability_threshold }}"
+    routes:
+      - to: $end
+        when: "{{ document_review.output.technical_review_approved and document_review.output.readability_review_approved }}"
+      - to: editor
+
+output:
+  document_path: "{{ workflow.input.document_path }}"
+  purpose: "{{ workflow.input.purpose }}"
+  updated_file: "{{ editor.output.file_path }}"
+  technical_review_score: "{{ document_review.output.technical_review_score }}"
+  readability_review_score: "{{ document_review.output.readability_review_score }}"
+  technical_review_feedback: "{{ document_review.output.technical_review_feedback }}"
+  readability_review_feedback: "{{ document_review.output.readability_review_feedback }}"
+  iterations: "{{ context.iteration }}"
