@@ -122,6 +122,23 @@ agents:
          - Check prerequisites: verify all prerequisite epics are DONE before selecting
          - If ALL epics are DONE, set `all_complete` to true
 
+         **SOURCE OF TRUTH for epic/task status:** the explicit `Status:` markers
+         on each epic and task (DONE / IN PROGRESS / NOT STARTED / TO DO) and any
+         "DONE" / checked acceptance-criteria boxes on the epic itself. Treat
+         those as authoritative.
+
+         Do NOT downgrade an epic's status based on freeform prose elsewhere in
+         the plan — phrases like "deferred", "incomplete acceptance criteria",
+         "blocked", or "status note" in another epic's description are author
+         commentary, not status. If a prerequisite epic is marked DONE, report
+         `prerequisites_met: true` for the epic that depends on it. If the
+         author wanted the prerequisite treated as incomplete, they would have
+         marked its status accordingly.
+
+         `prerequisites_met` is informational: it is passed downstream as
+         context but does NOT gate workflow routing — the workflow proceeds as
+         long as a current_epic is selected and not all epics are DONE.
+
       3. **Extract Epic Details**
          - Copy the FULL epic details including:
            - Epic title and description/goal
@@ -152,7 +169,7 @@ agents:
         description: Full details of the selected epic (tasks, acceptance criteria, files, prerequisites)
       prerequisites_met:
         type: boolean
-        description: Whether all prerequisites for the selected epic are satisfied
+        description: Informational — whether the selector judged all prerequisite epics DONE based on the plan's explicit status markers. Does not gate routing; passed downstream as context only.
       all_complete:
         type: boolean
         description: True only if ALL epics in the plan are marked DONE
@@ -160,11 +177,9 @@ agents:
         type: number
         description: Number of epics still remaining (not DONE)
     routes:
-      - to: coder
-        when: "{{ not output.all_complete and output.prerequisites_met }}"
       - to: plan_reviewer
         when: "{{ output.all_complete }}"
-      - to: $end
+      - to: coder
 
   - name: coder
     description: Implements code changes for a single epic
@@ -203,6 +218,23 @@ agents:
 
       **Plan Document:**
       {{ workflow.input.plan }}
+
+      {% if epic_selector.output.prerequisites_met == false %}
+      **Selector Flagged Prerequisites As Not Met:**
+      The epic selector marked `prerequisites_met = false` for this epic. This
+      is informational — the workflow proceeded because the plan's explicit
+      status markers say earlier epics are DONE, but the selector saw prose
+      elsewhere in the plan suggesting earlier work may be incomplete.
+
+      Before writing code:
+      - Sanity-check that this epic's prerequisites really are in place by
+        inspecting the codebase and tests.
+      - If a real blocker exists, STOP and surface it in `implementation_notes`
+        with a concrete list of what is missing; do not work around or paper
+        over the blocker.
+      - If the plan's "DONE" status is correct and the selector was being
+        overly conservative, proceed with the epic.
+      {% endif %}
 
       {% if epic_reviewer is defined and epic_reviewer.output and epic_reviewer.output.decision == "REQUEST_CHANGES" %}
       **Previous Implementation Failed Review - Fix These Issues:**
