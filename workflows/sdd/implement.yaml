@@ -71,7 +71,10 @@ workflow:
 agents:
   - name: epic_selector
     description: Reads the plan and selects exactly one epic to implement next
-    model: claude-sonnet-4.6
+    model: claude-sonnet-5
+    context_tier: default 
+    reasoning:
+      effort: medium 
     input:
       - workflow.input.plan
       - workflow.input.epic?
@@ -183,7 +186,8 @@ agents:
 
   - name: coder
     description: Implements code changes for a single epic
-    model: claude-opus-4.7-1m-internal
+    model: claude-sonnet-5
+    context_tier: long_context
     reasoning:
       effort: high
     input:
@@ -314,9 +318,10 @@ agents:
 
   - name: epic_reviewer
     description: Reviews the implementation for a single epic
-    model: gpt-5.5
+    model: gpt-5.6-sol
+    context_tier: long_context
     reasoning:
-      effort: medium
+      effort: max
     input:
       - coder.output
     system_prompt: |
@@ -413,7 +418,10 @@ agents:
 
   - name: committer
     description: Commits the changes and updates the plan document
-    model: claude-sonnet-4.6
+    model: claude-sonnet-5
+    context_tier: default
+    reasoning:
+      effort: medium
     input:
       - workflow.input.plan
       - coder.output
@@ -518,9 +526,10 @@ agents:
 
   - name: plan_reviewer
     description: Reviews the entire implementation plan and all commits holistically
-    model: claude-opus-4.7-1m-internal
+    model: claude-opus-4.8
+    context_tier: long_context
     reasoning:
-      effort: xhigh
+      effort: max
     input:
       - workflow.input.plan
       - epic_selector.output
@@ -640,9 +649,10 @@ agents:
 
   - name: fixer
     description: Fixes issues identified by the plan reviewer
-    model: claude-opus-4.7-1m-internal
+    model: claude-sonnet-5
+    context_tier: long_context
     reasoning:
-      effort: high
+      effort: medium
     input:
       - workflow.input.plan
       - coder.output

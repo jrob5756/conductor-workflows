@@ -189,7 +189,7 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 | `lens_skeptic_model` | string | `claude-opus-4.7` | Model for the Skeptic lens |
 | `lens_completeness_model` | string | `gpt-5.5` | Model for the Completeness lens |
 | `specialist_*_model` | string | various | Per-specialist model overrides (`specialist_security_model` defaults to `claude-opus-4.7` since security balancing benefits from strong reasoning) |
-| `polish_*_model` | string | `claude-sonnet-4.6` | Per-polish-agent model overrides |
+| `polish_*_model` | string | `claude-sonnet-5` | Per-polish-agent model overrides |
 
 ## Outputs
 

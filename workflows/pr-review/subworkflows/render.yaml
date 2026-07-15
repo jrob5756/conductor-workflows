@@ -18,7 +18,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: claude-sonnet-4.6
+    default_model: claude-sonnet-5
     max_session_seconds: 1800
     mcp_servers:
       filesystem:
@@ -626,7 +626,7 @@ agents:
   # ───────────────────────────────────────────────────────────────────────────
   - name: inline_comments_writer
     description: Builds the inline_comments array from agreed findings (or specialist findings in degraded mode) for posting on specific PR diff lines
-    model: claude-sonnet-4.6
+    model: claude-sonnet-5
     input:
       - workflow.input.pr_metadata
       - workflow.input.specialist_outputs
@@ -774,7 +774,7 @@ agents:
   # ───────────────────────────────────────────────────────────────────────────
   - name: output_writer
     description: Writes review-comment.md, detailed report, and inline-comments.json (latest + versioned) to the output directory
-    model: claude-sonnet-4.6
+    model: claude-sonnet-5
     input:
       - report_writer.output.review_comment_path
       - report_writer.output.consensus_count
@@ -933,19 +933,19 @@ agents:
       ## Models
       | Agent | Model |
       |---|---|
-      | dispatcher | claude-sonnet-4.6 |
+      | dispatcher | claude-sonnet-5 |
       | specialist_code | (see workflow input) |
       | specialist_tests | (see workflow input) |
       | specialist_errors | (see workflow input) |
       | specialist_types | (see workflow input) |
       | specialist_comments | (see workflow input) |
-      | consolidator | claude-sonnet-4.6 |
+      | consolidator | claude-sonnet-5 |
       | lens_skeptic | {{ workflow.input.lens_skeptic_model }} |
       | lens_completeness | {{ workflow.input.lens_completeness_model }} |
       | arbitrator | claude-opus-4.7 |
       | report_writer | claude-opus-4.7 |
-      | inline_comments_writer | claude-sonnet-4.6 |
-      | output_writer | claude-sonnet-4.6 |
+      | inline_comments_writer | claude-sonnet-5 |
+      | output_writer | claude-sonnet-5 |
 
       ## Specialist Contributions
       {% if workflow.input.has_consolidator %}

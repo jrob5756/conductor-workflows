@@ -76,9 +76,10 @@ workflow:
 agents:
   - name: architect
     description: Researches the codebase and broader context, then authors a solution design document
-    model: claude-opus-4.7-1m-internal
+    model: claude-opus-4.8
+    context_tier: long_context
     reasoning:
-      effort: high
+      effort: max 
     input:
       - workflow.input.purpose
       - workflow.input.output_path?

@@ -80,9 +80,10 @@ workflow:
 agents:
   - name: technical_reviewer
     description: Reviews the document for technical accuracy, factual correctness, and completeness
-    model: claude-opus-4.7-1m-internal
+    model: claude-opus-4.8
+    context_tier: long_context
     reasoning:
-      effort: high
+      effort: max
     input:
       - workflow.input.document_path
       - workflow.input.purpose?
@@ -177,9 +178,10 @@ agents:
 
   - name: readability_reviewer
     description: Reviews the document for structure, clarity, and readability
-    model: gpt-5.5
+    model: gpt-5.6-sol
+    context_tier: default 
     reasoning:
-      effort: medium
+      effort: max
     input:
       - workflow.input.document_path
       - workflow.input.purpose?

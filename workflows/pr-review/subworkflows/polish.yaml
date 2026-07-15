@@ -19,7 +19,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: claude-sonnet-4.6
+    default_model: claude-sonnet-5
     max_session_seconds: 1800
     mcp_servers:
       filesystem:
@@ -48,11 +48,11 @@ workflow:
     polish_simplifier_model:
       type: string
       required: false
-      default: "claude-sonnet-4.6"
+      default: "claude-sonnet-5"
     polish_dead_code_model:
       type: string
       required: false
-      default: "claude-sonnet-4.6"
+      default: "claude-sonnet-5"
 
   context:
     mode: explicit

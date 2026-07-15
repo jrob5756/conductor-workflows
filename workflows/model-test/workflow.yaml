@@ -59,7 +59,7 @@ agents:
       reply: { type: string }
 
   - name: probe_claude_sonnet_46
-    model: claude-sonnet-4.6
+    model: claude-sonnet-5
     system_prompt: "Reply with exactly the word: OK"
     prompt: "Say OK."
     output:
