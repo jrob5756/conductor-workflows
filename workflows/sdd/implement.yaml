@@ -63,6 +63,10 @@ workflow:
       type: string
       required: false
       description: A specific epic ID to implement. If not provided, all incomplete epics are in scope
+    max_epic_review_rounds:
+      type: number
+      default: 4
+      description: Max coder<->epic_reviewer rounds for a single epic before escalating to a human gate instead of looping indefinitely
 
   context:
     mode: accumulate
@@ -338,6 +342,20 @@ agents:
 
       **Epic:** {{ coder.output.current_epic }}
 
+      **Your Previous Review (if any, for round-tracking):**
+      {% if epic_reviewer is defined and epic_reviewer.output %}
+      - Epic reviewed: {{ epic_reviewer.output.epic_reviewed | default('(none)') }}
+      - Round: {{ epic_reviewer.output.review_round | default(0) }}
+      {% else %}
+      (This is the first review in this workflow run — start at round 1.)
+      {% endif %}
+
+      If the epic above differs from "Epic reviewed" here, this is a NEW
+      epic: set `review_round` to 1. Otherwise you are reviewing the SAME
+      epic again after requesting changes: set `review_round` to the
+      previous round + 1. Always set `epic_reviewed` to the current epic
+      identifier so the next round can detect epic changes correctly.
+
       **Epic Details:**
       {{ coder.output.epic_details }}
 
@@ -414,10 +432,60 @@ agents:
       strengths:
         type: array
         description: List of things done well in the implementation
+      epic_reviewed:
+        type: string
+        description: The exact epic identifier under review this round (for round-tracking; copy the "Epic:" value verbatim).
+      review_round:
+        type: number
+        description: This epic's review round number. 1 for a fresh epic; previous round + 1 when re-reviewing the SAME epic after REQUEST_CHANGES; resets to 1 whenever the epic changes.
     routes:
       - to: committer
         when: "{{ output.decision == 'APPROVE' }}"
+      - to: epic_review_escalation
+        when: "{{ output.decision == 'REQUEST_CHANGES' and output.review_round >= workflow.input.max_epic_review_rounds }}"
       - to: coder
+
+  - name: epic_review_escalation
+    type: human_gate
+    description: Escalate when an epic hasn't converged after several coder<->epic_reviewer rounds
+    prompt: |
+      **Epic {{ coder.output.current_epic }}** has been through
+      {{ epic_reviewer.output.review_round }} review rounds without approval
+      (limit: {{ workflow.input.max_epic_review_rounds }}).
+
+      **Latest reviewer feedback:**
+      {{ epic_reviewer.output.feedback }}
+
+      **Outstanding issues:**
+      {% for issue in epic_reviewer.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      **Strengths noted:**
+      {% for strength in epic_reviewer.output.strengths %}
+      - {{ strength }}
+      {% endfor %}
+
+      How would you like to proceed?
+    options:
+      - label: Continue reviewing (one more round)
+        value: continue
+        route: coder
+      - label: Force-approve and flag for plan review
+        value: force_approve
+        route: mark_force_approved
+      - label: Stop the workflow here
+        value: stop
+        route: $end
+
+  - name: mark_force_approved
+    type: set
+    description: Record that this epic was force-approved past the review-round cap, so the committer can flag it for plan_reviewer
+    values:
+      force_approved_epic: "{{ coder.output.current_epic }}"
+      force_approved_note: "Force-approved after {{ epic_reviewer.output.review_round }} review rounds without reviewer sign-off. Outstanding: {{ epic_reviewer.output.issues | join('; ') }}"
+    routes:
+      - to: committer
 
   - name: committer
     description: Commits the changes and updates the plan document
@@ -438,6 +506,14 @@ agents:
       The following epic has been implemented and approved.
 
       **Epic:** {{ coder.output.current_epic }}
+
+      {% if mark_force_approved is defined and mark_force_approved.output.force_approved_epic == coder.output.current_epic %}
+      **IMPORTANT:** This epic was force-approved by a human operator after
+      hitting the review-round cap — the automated epic_reviewer had NOT
+      approved it. When updating the plan document, add a note under this
+      epic's status: "⚠️ {{ mark_force_approved.output.force_approved_note }}"
+      so the final plan_reviewer pass is aware this epic needs extra scrutiny.
+      {% endif %}
 
       **Epic Details:**
       {{ coder.output.epic_details }}
