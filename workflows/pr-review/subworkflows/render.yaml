@@ -150,7 +150,7 @@ workflow:
     lens_skeptic_model:
       type: string
       required: false
-      default: "claude-opus-4.7"
+      default: "claude-opus-5"
     lens_completeness_model:
       type: string
       required: false
@@ -230,7 +230,7 @@ agents:
 
   - name: report_writer
     description: Renders the final PR review markdown — consensus + disputed findings, polish section, delta mode, optional impact diagram
-    model: claude-opus-4.7
+    model: claude-opus-5
     input:
       - workflow.input.pr_metadata
       - workflow.input.pr_data_dir
@@ -942,8 +942,8 @@ agents:
       | consolidator | claude-sonnet-5 |
       | lens_skeptic | {{ workflow.input.lens_skeptic_model }} |
       | lens_completeness | {{ workflow.input.lens_completeness_model }} |
-      | arbitrator | claude-opus-4.7 |
-      | report_writer | claude-opus-4.7 |
+      | arbitrator | claude-opus-5 |
+      | report_writer | claude-opus-5 |
       | inline_comments_writer | claude-sonnet-5 |
       | output_writer | claude-sonnet-5 |
 

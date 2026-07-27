@@ -82,7 +82,7 @@ workflow:
 agents:
   - name: architect
     description: Researches the codebase and broader context, then authors a solution design document with actionable implementation plan
-    model: claude-opus-4.8
+    model: claude-opus-5
     context_tier: long_context
     reasoning:
       effort: max

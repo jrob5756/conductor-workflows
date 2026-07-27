@@ -65,7 +65,7 @@ specialists (sub-workflow)
   └─ persist_specialist_outputs (writes specialist-outputs.json + gate-output.json + …)
   ↓
 deliberate (sub-workflow)
-  ├─ lens_skeptic                 (claude-opus-4.7 default — "are these findings real?")
+  ├─ lens_skeptic                 (claude-opus-5 default — "are these findings real?")
   ├─ lens_completeness            (gpt-5.5 default — "what did we miss?", cross-family)
   ├─ deliberation rounds (sequential loop, 1-10):
   │   deliberation_lens_1 → deliberation_lens_2 → arbitrator
@@ -186,9 +186,9 @@ sub-workflow output for the parent and downstream sub-workflows to consume.
 | `output_dir` | string | `""` | Where to write artifacts (defaults to a workflow temp dir) |
 | `diff_boundary_nonce` | string | `""` | Pre-generated 8-char hex nonce for `<diff-NONCE>...</diff-NONCE>` markers |
 | `auto_post` | bool | `false` | Post the rendered comment + inline comments back to the PR via `gh` |
-| `lens_skeptic_model` | string | `claude-opus-4.7` | Model for the Skeptic lens |
+| `lens_skeptic_model` | string | `claude-opus-5` | Model for the Skeptic lens |
 | `lens_completeness_model` | string | `gpt-5.5` | Model for the Completeness lens |
-| `specialist_*_model` | string | various | Per-specialist model overrides (`specialist_security_model` defaults to `claude-opus-4.7` since security balancing benefits from strong reasoning) |
+| `specialist_*_model` | string | various | Per-specialist model overrides (`specialist_security_model` defaults to `claude-opus-5` since security balancing benefits from strong reasoning) |
 | `polish_*_model` | string | `claude-sonnet-5` | Per-polish-agent model overrides |
 
 ## Outputs
@@ -273,7 +273,7 @@ conductor run workflows/pr-review/workflow.yaml \
 ```bash
 conductor run workflows/pr-review/workflow.yaml \
   --input pr_url="https://github.com/owner/repo/pull/123" \
-  --input lens_skeptic_model="claude-opus-4.7-1m-internal"
+  --input lens_skeptic_model="claude-opus-5-1m-internal"
 ```
 
 ### Debug a single phase (sub-workflow only)

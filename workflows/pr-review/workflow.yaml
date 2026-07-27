@@ -198,7 +198,7 @@ workflow:
     lens_skeptic_model:
       type: string
       required: false
-      default: "claude-opus-4.7"
+      default: "claude-opus-5"
       description: "Model for the Skeptic lens."
 
     lens_completeness_model:
@@ -210,11 +210,11 @@ workflow:
     specialist_code_model:
       type: string
       required: false
-      default: "claude-opus-4.7"
+      default: "claude-opus-5"
     specialist_security_model:
       type: string
       required: false
-      default: "claude-opus-4.7"
+      default: "claude-opus-5"
       description: "Model for specialist_security (CVSS-style vulnerability review). Defaults to opus because security balancing of true-positives vs false-positives benefits from strong reasoning."
     specialist_tests_model:
       type: string
@@ -223,7 +223,7 @@ workflow:
     specialist_errors_model:
       type: string
       required: false
-      default: "claude-opus-4.7"
+      default: "claude-opus-5"
     specialist_types_model:
       type: string
       required: false

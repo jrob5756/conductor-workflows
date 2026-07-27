@@ -85,7 +85,7 @@ workflow:
     lens_skeptic_model:
       type: string
       required: false
-      default: "claude-opus-4.7"
+      default: "claude-opus-5"
     lens_completeness_model:
       type: string
       required: false
@@ -690,7 +690,7 @@ agents:
   # ───────────────────────────────────────────────────────────────────────────
   - name: arbitrator
     description: Evaluates lens-reviewer positions, identifies consensus, decides whether to continue or terminate deliberation
-    model: claude-opus-4.7
+    model: claude-opus-5
     reasoning:
       effort: high
     input:

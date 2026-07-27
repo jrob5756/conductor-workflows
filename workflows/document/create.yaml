@@ -85,7 +85,7 @@ workflow:
 agents:
   - name: author
     description: Researches the codebase and broader context, then authors a markdown document whose structure is inferred from the stated purpose
-    model: claude-opus-4.8
+    model: claude-opus-5
     context_tier: long_context
     reasoning:
       effort: max

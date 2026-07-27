@@ -605,7 +605,7 @@ agents:
 
   - name: plan_reviewer
     description: Reviews the entire implementation plan and all commits holistically
-    model: claude-opus-4.8
+    model: claude-opus-5
     context_tier: long_context
     reasoning:
       effort: max

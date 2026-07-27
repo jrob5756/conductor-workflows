@@ -91,7 +91,7 @@ workflow:
 agents:
   - name: editor
     description: Reads the existing document and applies updates according to the stated purpose, optionally addressing reviewer feedback on subsequent iterations
-    model: claude-opus-4.8
+    model: claude-opus-5
     context_tier: long_context
     reasoning:
       effort: max
