@@ -4,10 +4,12 @@ Guidance for AI coding agents working in this repository.
 
 ## Repository overview
 
-This is a sample workflow registry for [Conductor](https://github.com/microsoft/conductor). It contains:
+This is a sample workflow registry for [Conductor](https://github.com/microsoft/conductor), and a plugin marketplace. It contains:
 
 - `index.yaml` — registry index listing available workflows
 - `workflows/` — workflow definitions (YAML)
+- `.github/plugin/marketplace.json` — plugin marketplace registry
+- `plugins/` — plugins exposing workflows as skills
 - `README.md` — user-facing documentation
 
 ## Conventions
@@ -16,6 +18,14 @@ This is a sample workflow registry for [Conductor](https://github.com/microsoft/
 - Keep `README.md` in sync with `index.yaml` when adding, removing, or renaming workflows.
 - Use lowercase, hyphen-separated names for workflow ids (e.g., `sdd-design`).
 - Prefer YAML over JSON for workflow definitions.
+
+## Plugins and skills
+
+- Plugins live at `plugins/<plugin>/` with a `.github/plugin/plugin.json` manifest (Copilot convention) and are registered in `.github/plugin/marketplace.json`.
+- Skills live at `plugins/<plugin>/skills/<skill>/SKILL.md`. The `name` in the frontmatter **must** equal the parent directory name, or the skill silently fails to load. Names are kebab-case and must not contain `/`, `.`, or `:`.
+- The plugin/skill pair determines the invocation: `plugins/workflows/skills/fusion` is invoked as `/workflows:fusion`.
+- **Skills must not bundle copies of workflow YAML.** Resolve workflows through the Conductor registry (`conductor run <id>@<registry>`) so a skill and its workflow cannot drift apart.
+- A skill that wraps a workflow must never answer the user's request itself when the workflow fails — the orchestration is the point, so it reports the error and stops.
 
 ## Validating changes
 

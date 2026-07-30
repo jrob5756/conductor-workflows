@@ -1,109 +1,172 @@
+# Model Availability Probe
+#
+# Pings every Copilot model id in parallel with a trivial arithmetic question to
+# confirm the SDK actually accepts it end-to-end.
+#
+# `conductor doctor --models -p copilot` is the authoritative list of ids; this
+# workflow is the empirical check that each one really runs — an id can be
+# advertised and still fail at session.create.
+#
+# Keep the model list below in sync with `conductor doctor --models -p copilot`.
+#
+# Known result as of the last run: 21/22 pass. `gpt-5.6-luna` consistently
+# returns a dict where a string was declared, which is a structured-output
+# quirk of that model rather than an availability problem.
+#
+# The probe deliberately asks a real question and requests a full sentence,
+# rather than demanding a magic token. Two failure modes motivated this:
+# instruction-following models can read "reply with exactly the word OK" as a
+# compliance test and refuse outright, and a bare "4" sometimes gets extracted
+# as a dict or dropped entirely. Both surface as false negatives that look like
+# the model is unavailable when it is not.
+#
+# Usage:
+#   conductor run workflows/model-test/workflow.yaml
+
 workflow:
   name: model-test
-  description: Pings every candidate Copilot model in parallel with a trivial prompt to see which IDs the SDK accepts.
+  description: Pings every candidate Copilot model in parallel with a trivial prompt to see which ids the SDK accepts.
   entry_point: probe_all
-  version: 0.1.0
+  version: 0.2.0
   runtime:
     provider: copilot
-    timeout: 30
-    max_session_seconds: 30
+    timeout: 60
+    max_session_seconds: 60
   limits:
     max_iterations: 50
-    timeout_seconds: 180
+    timeout_seconds: 300
 
 agents:
-  - name: probe_claude_opus_47
-    model: claude-opus-4.7
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+  - name: probe_auto
+    model: auto
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_claude_opus_47_1m
-    model: claude-opus-4.7-1m-internal
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+  - name: probe_claude_opus_5
+    model: claude-opus-5
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_claude_opus_47_high
-    model: claude-opus-4.7-high
-    reasoning:
-      effort: high
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
-    output:
-      reply: { type: string }
-
-  - name: probe_claude_opus_47_xhigh
-    model: claude-opus-4.7-xhigh
-    reasoning:
-      effort: xhigh
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
-    output:
-      reply: { type: string }
-
-  - name: probe_claude_opus_46
-    model: claude-opus-4.6
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
-    output:
-      reply: { type: string }
-
-  - name: probe_claude_opus_46_1m
-    model: claude-opus-4.6-1m
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
-    output:
-      reply: { type: string }
-
-  - name: probe_claude_sonnet_46
+  - name: probe_claude_sonnet_5
     model: claude-sonnet-5
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_claude_haiku_45
+  - name: probe_claude_opus_4_8
+    model: claude-opus-4.8
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_claude_opus_4_7
+    model: claude-opus-4.7
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_claude_opus_4_6
+    model: claude-opus-4.6
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_claude_sonnet_4_6
+    model: claude-sonnet-4.6
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_claude_sonnet_4_5
+    model: claude-sonnet-4.5
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_claude_haiku_4_5
     model: claude-haiku-4.5
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_gpt_55
+  - name: probe_gpt_5_6_sol
+    model: gpt-5.6-sol
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_gpt_5_6_terra
+    model: gpt-5.6-terra
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_gpt_5_6_luna
+    model: gpt-5.6-luna
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_gpt_5_5
     model: gpt-5.5
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_gpt_54
+  - name: probe_gpt_5_4
     model: gpt-5.4
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_gpt_53_codex
+  - name: probe_gpt_5_3_codex
     model: gpt-5.3-codex
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_gpt_54_mini
+  - name: probe_gpt_5_4_mini
     model: gpt-5.4-mini
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
-
-  - name: probe_gpt_41
-    model: gpt-4.1
-    system_prompt: "Reply with exactly the word: OK"
-    prompt: "Say OK."
+  - name: probe_gpt_5_mini
+    model: gpt-5-mini
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_gemini_3_1_pro_preview
+    model: gemini-3.1-pro-preview
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_gemini_3_5_flash
+    model: gemini-3.5-flash
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_gemini_3_6_flash
+    model: gemini-3.6-flash
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_grok_4_5
+    model: grok-4.5
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
+    output:
+      reply: { type: string }
+  - name: probe_mai_code_1_flash_picker
+    model: mai-code-1-flash-picker
+    system_prompt: "You are a connectivity probe. Answer in as few words as possible."
+    prompt: "What is 2 + 2? Answer in one short sentence."
     output:
       reply: { type: string }
 
@@ -112,38 +175,56 @@ parallel:
     description: Probe all candidate models concurrently; record per-model success/failure.
     failure_mode: continue_on_error
     agents:
-      - probe_claude_opus_47
-      - probe_claude_opus_47_1m
-      - probe_claude_opus_47_high
-      - probe_claude_opus_47_xhigh
-      - probe_claude_opus_46
-      - probe_claude_opus_46_1m
-      - probe_claude_sonnet_46
-      - probe_claude_haiku_45
-      - probe_gpt_55
-      - probe_gpt_54
-      - probe_gpt_53_codex
-      - probe_gpt_54_mini
-      - probe_gpt_41
+      - probe_auto
+      - probe_claude_opus_5
+      - probe_claude_sonnet_5
+      - probe_claude_opus_4_8
+      - probe_claude_opus_4_7
+      - probe_claude_opus_4_6
+      - probe_claude_sonnet_4_6
+      - probe_claude_sonnet_4_5
+      - probe_claude_haiku_4_5
+      - probe_gpt_5_6_sol
+      - probe_gpt_5_6_terra
+      - probe_gpt_5_6_luna
+      - probe_gpt_5_5
+      - probe_gpt_5_4
+      - probe_gpt_5_3_codex
+      - probe_gpt_5_4_mini
+      - probe_gpt_5_mini
+      - probe_gemini_3_1_pro_preview
+      - probe_gemini_3_5_flash
+      - probe_gemini_3_6_flash
+      - probe_grok_4_5
+      - probe_mai_code_1_flash_picker
     routes:
       - to: $end
 
 output:
   results: |
     {% set probes = [
-      'probe_claude_opus_47',
-      'probe_claude_opus_47_1m',
-      'probe_claude_opus_47_high',
-      'probe_claude_opus_47_xhigh',
-      'probe_claude_opus_46',
-      'probe_claude_opus_46_1m',
-      'probe_claude_sonnet_46',
-      'probe_claude_haiku_45',
-      'probe_gpt_55',
-      'probe_gpt_54',
-      'probe_gpt_53_codex',
-      'probe_gpt_54_mini',
-      'probe_gpt_41'
+      'probe_auto',
+      'probe_claude_opus_5',
+      'probe_claude_sonnet_5',
+      'probe_claude_opus_4_8',
+      'probe_claude_opus_4_7',
+      'probe_claude_opus_4_6',
+      'probe_claude_sonnet_4_6',
+      'probe_claude_sonnet_4_5',
+      'probe_claude_haiku_4_5',
+      'probe_gpt_5_6_sol',
+      'probe_gpt_5_6_terra',
+      'probe_gpt_5_6_luna',
+      'probe_gpt_5_5',
+      'probe_gpt_5_4',
+      'probe_gpt_5_3_codex',
+      'probe_gpt_5_4_mini',
+      'probe_gpt_5_mini',
+      'probe_gemini_3_1_pro_preview',
+      'probe_gemini_3_5_flash',
+      'probe_gemini_3_6_flash',
+      'probe_grok_4_5',
+      'probe_mai_code_1_flash_picker'
     ] %}
     {% for name in probes -%}
     {% if name in probe_all.outputs -%}

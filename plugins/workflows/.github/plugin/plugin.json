@@ -1,0 +1,18 @@
+{
+  "name": "workflows",
+  "description": "Invoke Conductor workflows from the conductor-workflows registry as skills. Ships the fusion skill, which runs multi-model deliberation: a panel of models from different labs answers a question in parallel, an analyst compares their answers, and a synthesiser writes the final answer.",
+  "version": "0.1.0",
+  "author": {
+    "name": "jrob5756"
+  },
+  "homepage": "https://github.com/jrob5756/conductor-workflows",
+  "repository": "https://github.com/jrob5756/conductor-workflows",
+  "license": "MIT",
+  "keywords": [
+    "conductor",
+    "workflow",
+    "multi-agent",
+    "deliberation",
+    "fusion"
+  ]
+}

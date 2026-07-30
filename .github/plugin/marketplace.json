@@ -1,0 +1,35 @@
+{
+  "name": "conductor-workflows",
+  "owner": {
+    "name": "jrob5756"
+  },
+  "metadata": {
+    "description": "Plugin marketplace for the conductor-workflows registry — skills that invoke Conductor multi-agent workflows",
+    "version": "0.1.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "workflows",
+      "source": "./workflows",
+      "description": "Invoke Conductor workflows from this registry as skills. Ships the fusion skill for multi-model deliberation.",
+      "version": "0.1.0",
+      "author": {
+        "name": "jrob5756"
+      },
+      "homepage": "https://github.com/jrob5756/conductor-workflows",
+      "repository": "https://github.com/jrob5756/conductor-workflows",
+      "license": "MIT",
+      "keywords": [
+        "conductor",
+        "workflow",
+        "multi-agent",
+        "deliberation",
+        "fusion"
+      ],
+      "skills": [
+        "./skills/fusion"
+      ]
+    }
+  ]
+}

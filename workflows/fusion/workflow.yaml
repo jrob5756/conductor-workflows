@@ -1,0 +1,837 @@
+# Fusion Deliberate Sub-workflow
+#
+# Multi-model deliberation as a reusable primitive, modelled on OpenRouter's
+# Fusion Router (https://openrouter.ai/docs/guides/routing/routers/fusion-router).
+#
+# A panel of models answers the question in parallel, an analyst COMPARES their
+# answers (it deliberately does not merge them) and emits structured analysis,
+# and a synthesiser writes the final answer from that analysis.
+#
+#   resolve_config (set)   preset → panel[{model, role}], effective mode
+#     ↓
+#   gate (cheap LLM)       is this question worth deliberating over?
+#     ├─ no  → direct_answer → $end        (single strong model, fast path)
+#     └─ yes ↓
+#   panel (for_each)       N models answer independently, in parallel, with
+#                          web search. key_by model → named attribution.
+#     ↓
+#   panel_check (set)      guard: if every panelist failed, fall back to
+#                          direct_answer rather than analysing nothing
+#     ↓
+#   analyst                consensus / contradictions / coverage_gaps /
+#                          unique_insights / blind_spots  (structured)
+#     ↓
+#   round_check (set)      max_rounds > 1 and blind spots found?
+#     ├─ yes → gap_panel → analyst_merge ↓   targeted second pass
+#     └─ no  ─────────────────────────────↓
+#   synthesizer            final answer grounded in the analysis
+#     ↓ $end
+#
+# Design notes:
+#
+#   * The second round is a SEPARATE group (gap_panel), not a loop-back into
+#     `panel`. A loop-back would need a round counter, but `set` steps render
+#     against pre-step context, so self-incrementing is fragile and risks
+#     tripping max_iterations. A distinct group is bounded by construction.
+#
+#   * The panel agent deliberately sets NO `reasoning.effort`. Panel models are
+#     dynamic, and some (grok-4.5, gemini-3.6-flash) advertise no reasoning
+#     support — the Copilot provider raises ValidationError on unsupported
+#     model/effort pairs, which would break any panel containing them.
+#
+#   * `key_by: model` is deliberately NOT `key_by: panelist.model` — the path is
+#     relative to the loop item, not prefixed with the loop variable. Prefixing
+#     it silently falls back to integer keys ("Panelist 0/1/2"), which strips
+#     model attribution out of the analyst's view without raising any error.
+#
+#   * The analyst cannot be pinned to temperature 0 the way Fusion pins it.
+#     Conductor has no per-agent temperature (it is runtime-wide only), and the
+#     Copilot provider discards `runtime.temperature` outright — it logs
+#     "Copilot SDK does not support 'temperature' as a session parameter" and
+#     ignores the value. Analyst determinism therefore rests entirely on its
+#     system prompt and its strict output schema. Do not add a temperature here
+#     expecting it to do anything.
+#
+# Self-contained: run it directly, or embed it in any other workflow as a
+# `type: workflow` step (see "As a sub-workflow" in README.md).
+#
+# Usage:
+#   conductor run workflows/fusion/workflow.yaml \
+#     --input question="What are the strongest arguments for and against carbon taxes?"
+#
+#   Force deliberation and use the cheap panel:
+#   conductor run workflows/fusion/workflow.yaml \
+#     --input question="Compare ridge, lasso and elastic-net regression." \
+#     --input mode=always \
+#     --input preset=fast
+#
+#   Bring your own panel, and chase blind spots with a second round:
+#   conductor run workflows/fusion/workflow.yaml \
+#     --input question="Is event sourcing worth it for a 5-person team?" \
+#     --input panel='["claude-opus-5", "gpt-5.6-sol", "grok-4.5"]' \
+#     --input max_rounds=2
+#
+# Requires:
+#   - Node.js 18+ (used by the open-websearch MCP server)
+
+workflow:
+  name: fusion
+  description: Multi-model deliberation — a panel of models from different labs answers in parallel, an analyst compares (never merges) their answers into structured analysis, and a synthesiser writes the final answer
+  version: "1.0.0"
+  entry_point: resolve_config
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-5
+    max_session_seconds: 900
+    mcp_servers:
+      web-search:
+        command: npx
+        args: ["-y", "open-websearch@latest"]
+        env:
+          MODE: stdio
+          DEFAULT_SEARCH_ENGINE: duckduckgo
+          ALLOWED_SEARCH_ENGINES: duckduckgo,brave,exa
+        tools: ["search"]
+
+  input:
+    question:
+      type: string
+      required: true
+      description: "The question or task to deliberate over."
+
+    context:
+      type: string
+      required: false
+      default: ""
+      description: "Optional background material (source excerpts, prior findings, constraints) given verbatim to every panelist."
+
+    preset:
+      type: string
+      required: false
+      default: "quality"
+      description: "Panel preset. Governs the panel AND the analyst/synthesiser: quality (claude-opus-5 + gpt-5.6-sol + gemini-3.1-pro-preview, opus-5 analyst), balanced (claude-sonnet-5 + gpt-5.6-terra + gemini-3.1-pro-preview, sonnet-5 analyst), fast (claude-haiku-4.5 + gpt-5.6-luna + gemini-3.5-flash, sonnet-5 analyst), max (4 labs incl. grok-4.5, opus-5 analyst). The `panel` input overrides the panel only; `analyst_model` / `synthesizer_model` override those."
+
+    panel:
+      type: array
+      required: false
+      default: []
+      description: "Explicit panel as an array of model ids, e.g. [\"gpt-5.6-sol\", \"grok-4.5\"]. Overrides `preset`. 1-8 models."
+
+    mode:
+      type: string
+      required: false
+      default: "auto"
+      description: "auto = a cheap gate model decides whether deliberation is warranted; always = always deliberate (Fusion's tool_choice:required); never = always answer directly."
+
+    max_rounds:
+      type: number
+      required: false
+      default: 1
+      description: "1 = single deliberation pass (Fusion-faithful). 2 = run one extra targeted panel pass over the blind spots the analyst identified."
+
+    gate_model:
+      type: string
+      required: false
+      default: "gpt-5.6-luna"
+      description: "Model that decides whether a question warrants deliberation. Runs once and returns a single boolean plus a one-line reason, so it is a small fraction of total cost regardless of model."
+
+    analyst_model:
+      type: string
+      required: false
+      default: ""
+      description: "Model that compares panel answers into structured analysis. Empty = take the preset's analyst (claude-opus-5 for quality/max, claude-sonnet-5 for balanced/fast). The linchpin of the pipeline, deliberately never downgraded below claude-sonnet-5. Must support `high` reasoning effort — models advertising no reasoning support (claude-haiku-4.5, grok-4.5, gemini-3.6-flash) will fail at run time."
+
+    synthesizer_model:
+      type: string
+      required: false
+      default: ""
+      description: "Model that writes the final answer from the analysis, and that serves the direct-answer fast path. Empty = take the preset's synthesiser (claude-opus-5 for quality/max, claude-sonnet-5 for balanced/fast)."
+
+  context:
+    mode: explicit
+
+  limits:
+    # ~9 nominal steps, but for-each members count individually. Padded so a
+    # max-preset panel across two rounds cannot exhaust the budget.
+    max_iterations: 40
+    timeout_seconds: 3600
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PANEL GROUPS
+# ─────────────────────────────────────────────────────────────────────────────
+for_each:
+  # Round 1 — every panelist answers the question independently. They cannot
+  # see each other's answers (for-each members get an isolated context
+  # snapshot), which is what makes the analyst's agreement signal meaningful.
+  - name: panel
+    type: for_each
+    description: Panel models answer the question independently and in parallel
+    source: resolve_config.output.panel
+    as: panelist
+    key_by: model
+    max_concurrent: 8
+    failure_mode: continue_on_error
+
+    agent:
+      name: panelist_agent
+      model: "{{ panelist.model }}"
+      input:
+        - workflow.input.question
+        - workflow.input.context
+      # No `reasoning:` block here — see the design notes in the header.
+      system_prompt: |
+        You are one member of an independent expert panel. You are answering
+        alone: you cannot see the other panelists, and you must not speculate
+        about what they might say or address them.
+
+        Answer the question directly and substantively, on the merits. State
+        your reasoning and your genuine position, including where you are
+        uncertain and why. Do not hedge to sound balanced — a panel is only
+        useful if its members commit to real positions that can be compared.
+
+        If the question depends on current facts, use the search tool and cite
+        what you find. If you do not know something, say so plainly rather
+        than guessing.
+      prompt: |
+        {% if panelist.role %}
+        Answer from this perspective: {{ panelist.role }}
+        {% endif %}
+        {% if workflow.input.context %}
+        ## Background
+
+        {{ workflow.input.context }}
+        {% endif %}
+
+        ## Question
+
+        {{ workflow.input.question }}
+
+        Give your complete answer, then a short `confidence` note describing how
+        certain you are and what would change your mind.
+      output:
+        answer:
+          type: string
+          description: The panelist's full substantive answer.
+        key_points:
+          type: array
+          description: The load-bearing claims of the answer, one per item, each self-contained.
+          items:
+            type: string
+        confidence:
+          type: string
+          description: How certain the panelist is, and what would change their mind.
+
+    routes:
+      - to: panel_check
+
+  # Round 2 (optional) — same panel, but aimed squarely at what round 1 missed.
+  # Only reached when max_rounds > 1 and the analyst actually found blind spots.
+  - name: gap_panel
+    type: for_each
+    description: Second targeted panel pass over the blind spots the analyst identified
+    source: resolve_config.output.panel
+    as: panelist
+    key_by: model
+    max_concurrent: 8
+    failure_mode: continue_on_error
+
+    agent:
+      name: gap_panelist_agent
+      model: "{{ panelist.model }}"
+      input:
+        - workflow.input.question
+        - workflow.input.context
+        - analyst.output.blind_spots
+      system_prompt: |
+        You are one member of an independent expert panel, in a second round.
+        A first round has already been analysed, and specific gaps were found —
+        things no panelist addressed.
+
+        Your job is narrow: address those gaps directly. Do not restate the
+        general answer and do not repeat what the first round already covered.
+        If you believe a listed gap is not actually important, say so and
+        explain why — that is a legitimate finding.
+      prompt: |
+        {% if workflow.input.context %}
+        ## Background
+
+        {{ workflow.input.context }}
+        {% endif %}
+
+        ## Original question
+
+        {{ workflow.input.question }}
+
+        ## Gaps the first round missed
+
+        {% for gap in analyst.output.blind_spots %}
+        - {{ gap }}
+        {% endfor %}
+
+        Address each gap above, in order.
+      output:
+        answer:
+          type: string
+          description: This panelist's treatment of the identified gaps.
+        key_points:
+          type: array
+          description: The load-bearing claims about the gaps, one per item.
+          items:
+            type: string
+
+    routes:
+      - to: analyst_merge
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENTS
+# ─────────────────────────────────────────────────────────────────────────────
+agents:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # RESOLVE_CONFIG — Pure context step. Turns `preset` / `panel` into the
+  # concrete panel array, and resolves which analyst/synthesiser the preset
+  # implies. Uses `values:` (not `value:`) because a for-each `source` must be
+  # a 3-part dotted path: resolve_config.output.panel.
+  #
+  # A preset governs all three stages, not just the panel. Measured on an
+  # identical question: the panel is only 13-53% of wall time, so a preset that
+  # changed the panel alone left `fast` barely faster than `balanced`. The
+  # analyst and synthesiser are the dominant cost.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: resolve_config
+    description: Resolves the panel preset (or explicit override) into a concrete panel, analyst and synthesiser, and normalises the deliberation mode
+    type: set
+    input:
+      - workflow.input.panel
+      - workflow.input.preset
+      - workflow.input.mode
+      - workflow.input.analyst_model
+      - workflow.input.synthesizer_model
+    values:
+      panel: >-
+        {%- if workflow.input.panel and (workflow.input.panel | length) > 0 -%}
+        [{% for m in workflow.input.panel %}{"model": "{{ m }}", "role": ""}{% if not loop.last %}, {% endif %}{% endfor %}]
+        {%- elif workflow.input.preset == 'fast' -%}
+        [{"model": "claude-haiku-4.5", "role": ""}, {"model": "gpt-5.6-luna", "role": ""}, {"model": "gemini-3.5-flash", "role": ""}]
+        {%- elif workflow.input.preset == 'balanced' -%}
+        [{"model": "claude-sonnet-5", "role": ""}, {"model": "gpt-5.6-terra", "role": ""}, {"model": "gemini-3.1-pro-preview", "role": ""}]
+        {%- elif workflow.input.preset == 'max' -%}
+        [{"model": "claude-opus-5", "role": ""}, {"model": "gpt-5.6-sol", "role": ""}, {"model": "gemini-3.1-pro-preview", "role": ""}, {"model": "grok-4.5", "role": ""}, {"model": "claude-sonnet-5", "role": ""}]
+        {%- else -%}
+        [{"model": "claude-opus-5", "role": ""}, {"model": "gpt-5.6-sol", "role": ""}, {"model": "gemini-3.1-pro-preview", "role": ""}]
+        {%- endif -%}
+      # Explicit input wins; empty means "take the preset's". claude-sonnet-5 is
+      # the deliberate floor for the analyst — it is the only stage that produces
+      # blind_spots, and unlike a weak panelist it has no backstop. It must also
+      # support `high` reasoning effort, which rules out claude-haiku-4.5,
+      # grok-4.5 and gemini-3.6-flash (they advertise no reasoning support and
+      # the Copilot provider rejects the pair at run time).
+      analyst_model: >-
+        {%- if workflow.input.analyst_model -%}
+        {{ workflow.input.analyst_model }}
+        {%- elif workflow.input.preset in ['fast', 'balanced'] -%}
+        claude-sonnet-5
+        {%- else -%}
+        claude-opus-5
+        {%- endif -%}
+      synthesizer_model: >-
+        {%- if workflow.input.synthesizer_model -%}
+        {{ workflow.input.synthesizer_model }}
+        {%- elif workflow.input.preset in ['fast', 'balanced'] -%}
+        claude-sonnet-5
+        {%- else -%}
+        claude-opus-5
+        {%- endif -%}
+      effective_mode: "{{ workflow.input.mode if workflow.input.mode in ['auto', 'always', 'never'] else 'auto' }}"
+    routes:
+      # Skip the gate call entirely when the caller has already decided.
+      - to: panel
+        when: "{{ output.effective_mode == 'always' }}"
+      - to: direct_answer
+        when: "{{ output.effective_mode == 'never' }}"
+      - to: gate
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # GATE — Fusion's "the model decides whether to call fusion". One cheap call
+  # judges whether multi-model deliberation would actually change the answer.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: gate
+    description: Triage deciding whether the question warrants full multi-model deliberation
+    model: "{{ workflow.input.gate_model }}"
+    tools: []
+    input:
+      - workflow.input.question
+      - workflow.input.context
+      - workflow.input.gate_model
+    system_prompt: |
+      You decide whether a question is worth convening a panel of expensive
+      models over. Deliberation costs roughly 4-5x a single answer, so it must
+      earn its keep.
+
+      Deliberation IS warranted when the question is contested, open-ended, or
+      high-stakes; when it asks for comparison, critique, tradeoffs, or a
+      survey of positions; when being wrong is expensive; or when a single
+      model is likely to produce a confident but incomplete answer.
+
+      Deliberation is NOT warranted for simple factual lookups, definitions,
+      arithmetic, formatting or translation tasks, mechanical code edits, or
+      anything with one uncontested correct answer.
+
+      Judge the question on its merits. Do not treat mere length or the
+      presence of technical jargon as evidence of difficulty.
+    prompt: |
+      {% if workflow.input.context %}
+      ## Background
+
+      {{ workflow.input.context }}
+      {% endif %}
+
+      ## Question
+
+      {{ workflow.input.question }}
+
+      Decide whether this warrants a multi-model panel.
+    output:
+      needs_deliberation:
+        type: boolean
+        description: True if a multi-model panel would meaningfully improve the answer.
+      reason:
+        type: string
+        description: One sentence justifying the decision.
+    routes:
+      - to: panel
+        when: "{{ output.needs_deliberation }}"
+      - to: direct_answer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # DIRECT_ANSWER — Fast path. Also the safety net when every panelist fails.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: direct_answer
+    description: Single-model answer used when deliberation is not warranted, is disabled, or the panel failed entirely
+    model: "{{ resolve_config.output.synthesizer_model }}"
+    input:
+      - workflow.input.question
+      - workflow.input.context
+      - resolve_config.output.synthesizer_model
+    system_prompt: |
+      Answer the question directly, accurately and completely. Use the search
+      tool when the answer depends on current facts. Be explicit about
+      uncertainty rather than papering over it.
+    prompt: |
+      {% if workflow.input.context %}
+      ## Background
+
+      {{ workflow.input.context }}
+      {% endif %}
+
+      ## Question
+
+      {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+        description: The complete answer.
+    routes:
+      - to: $end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # PANEL_CHECK — `continue_on_error` keeps one dead model from killing the
+  # run, but if EVERY panelist failed the analyst would confidently analyse
+  # nothing. Fall back to a direct answer instead.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: panel_check
+    description: Verifies at least one panelist succeeded before handing off to the analyst
+    type: set
+    input:
+      - panel.outputs
+    values:
+      any_success: "{{ (panel.outputs | length) > 0 }}"
+    routes:
+      - to: analyst
+        when: "{{ output.any_success }}"
+      - to: direct_answer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ANALYST — The heart of Fusion. It COMPARES; it must never merge. Merging
+  # is the synthesiser's job, and conflating the two destroys the signal that
+  # makes the pipeline worth its cost.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: analyst
+    description: Compares panel answers into structured analysis — consensus, contradictions, coverage gaps, unique insights, and blind spots
+    model: "{{ resolve_config.output.analyst_model }}"
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.question
+      - resolve_config.output.analyst_model
+      - panel.outputs
+    system_prompt: |
+      You are the analyst for a panel of independent expert models.
+
+      Your job is to COMPARE the panel's answers. You are explicitly NOT
+      writing an answer to the question, and you are NOT merging the responses
+      into a combined one. Someone else does that, using your analysis. If you
+      merge, you destroy the very signal you were convened to produce.
+
+      Apply these rules:
+
+      * Consensus means genuine agreement on substance, reached independently.
+        Panelists could not see each other, so independent agreement is real
+        evidence. Do not count agreement that is merely everyone restating the
+        premise of the question.
+      * Contradictions are direct conflicts on substance. Record what each side
+        actually claims and attribute each position to the models holding it.
+        Do not resolve the conflict — surface it.
+      * Coverage gaps are points raised by some panelists but ignored by
+        others. Attribute them by model.
+      * Unique insights are points exactly one panelist raised that are
+        genuinely valuable. Attribute by model. Being unique is not enough; it
+        must be worth acting on.
+      * Blind spots are things NO panelist addressed but that a complete answer
+        needs. This is the hardest and most valuable section — reason about
+        what the question demands, then about what is absent. An empty list is
+        a legitimate answer, but only after you have actually looked.
+
+      Attribute every claim to the model that made it, by name. Never invent a
+      position no panelist took.
+    prompt: |
+      ## Original question
+
+      {{ workflow.input.question }}
+
+      ## Panel answers
+
+      {% for model_id, response in panel.outputs.items() %}
+      ### Panelist: {{ model_id }}
+
+      {{ response.answer }}
+
+      Key points:
+      {% for point in response.key_points %}
+      - {{ point }}
+      {% endfor %}
+
+      Stated confidence: {{ response.confidence }}
+
+      ---
+      {% endfor %}
+
+      {{ panel.outputs | length }} panelist(s) responded. Compare them.
+    output:
+      consensus:
+        type: array
+        description: Substantive points the panel independently agreed on. Treat these as higher-confidence.
+        items:
+          type: string
+      contradictions:
+        type: array
+        description: Direct substantive conflicts between panelists, left unresolved.
+        items:
+          type: object
+          properties:
+            topic:
+              type: string
+              description: What the disagreement is about.
+            positions:
+              type: string
+              description: Each conflicting position, attributed to the models holding it.
+      coverage_gaps:
+        type: array
+        description: Points some panelists raised and others ignored.
+        items:
+          type: object
+          properties:
+            point:
+              type: string
+              description: The point in question.
+            covered_by:
+              type: string
+              description: Which models addressed it, and which did not.
+      unique_insights:
+        type: array
+        description: Valuable points raised by exactly one panelist.
+        items:
+          type: object
+          properties:
+            model:
+              type: string
+              description: The model that raised it.
+            insight:
+              type: string
+              description: The insight itself.
+      blind_spots:
+        type: array
+        description: Things no panelist addressed that a complete answer requires. May be empty.
+        items:
+          type: string
+      confidence_notes:
+        type: string
+        description: Where the panel is collectively strong and where it is weak or unreliable.
+    routes:
+      - to: round_check
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ROUND_CHECK — Gate the optional second pass. Only worth running when the
+  # caller opted in AND the analyst actually found gaps to chase.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: round_check
+    description: Decides whether to run the optional targeted second panel round over identified blind spots
+    type: set
+    input:
+      - workflow.input.max_rounds
+      - analyst.output.blind_spots
+    values:
+      do_gap_round: "{{ (workflow.input.max_rounds | int) > 1 and (analyst.output.blind_spots | length) > 0 }}"
+    routes:
+      - to: gap_panel
+        when: "{{ output.do_gap_round }}"
+      - to: synthesizer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ANALYST_MERGE — Folds round-2 findings into the round-1 analysis, so the
+  # synthesiser always reads a single coherent analysis object.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: analyst_merge
+    description: Folds the second-round gap findings back into the analysis
+    model: "{{ resolve_config.output.analyst_model }}"
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.question
+      - resolve_config.output.analyst_model
+      - analyst.output
+      - gap_panel.outputs
+    system_prompt: |
+      You are the analyst, updating your own analysis after a targeted second
+      panel round that addressed the blind spots you identified.
+
+      Produce the SAME structure as before, now incorporating round 2. Rules:
+
+      * Keep every round-1 finding that still holds.
+      * A blind spot that round 2 adequately addressed moves out of
+        `blind_spots` and into `consensus` (if round-2 panelists agreed) or
+        `contradictions` (if they disagreed).
+      * A blind spot round 2 failed to resolve stays in `blind_spots`.
+      * New disagreements from round 2 become contradictions.
+
+      You are still comparing, not answering, and still attributing by model.
+    prompt: |
+      ## Original question
+
+      {{ workflow.input.question }}
+
+      ## Your round-1 analysis
+
+      Consensus:
+      {% for item in analyst.output.consensus %}
+      - {{ item }}
+      {% endfor %}
+
+      Contradictions:
+      {% for item in analyst.output.contradictions %}
+      - {{ item.topic }}: {{ item.positions }}
+      {% endfor %}
+
+      Coverage gaps:
+      {% for item in analyst.output.coverage_gaps %}
+      - {{ item.point }} ({{ item.covered_by }})
+      {% endfor %}
+
+      Unique insights:
+      {% for item in analyst.output.unique_insights %}
+      - [{{ item.model }}] {{ item.insight }}
+      {% endfor %}
+
+      Blind spots you flagged:
+      {% for item in analyst.output.blind_spots %}
+      - {{ item }}
+      {% endfor %}
+
+      ## Round-2 responses to those blind spots
+
+      {% for model_id, response in gap_panel.outputs.items() %}
+      ### Panelist: {{ model_id }}
+
+      {{ response.answer }}
+
+      Key points:
+      {% for point in response.key_points %}
+      - {{ point }}
+      {% endfor %}
+
+      ---
+      {% endfor %}
+
+      Produce the updated analysis.
+    output:
+      consensus:
+        type: array
+        description: Updated consensus, including blind spots round 2 resolved by agreement.
+        items:
+          type: string
+      contradictions:
+        type: array
+        description: Updated contradictions, including new round-2 disagreements.
+        items:
+          type: object
+          properties:
+            topic:
+              type: string
+              description: What the disagreement is about.
+            positions:
+              type: string
+              description: Each conflicting position, attributed by model.
+      coverage_gaps:
+        type: array
+        description: Updated coverage gaps.
+        items:
+          type: object
+          properties:
+            point:
+              type: string
+              description: The point in question.
+            covered_by:
+              type: string
+              description: Which models addressed it, and which did not.
+      unique_insights:
+        type: array
+        description: Updated unique insights across both rounds.
+        items:
+          type: object
+          properties:
+            model:
+              type: string
+              description: The model that raised it.
+            insight:
+              type: string
+              description: The insight itself.
+      blind_spots:
+        type: array
+        description: Blind spots that remain unresolved after round 2.
+        items:
+          type: string
+      confidence_notes:
+        type: string
+        description: Collective strengths and weaknesses after both rounds.
+    routes:
+      - to: synthesizer
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SYNTHESIZER — Fusion's outer model. Receives the ANALYSIS, not the raw
+  # panel transcripts: that is both cheaper and truer to Fusion's design.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: synthesizer
+    description: Writes the final answer grounded in the analyst's structured comparison
+    model: "{{ resolve_config.output.synthesizer_model }}"
+    input:
+      - workflow.input.question
+      - workflow.input.context
+      - resolve_config.output.synthesizer_model
+      - analyst.output
+      - analyst_merge.output?
+    system_prompt: |
+      You write the final answer, informed by an analyst's structured
+      comparison of an independent expert panel.
+
+      Use the analysis as evidence, not as an outline:
+
+      * Consensus was reached independently, so treat it as your most reliable
+        material and state it with confidence.
+      * Contradictions must not be silently flattened. Where experts genuinely
+        disagree, say so and explain the disagreement — that IS the honest
+        answer.
+      * Fold unique insights in where they matter; a point only one model saw
+        is often the most valuable thing on the page.
+      * Name any blind spots that remain unresolved, as explicit limitations.
+
+      Write a direct, well-organised answer to the original question. Do not
+      describe the deliberation process, do not mention "the panel", "the
+      analyst", or model names, and do not narrate your own structure. The
+      reader wants the answer, not an account of how it was produced.
+    prompt: |
+      {% if workflow.input.context %}
+      ## Background
+
+      {{ workflow.input.context }}
+      {% endif %}
+
+      ## Question
+
+      {{ workflow.input.question }}
+
+      {% if analyst_merge is defined and analyst_merge.output %}
+      {% set analysis = analyst_merge.output %}
+      {% else %}
+      {% set analysis = analyst.output %}
+      {% endif %}
+
+      ## Panel analysis
+
+      High-confidence consensus:
+      {% for item in analysis.consensus %}
+      - {{ item }}
+      {% endfor %}
+
+      Genuine disagreements:
+      {% for item in analysis.contradictions %}
+      - {{ item.topic }}: {{ item.positions }}
+      {% endfor %}
+
+      Partial coverage:
+      {% for item in analysis.coverage_gaps %}
+      - {{ item.point }} ({{ item.covered_by }})
+      {% endfor %}
+
+      Unique insights:
+      {% for item in analysis.unique_insights %}
+      - {{ item.insight }}
+      {% endfor %}
+
+      Unresolved blind spots:
+      {% for item in analysis.blind_spots %}
+      - {{ item }}
+      {% endfor %}
+
+      Reliability notes: {{ analysis.confidence_notes }}
+
+      Write the final answer.
+    output:
+      answer:
+        type: string
+        description: The final answer to the original question.
+    routes:
+      - to: $end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUT — Shaped identically on every path (direct, single-round, two-round)
+# so callers embedding this as a sub-workflow get a stable contract.
+# ─────────────────────────────────────────────────────────────────────────────
+output:
+  answer: >-
+    {%- if synthesizer is defined and synthesizer.output -%}
+    {{ synthesizer.output.answer }}
+    {%- elif direct_answer is defined and direct_answer.output -%}
+    {{ direct_answer.output.answer }}
+    {%- endif -%}
+
+  deliberated: >-
+    {%- if synthesizer is defined and synthesizer.output -%}true{%- else -%}false{%- endif -%}
+
+  panel_models: >-
+    {%- if panel is defined and panel.outputs -%}
+    {{ panel.outputs.keys() | list | join(', ') }}
+    {%- endif -%}
+
+  rounds_run: >-
+    {%- if analyst_merge is defined and analyst_merge.output -%}2
+    {%- elif analyst is defined and analyst.output -%}1
+    {%- else -%}0
+    {%- endif -%}
+
+  analysis: >-
+    {%- if analyst_merge is defined and analyst_merge.output -%}
+    {{ analyst_merge.output | tojson }}
+    {%- elif analyst is defined and analyst.output -%}
+    {{ analyst.output | tojson }}
+    {%- endif -%}
