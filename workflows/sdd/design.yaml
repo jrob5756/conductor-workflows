@@ -8,7 +8,10 @@
 #
 # The design is reviewed by the `document-review` sub-workflow, which scores
 # it on technical accuracy and readability. If either score is below the
-# threshold (90), the workflow loops back to the architect for revision.
+# threshold (90), a cheaper fixer agent applies targeted revisions and sends
+# the document back for re-review. When the feedback invalidates the core
+# design rather than calling for surgical edits, the fixer escalates back to
+# the architect, which is the only agent that re-derives the design.
 #
 # Usage:
 #   conductor run workflows/sdd/design.yaml --input purpose="Build a user authentication system with OAuth2"
@@ -22,7 +25,16 @@
 # Flow:
 #   architect → document_review (sub-workflow)
 #     → $end                  (when both reviews are approved)
-#     → architect             (when either review is not approved)
+#     → fixer                 (when either review is not approved)
+#   fixer
+#     → review_escalation     (when the revision-round cap is reached)
+#     → architect             (when the feedback requires a fundamental redesign)
+#     → document_review       (otherwise, after targeted revisions)
+#   review_escalation (human gate)
+#     → document_review       (re-review the latest revisions)
+#     → architect             (send back for a full revision)
+#     → mark_accepted → $end  (accept the document as-is)
+#     → $end                  (stop)
 #
 # Composing with sdd-plan:
 #   Once this workflow produces an approved design document, you can feed it
@@ -33,8 +45,8 @@
 
 workflow:
   name: design
-  description: Create a comprehensive solution design document grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability
-  version: "1.0.0"
+  description: Create a comprehensive solution design document grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability, with a fixer agent applying targeted revisions between review rounds
+  version: "1.1.0"
   entry_point: architect
 
   runtime:
@@ -66,12 +78,21 @@ workflow:
       type: string
       required: false
       description: Optional file path for the design document (e.g. docs/my-feature.design.md)
+    max_architect_escalations:
+      type: number
+      default: 2
+      description: Max times the fixer may hand a revision back to the architect before it must resolve the review feedback itself
+    max_review_rounds:
+      type: number
+      default: 3
+      description: Max revision rounds without reviewer sign-off before escalating to a human gate instead of looping indefinitely
 
   context:
     mode: explicit
 
   limits:
     max_iterations: 50
+    max_timeout_seconds: 3600 # 60 minutes
 
 agents:
   - name: architect
@@ -85,6 +106,7 @@ agents:
       - workflow.input.output_path?
       - architect.output?
       - document_review.output?
+      - fixer.output?
     system_prompt: |
       You are a Principal Software Architect. You analyze requirements deeply, research the
       existing codebase, and produce clear, high-level technical design documents.
@@ -124,6 +146,27 @@ agents:
       **IMPORTANT:** You are revising an existing document. Read the document at
       `{{ architect.output.file_path }}` and update it to address the feedback.
       Preserve content that is satisfactory.
+      {% endif %}
+
+      {% if fixer is defined and fixer.output %}
+      **Handed back from the fixer** — targeted edits were not enough to resolve
+      the review feedback.
+
+      {% if fixer.output.escalation_reason %}
+      **Why this needs you:**
+      {{ fixer.output.escalation_reason }}
+      {% endif %}
+
+      **Corrections the fixer already applied** — the document on disk is newer
+      than your last draft. Read the current file and preserve these:
+      {% for item in fixer.output.issues_fixed %}
+      - {{ item }}
+      {% endfor %}
+
+      **Issues the fixer could not resolve:**
+      {% for item in fixer.output.unresolved_issues %}
+      - {{ item }}
+      {% endfor %}
       {% endif %}
 
       ---
@@ -292,8 +335,233 @@ agents:
     routes:
       - to: $end
         when: "{{ document_review.output.technical_review_approved and document_review.output.readability_review_approved }}"
-      - to: architect
+      - to: fixer
 
+  - name: fixer
+    description: Applies targeted revisions to the design document from review feedback, escalating to the architect when the feedback requires a fundamental redesign
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: high
+    input:
+      - workflow.input.purpose
+      - workflow.input.max_architect_escalations
+      - workflow.input.max_review_rounds
+      - architect.output.file_path
+      - document_review.output
+      - fixer.output?
+    system_prompt: |
+      You are a Senior Technical Editor who revises design documents in response
+      to review feedback.
+
+      You make surgical edits that resolve reviewer findings without rewriting
+      content that already passes. You verify before you write — reading the
+      codebase and searching documentation rather than guessing at facts you
+      are asked to correct.
+
+      You also know the limits of a targeted edit. When feedback invalidates the
+      document's core approach or demands design work that an editing pass
+      cannot honestly deliver, you escalate to the architect instead of papering
+      over the problem.
+    prompt: |
+      The review did not approve the design document. Revise it.
+
+      **Purpose:** {{ workflow.input.purpose }}
+
+      **Document:** `{{ architect.output.file_path }}`
+
+      Read the current document from that path and edit it in place. Do not
+      create a new file and do not change the file name.
+
+      ---
+
+      ## REVIEW FEEDBACK
+
+      {% if not document_review.output.technical_review_approved %}
+      ### Technical review — {{ document_review.output.technical_review_score }}/100 (NOT APPROVED)
+
+      {{ document_review.output.technical_review_feedback }}
+
+      **Critical technical issues:**
+      {% for issue in document_review.output.technical_review_critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      The readability review did not run this round — the review sub-workflow
+      short-circuits when the technical score is below its threshold. Focus this
+      pass on technical accuracy and completeness.
+      {% else %}
+      ### Technical review — {{ document_review.output.technical_review_score }}/100 (APPROVED)
+
+      Technical accuracy passed. Do not regress it while addressing readability.
+
+      ### Readability review — {{ document_review.output.readability_review_score }}/100 (NOT APPROVED)
+
+      {{ document_review.output.readability_review_feedback }}
+
+      **Critical readability issues:**
+      {% for issue in document_review.output.readability_review_critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% endif %}
+
+      ---
+
+      ## ESCALATION CHECK
+
+      Before editing, decide whether this feedback is within reach of targeted
+      revisions or belongs to the architect.
+
+      **Escalate (`escalate_to_architect: true`) when:**
+      - The reviewer rejects the core approach, architecture, or a key design decision
+      - Resolving the feedback means re-deriving design decisions, alternatives, or trade-offs
+      - Whole required sections are missing and can only be written from fresh
+        codebase or external research
+      - The document's factual grounding is wrong in ways that invalidate the proposed design
+
+      **Fix it yourself (`escalate_to_architect: false`) when:**
+      - Claims, versions, API names, file paths, or links are wrong but the design holds
+      - Sections are thin or vague and you can supply the detail by verifying against
+        the codebase and documentation
+      - Structure, clarity, ordering, formatting, redundancy, or verbosity need work
+      - Assumptions or open questions need to be stated explicitly
+      - Scope creep or unnecessary complexity the reviewer flagged needs trimming
+
+      {% if fixer is defined and fixer.output %}
+      You have escalated to the architect {{ fixer.output.escalation_count }} time(s)
+      so far. The limit is {{ workflow.input.max_architect_escalations }}.
+      {% if fixer.output.escalation_count >= workflow.input.max_architect_escalations %}
+
+      **You have reached the escalation limit. Do NOT escalate again.** Make the
+      strongest targeted improvements you can and record anything still
+      outstanding in `unresolved_issues`.
+      {% endif %}
+      {% endif %}
+
+      ---
+
+      ## ROUND TRACKING
+
+      Set `review_round` to {% if fixer is defined and fixer.output %}the previous round ({{ fixer.output.review_round }}) plus 1{% else %}1 — this is the first failed review round{% endif %}.
+
+      Set `escalation_count` to {% if fixer is defined and fixer.output %}{{ fixer.output.escalation_count }}{% else %}0{% endif %},
+      plus 1 if you escalate this round.
+
+      ---
+
+      ## REVISION TASKS
+
+      {% if fixer is defined and fixer.output and fixer.output.escalation_count >= workflow.input.max_architect_escalations %}
+      You cannot escalate. Work the list below.
+      {% else %}
+      **If you are escalating:** do NOT attempt the rework yourself. Apply only
+      unambiguous, low-risk corrections (typos, broken links, wrong file paths),
+      then write a precise handoff brief in `escalation_reason` covering what is
+      fundamentally wrong, which sections are affected, and what the architect
+      must re-derive. Stop there.
+
+      **Otherwise:**
+      {% endif %}
+
+      1. **Resolve every critical issue.** Work the critical issues list first,
+         then the narrative feedback. Anything you cannot resolve goes in
+         `unresolved_issues` with the reason — never silently skip it.
+      2. **Verify before you write.** Read the referenced source files and search
+         documentation to confirm the facts you are correcting. Do not swap one
+         unverified claim for another.
+      3. **Preserve what passed.** Leave satisfactory content alone. Do not
+         rewrite sections the reviewers did not fault.
+      4. **Respect the document's contract.** This is a high-level design
+         document. Do not add an implementation plan, epic breakdown, or task
+         tables — those belong to the separate planning step.
+      5. **Stay in scope.** Fix what the reviewers raised. Do not expand the
+         design, add new alternatives, or introduce sections nobody asked for.
+    output:
+      issues_fixed:
+        type: array
+        description: Review issues resolved in this pass
+      unresolved_issues:
+        type: array
+        description: Review issues left unresolved, each with the reason why
+      fix_notes:
+        type: string
+        description: Summary of the revisions made in this pass
+      escalate_to_architect:
+        type: boolean
+        description: True when the feedback requires a fundamental redesign rather than targeted edits
+      escalation_reason:
+        type: string
+        description: Handoff brief for the architect when escalating; empty string otherwise
+      escalation_count:
+        type: number
+        description: Total escalations to the architect so far, including this round
+      review_round:
+        type: number
+        description: Number of failed review rounds handled so far, including this one. 1 on the first run, previous round + 1 on every later run.
+      all_issues_resolved:
+        type: boolean
+        description: Whether every issue raised by the review was resolved
+    routes:
+      - to: review_escalation
+        when: "{{ output.review_round >= workflow.input.max_review_rounds }}"
+      - to: architect
+        when: "{{ output.escalate_to_architect and output.escalation_count <= workflow.input.max_architect_escalations }}"
+      - to: document_review
+
+  - name: review_escalation
+    type: human_gate
+    description: Escalate when the document hasn't earned reviewer sign-off after several revision rounds
+    prompt: |
+      The design document at `{{ architect.output.file_path }}` has been through
+      {{ fixer.output.review_round }} revision rounds without reviewer sign-off
+      (limit: {{ workflow.input.max_review_rounds }}).
+
+      **Latest scores:** technical {{ document_review.output.technical_review_score }}/100{% if document_review.output.technical_review_approved %}, readability {{ document_review.output.readability_review_score }}/100{% else %} (readability did not run — technical review short-circuited){% endif %}. Both thresholds are 90.
+
+      **Fixes applied in the latest round:**
+      {% for item in fixer.output.issues_fixed %}
+      - {{ item }}
+      {% endfor %}
+
+      **Still unresolved:**
+      {% for item in fixer.output.unresolved_issues %}
+      - {{ item }}
+      {% endfor %}
+
+      {% if fixer.output.escalate_to_architect %}
+      **The fixer wants the architect to take this back:**
+      {{ fixer.output.escalation_reason }}
+      {% endif %}
+
+      How would you like to proceed?
+    options:
+      - label: Re-review the latest revisions (one more round)
+        value: continue
+        route: document_review
+      - label: Send it back to the architect for a full revision
+        value: redesign
+        route: architect
+      - label: Accept the document as-is and finish
+        value: accept
+        route: mark_accepted
+      - label: Stop the workflow here
+        value: stop
+        route: $end
+
+  - name: mark_accepted
+    type: set
+    description: Record that a human accepted the document past the revision-round cap without reviewer sign-off
+    input:
+      - fixer.output
+    values:
+      human_accepted: "true"
+      human_accepted_note: "Accepted by a human after {{ fixer.output.review_round }} revision rounds without reviewer sign-off. Outstanding: {{ fixer.output.unresolved_issues | join('; ') }}"
+    routes:
+      - to: $end
+
+# `fixer` and `mark_accepted` only run when a review round fails, so every
+# reference to them is guarded with `is defined` to keep the output valid on
+# the straight-through path.
 output:
   purpose: "{{ workflow.input.purpose }}"
   design_file: "{{ architect.output.file_path }}"
@@ -301,4 +569,8 @@ output:
   readability_review_score: "{{ document_review.output.readability_review_score }}"
   technical_review_feedback: "{{ document_review.output.technical_review_feedback }}"
   readability_review_feedback: "{{ document_review.output.readability_review_feedback }}"
+  revision_rounds: "{{ fixer.output.review_round if fixer is defined else 0 }}"
+  unresolved_issues: "{{ fixer.output.unresolved_issues | join('; ') if fixer is defined else '' }}"
+  human_accepted: "{{ mark_accepted.output.human_accepted if mark_accepted is defined else 'false' }}"
+  human_accepted_note: "{{ mark_accepted.output.human_accepted_note if mark_accepted is defined else '' }}"
   iterations: "{{ context.iteration }}"

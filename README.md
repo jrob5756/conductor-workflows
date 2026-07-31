@@ -11,8 +11,8 @@ Sample workflow registry for [Conductor](https://github.com/microsoft/conductor)
 | `document-update` | Update an existing markdown document to incorporate a stated purpose, with technical and readability review cycles (loops back to the editor until both thresholds are met) |
 | `fusion` | Multi-model deliberation modelled on OpenRouter's Fusion Router: a panel of models from different labs answers independently in parallel, an analyst compares (never merges) their answers into consensus, contradictions, coverage gaps, unique insights and blind spots, and a synthesiser writes the final answer. A cheap gate lets trivial questions skip the panel |
 | `pr-review` | Multi-agent PR review with smart per-PR triage: a heuristic + cheap LLM decides which of 6 specialists (code, security, tests, errors, types, comments) need to run for this PR, then cross-lens deliberation and a non-blocking polish stage. Self-contained via the `gh` CLI; GitHub-only in v1 |
-| `sdd-design` | Solution design document with technical and readability review cycles (no implementation plan) |
-| `sdd-plan` | Solution design + implementation plan with technical and readability review cycles. Optional `design` input switches it to plan-only mode, consuming an existing design document (e.g. one produced by `sdd-design`) |
+| `sdd-design` | Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan) |
+| `sdd-plan` | Solution design + implementation plan with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge. Optional `design` input switches it to plan-only mode, consuming an existing design document (e.g. one produced by `sdd-design`) |
 | `sdd-implement` | Implement a plan epic-by-epic with epic-level and plan-level review |
 
 ## Usage

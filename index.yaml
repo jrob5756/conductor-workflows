@@ -15,10 +15,10 @@ workflows:
     description: "Multi-agent PR review with smart per-PR specialist triage: heuristic + LLM picks which of 6 deep-domain specialists (code, security, tests, errors, types, comments) need to run, then cross-lens deliberation, consensus arbitration, and a non-blocking polish stage. Self-contained via the gh CLI; GitHub-only in v1."
     path: workflows/pr-review/workflow.yaml
   sdd-design:
-    description: "Solution design document with technical and readability review cycles (no implementation plan)"
+    description: "Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan)"
     path: workflows/sdd/design.yaml
   sdd-plan:
-    description: "Solution design + implementation plan with technical and readability review cycles. Accepts an optional `design` input to skip the design phase and produce only the implementation plan from an existing design document"
+    description: "Solution design + implementation plan with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge. Accepts an optional `design` input to skip the design phase and produce only the implementation plan from an existing design document"
     path: workflows/sdd/plan.yaml
   sdd-implement:
     description: "Implement a feature based on an implementation plan document, with epic-level and plan-level review"
