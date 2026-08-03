@@ -36,6 +36,10 @@
 #     → mark_accepted → $end  (accept the document as-is)
 #     → $end                  (stop)
 #
+# The document-review sub-workflow's technical reviewer can also pause and
+# escalate a genuine ambiguity to a human gate mid-review, when
+# allow_human_escalation is true (default). See workflows/document/review.yaml.
+#
 # Composing with sdd-plan:
 #   Once this workflow produces an approved design document, you can feed it
 #   into sdd-plan to author the implementation plan separately:
@@ -46,7 +50,7 @@
 workflow:
   name: design
   description: Create a comprehensive solution design document grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability, with a fixer agent applying targeted revisions between review rounds
-  version: "1.1.0"
+  version: "1.2.0"
   entry_point: architect
 
   runtime:
@@ -80,12 +84,19 @@ workflow:
       description: Optional file path for the design document (e.g. docs/my-feature.design.md)
     max_architect_escalations:
       type: number
+      required: false
       default: 2
       description: Max times the fixer may hand a revision back to the architect before it must resolve the review feedback itself
     max_review_rounds:
       type: number
+      required: false
       default: 3
       description: Max revision rounds without reviewer sign-off before escalating to a human gate instead of looping indefinitely
+    allow_human_escalation:
+      type: boolean
+      required: false
+      default: true
+      description: Whether the document-review sub-workflow's technical reviewer may pause and escalate genuine ambiguities to a human gate, instead of guessing
 
   context:
     mode: explicit
@@ -332,6 +343,7 @@ agents:
       purpose: "{{ workflow.input.purpose }}"
       technical_threshold: "90"
       readability_threshold: "90"
+      allow_human_escalation: "{{ workflow.input.allow_human_escalation }}"
     routes:
       - to: $end
         when: "{{ document_review.output.technical_review_approved and document_review.output.readability_review_approved }}"
@@ -342,11 +354,11 @@ agents:
     model: claude-sonnet-5
     context_tier: long_context
     reasoning:
-      effort: high
+      effort: medium 
     input:
       - workflow.input.purpose
-      - workflow.input.max_architect_escalations
-      - workflow.input.max_review_rounds
+      - workflow.input.max_architect_escalations?
+      - workflow.input.max_review_rounds?
       - architect.output.file_path
       - document_review.output
       - fixer.output?
@@ -364,6 +376,7 @@ agents:
       cannot honestly deliver, you escalate to the architect instead of papering
       over the problem.
     prompt: |
+      {% set max_escalations = workflow.input.max_architect_escalations | default(2, true) %}
       The review did not approve the design document. Revise it.
 
       **Purpose:** {{ workflow.input.purpose }}
@@ -429,8 +442,8 @@ agents:
 
       {% if fixer is defined and fixer.output %}
       You have escalated to the architect {{ fixer.output.escalation_count }} time(s)
-      so far. The limit is {{ workflow.input.max_architect_escalations }}.
-      {% if fixer.output.escalation_count >= workflow.input.max_architect_escalations %}
+      so far. The limit is {{ max_escalations }}.
+      {% if fixer.output.escalation_count >= max_escalations %}
 
       **You have reached the escalation limit. Do NOT escalate again.** Make the
       strongest targeted improvements you can and record anything still
@@ -451,7 +464,7 @@ agents:
 
       ## REVISION TASKS
 
-      {% if fixer is defined and fixer.output and fixer.output.escalation_count >= workflow.input.max_architect_escalations %}
+      {% if fixer is defined and fixer.output and fixer.output.escalation_count >= max_escalations %}
       You cannot escalate. Work the list below.
       {% else %}
       **If you are escalating:** do NOT attempt the rework yourself. Apply only
@@ -503,9 +516,9 @@ agents:
         description: Whether every issue raised by the review was resolved
     routes:
       - to: review_escalation
-        when: "{{ output.review_round >= workflow.input.max_review_rounds }}"
+        when: "{{ output.review_round >= (workflow.input.max_review_rounds | default(3, true)) }}"
       - to: architect
-        when: "{{ output.escalate_to_architect and output.escalation_count <= workflow.input.max_architect_escalations }}"
+        when: "{{ output.escalate_to_architect and output.escalation_count <= (workflow.input.max_architect_escalations | default(2, true)) }}"
       - to: document_review
 
   - name: review_escalation
@@ -514,7 +527,7 @@ agents:
     prompt: |
       The design document at `{{ architect.output.file_path }}` has been through
       {{ fixer.output.review_round }} revision rounds without reviewer sign-off
-      (limit: {{ workflow.input.max_review_rounds }}).
+      (limit: {{ workflow.input.max_review_rounds | default(3, true) }}).
 
       **Latest scores:** technical {{ document_review.output.technical_review_score }}/100{% if document_review.output.technical_review_approved %}, readability {{ document_review.output.readability_review_score }}/100{% else %} (readability did not run — technical review short-circuited){% endif %}. Both thresholds are 90.
 

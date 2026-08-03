@@ -8,8 +8,12 @@
 #
 # Flow:
 #   technical_reviewer
+#     → technical_escalation  (only if allow_human_escalation and the reviewer
+#                              flags a genuine ambiguity it cannot resolve)
 #     → readability_reviewer  (only if technical score >= technical_threshold)
 #     → $end                  (otherwise short-circuits and returns)
+#   technical_escalation (human gate)
+#     → technical_reviewer    (re-review, with human answers or a skip note)
 #
 # Usage:
 #   conductor run document-review --input document_path="docs/my-design.md"
@@ -27,8 +31,8 @@
 
 workflow:
   name: document-review
-  description: Review-only workflow that scores an existing markdown document on technical accuracy and readability, short-circuiting if the technical score is below the technical threshold
-  version: "1.0.0"
+  description: Review-only workflow that scores an existing markdown document on technical accuracy and readability, short-circuiting if the technical score is below the technical threshold, optionally letting the technical reviewer escalate genuine ambiguities to a human gate
+  version: "1.1.0"
   entry_point: technical_reviewer
 
   runtime:
@@ -70,6 +74,11 @@ workflow:
       required: false
       default: 90
       description: Minimum score (0-100) the readability review must reach to be considered approved
+    allow_human_escalation:
+      type: boolean
+      required: false
+      default: false
+      description: Whether the technical reviewer may pause and escalate genuine ambiguities to a human via a gate, instead of guessing
 
   context:
     mode: explicit
@@ -88,6 +97,9 @@ agents:
       - workflow.input.document_path
       - workflow.input.purpose?
       - workflow.input.technical_threshold
+      - workflow.input.allow_human_escalation?
+      - technical_reviewer.output?
+      - technical_escalation.output?
     system_prompt: |
       You are a Senior Engineering Reviewer with broad expertise across software
       architecture, distributed systems, cloud-native development, and general
@@ -153,11 +165,49 @@ agents:
       | **Simplicity** | Is the proposed approach the minimum viable one? Flag unnecessary abstraction, configurability, or scope creep. |
       | **Assumption Transparency** | Are assumptions explicitly stated? Are ambiguities flagged with the chosen interpretation? |
 
+      {% if workflow.input.allow_human_escalation %}
+      {% if technical_escalation is defined %}
+      ## Human Escalation Follow-up
+
+      You previously escalated these questions to a human:
+      {% for q in technical_reviewer.output.escalation_questions %}
+      - {{ q }}
+      {% endfor %}
+
+      {% if technical_escalation.output.selected == 'answer' %}
+      The human answered:
+      {{ technical_escalation.output.additional_input.human_answers }}
+
+      Use these answers to finalize your review now.
+      {% else %}
+      The human chose to skip answering. Finalize your review using your best
+      judgment given the available information.
+      {% endif %}
+      Do not escalate again — provide a final score, approval, feedback, and
+      critical issues below.
+      {% else %}
+      ## Escalating to a Human
+
+      If, and only if, you encounter a genuine ambiguity you cannot resolve
+      through fact-checking or codebase inspection — such as a policy
+      decision, business trade-off, or missing information only a human
+      stakeholder can supply — you may escalate instead of guessing. Set
+      `needs_human_escalation` to `true` and list the specific questions in
+      `escalation_questions`. Still provide your best-effort `score`,
+      `approved`, `feedback`, and `critical_issues` in case escalation is
+      skipped. Use this sparingly — most findings belong in
+      `critical_issues`, not an escalation.
+      {% endif %}
+      {% endif %}
+
       Provide:
       1. A score from 0-100
       2. Whether the technical content is approved (score >= {{ workflow.input.technical_threshold }})
       3. Specific feedback on technical issues
       4. List of critical technical issues that must be addressed
+      {% if workflow.input.allow_human_escalation and technical_escalation is not defined %}
+      5. Whether you need to escalate a genuine ambiguity to a human, and if so, the specific questions
+      {% endif %}
     output:
       score:
         type: number
@@ -171,10 +221,44 @@ agents:
       critical_issues:
         type: array
         description: List of critical technical issues that must be addressed
+      needs_human_escalation:
+        type: boolean
+        description: Whether the reviewer wants to escalate a genuine ambiguity to a human before finalizing
+      escalation_questions:
+        type: array
+        description: Specific questions for the human, populated only when needs_human_escalation is true
     routes:
+      - to: technical_escalation
+        when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and technical_escalation is not defined }}"
       - to: readability_reviewer
         when: "{{ output.approved }}"
       - to: $end
+
+  - name: technical_escalation
+    type: human_gate
+    description: Lets a human answer the technical reviewer's open questions, when human escalation is enabled and the reviewer flags a genuine ambiguity
+    prompt: |
+      ## Technical Review Escalation
+
+      The technical reviewer has flagged questions it cannot resolve on its
+      own for `{{ workflow.input.document_path }}`:
+
+      {% for q in technical_reviewer.output.escalation_questions %}
+      - {{ q }}
+      {% endfor %}
+
+      **Reviewer's current best-effort assessment:** {{ technical_reviewer.output.score }}/100
+      {{ technical_reviewer.output.feedback }}
+
+      How would you like to proceed?
+    options:
+      - label: Answer the questions
+        value: answer
+        route: technical_reviewer
+        prompt_for: human_answers
+      - label: Skip — let the reviewer finalize without answers
+        value: skip
+        route: technical_reviewer
 
   - name: readability_reviewer
     description: Reviews the document for structure, clarity, and readability
@@ -265,6 +349,7 @@ output:
   technical_review_approved: "{{ technical_reviewer.output.approved }}"
   technical_review_feedback: "{{ technical_reviewer.output.feedback }}"
   technical_review_critical_issues: "{{ technical_reviewer.output.critical_issues }}"
+  technical_review_escalated: "{{ technical_escalation is defined }}"
   # Each readability output is a single bare {{ ... }} ternary so Conductor
   # preserves the native type (number/bool/string/list) when the readability
   # reviewer ran. When technical review short-circuits the workflow before
