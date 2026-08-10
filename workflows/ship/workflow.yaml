@@ -1,0 +1,1002 @@
+# Ship Workflow
+#
+# Takes an existing GitHub issue all the way to a merged pull request,
+# orchestrating the skills you already use rather than reimplementing their
+# logic:
+#
+#   bootstrap (script)        resolve repo root / default branch / gh identity
+#     ↓
+#   issue_resolver            read the issue from GitHub
+#     ↓
+#   worktree_setup            [worktree skill] assign, comment, cut a worktree
+#     ↓
+#   worktree_verify (script)  assert the worktree exists; emit an absolute path
+#     ↓
+#   planner ←──────────┐      "plan mode": study the repo, draft a plan, raise
+#     ↓                │      genuine open questions
+#   ask_questions ─────┘      the whole set in one step (back / skip / abort)
+#     ↓
+#   plan_approval             approve / revise / stop (human gate)
+#     ↓
+#   coder                     implement on autopilot, run the repo's own
+#     ↓                       build, lint and tests
+#   ship_draft                [git-workflow skill] stage, commit, push, draft PR
+#     ↓
+#   review                    [code-review skill] review AND apply the fixes,
+#     ↓                       then commit and push
+#   publish                   [git-workflow skill] mark ready for review
+#     ↓
+#   merge_gate                merge / don't merge (human gate)
+#     ↓
+#   merge                     [merge-pr skill] squash, delete branch, remove
+#     ↓                       the worktree — runs in the repo root, NOT in the
+#   $end                      worktree it is deleting
+#
+# Loops
+#   One, and a human drives it: the coder runs once, and if it does not
+#   finish, `implementation_stalled` asks whether to run it again. Everything
+#   after that is a straight line. Nothing retries itself on a round counter —
+#   the review skill already re-runs its own checks after applying fixes, so
+#   an outer retry loop would just re-review code that was already reconciled.
+#   Declining the merge leaves the PR open and ends the run; pick it up by
+#   hand or start a fresh one.
+#
+# Working directories
+#   Steps with no `working_dir` run in the directory you invoked
+#   `conductor run` from, so the workflow targets whatever repository you are
+#   standing in. Once the worktree exists, every implementation step pins
+#   `working_dir` to its absolute path. `merge` deliberately pins back to the
+#   repository root, mirroring the manual step of leaving the worktree before
+#   deleting it.
+#
+# Skills
+#   Skills are picked up from installed plugins via `runtime.skill_discovery`
+#   rather than hard-coded paths, because `skills:` entries cannot be
+#   templated and a bare name must be a Conductor built-in. This makes the run
+#   depend on what is installed on the machine. Expected plugin skills:
+#   `worktree`, `git-workflow`, `gh-cli`, `code-review`, `merge-pr`.
+#
+# Usage:
+#   Run it from the repository you want to work in. The issue must already
+#   exist — this workflow never creates one.
+#
+#     conductor run workflows/ship/workflow.yaml --input issue=123
+#
+#   The issue can also be a URL or an `owner/repo#123` reference:
+#     conductor run workflows/ship/workflow.yaml \
+#       --input issue="https://github.com/owner/repo/issues/123"
+#
+#   Skip the question gate and go straight to plan approval:
+#     conductor run workflows/ship/workflow.yaml --input issue=123 \
+#       --input ask_questions=false
+#
+# Requires:
+#   - git and gh (GitHub CLI) on PATH, with `gh auth status` passing
+#   - python3 on PATH (used by the bootstrap and worktree_verify steps)
+#   - The plugin skills listed above installed for the Copilot CLI
+
+workflow:
+  name: ship
+  description: Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a one-question-at-a-time human gate, implements on autopilot, opens a draft PR, runs a code review and reconciles the findings, then publishes and merges behind a human gate with full branch and worktree cleanup
+  version: "1.0.0"
+  entry_point: bootstrap
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-5
+    max_session_seconds: 3600
+    checkpoint:
+      every_agent: true   # long, human-gated run — keep it resumable after an
+      keep_last: 5        # external interruption
+    skill_discovery:
+      sources: [plugins]
+      exclude:
+        # Trimmed to the six skills this pipeline actually drives — worktree,
+        # git-workflow, gh-cli, code-review, merge-pr and code-comments.
+        # `ship` is excluded so an agent cannot recursively re-invoke this
+        # workflow, and `conductor` because it is ~117KB of workflow-authoring
+        # reference with nothing to say about shipping a change.
+        - ship
+        - conductor
+        - conductor-release
+        - fusion
+        - teams-cache
+        - triage
+        - concept-review
+        - web-research
+        - humanizer
+
+  input:
+    issue:
+      type: string
+      required: true
+      description: "Issue to work on — a number (`123`), a full URL, or `owner/repo#123`. The issue must already exist; this workflow never creates one."
+
+    ask_questions:
+      type: boolean
+      required: false
+      default: true
+      description: "Put the planner's open questions to you one at a time before implementation starts. Set false to go straight to plan approval."
+
+  context:
+    mode: explicit
+
+  limits:
+    max_iterations: 150
+
+agents:
+  # ---------------------------------------------------------------------------
+  # Setup
+  # ---------------------------------------------------------------------------
+
+  - name: bootstrap
+    description: Resolves the target repository, its default branch and your GitHub identity from the directory the workflow was invoked in
+    type: script
+    command: python3
+    timeout: 120
+    args:
+      - "-c"
+      - |
+        import json, os, subprocess, sys
+
+        def emit(payload):
+            print(json.dumps(payload))
+            sys.exit(0)
+
+        def run(args):
+            p = subprocess.run(args, capture_output=True, text=True)
+            return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+        rc, repo_root, err = run(["git", "rev-parse", "--show-toplevel"])
+        if rc != 0 or not repo_root:
+            emit({"ok": False, "error": "Not inside a git repository (cwd " + os.getcwd() + "). " + err})
+
+        rc, nwo, err = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        if rc != 0 or not nwo:
+            emit({"ok": False, "error": "'gh repo view' failed - check that the GitHub CLI is installed and authenticated. " + err})
+
+        rc, gh_user, err = run(["gh", "api", "user", "--jq", ".login"])
+        if rc != 0 or not gh_user:
+            emit({"ok": False, "error": "'gh api user' failed - run 'gh auth status'. " + err})
+
+        rc, ref, _ = run(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        default_branch = ref.split("/", 1)[1] if rc == 0 and "/" in ref else ""
+        if not default_branch:
+            rc, db, _ = run(["gh", "repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"])
+            default_branch = db if rc == 0 else ""
+        if not default_branch:
+            emit({"ok": False, "error": "Could not determine the default branch for " + nwo + "."})
+
+        repo_name = os.path.basename(repo_root)
+        emit({
+            "ok": True,
+            "error": "",
+            "repo_root": repo_root,
+            "repo_name": repo_name,
+            "name_with_owner": nwo,
+            "default_branch": default_branch,
+            "gh_user": gh_user,
+            "worktrees_dir": os.path.join(os.path.dirname(repo_root), repo_name + ".worktrees"),
+        })
+    routes:
+      - to: bootstrap_failed
+        when: "{{ not output.ok }}"
+      - to: issue_resolver
+
+  - name: bootstrap_failed
+    type: terminate
+    status: failed
+    input:
+      - bootstrap.output.error
+    reason: "{{ bootstrap.output.error }}"
+
+  - name: issue_resolver
+    description: Loads the issue to work on from GitHub
+    model: claude-sonnet-5
+    reasoning:
+      effort: medium
+    input:
+      - workflow.input.issue
+      - bootstrap.output.name_with_owner
+      - bootstrap.output.repo_root
+      - bootstrap.output.default_branch
+    system_prompt: |
+      You resolve the unit of work for an implementation pipeline: you read an
+      existing GitHub issue and classify it. You never create or edit issues,
+      you never implement anything, and you never touch git branches.
+
+      Use the `gh` CLI for every GitHub operation. If a `gh` call fails with a
+      404 or a permission error, run `gh auth status`, try `gh auth switch`,
+      and retry once before reporting failure.
+    prompt: |
+      Repository: `{{ bootstrap.output.name_with_owner }}` (checked out at `{{ bootstrap.output.repo_root }}`)
+      Default branch: `{{ bootstrap.output.default_branch }}`
+
+      ## Load issue `{{ workflow.input.issue }}`
+
+      The reference may be a bare number, a full URL, or `owner/repo#123`.
+      Normalise it, then read the issue:
+
+      ```
+      gh issue view <number> -R <owner>/<repo> --json number,title,body,labels,url,state
+      ```
+
+      If the issue cannot be read at all — it does not exist, or you lack
+      access — set `found: false` and put the exact `gh` error in `notes`. Do
+      not invent an issue, and do not create one; this workflow only ever works
+      an issue that already exists.
+
+      If the issue is closed, set `found: true` and say so plainly in `notes` —
+      that is not a failure, the human decides at the approval gate.
+
+      Report the issue exactly as GitHub returned it. Do not paraphrase the
+      title or body, and do not classify or summarise it — later steps read the
+      labels themselves.
+    output:
+      found:
+        type: boolean
+        description: True when the issue was read from GitHub. False when it does not exist or is not accessible.
+      issue_number:
+        type: number
+        description: The issue number
+      issue_title:
+        type: string
+        description: The issue title, verbatim from GitHub
+      issue_body:
+        type: string
+        description: The issue body, verbatim from GitHub
+      issue_url:
+        type: string
+        description: Full URL of the issue
+      notes:
+        type: string
+        description: Anything the human should know before work starts, such as the issue already being closed. Empty when there is nothing to flag.
+    routes:
+      - to: issue_resolver_failed
+        when: "{{ not output.found }}"
+      - to: worktree_setup
+
+  - name: issue_resolver_failed
+    type: terminate
+    status: failed
+    input:
+      - workflow.input.issue
+      - issue_resolver.output.notes
+    reason: "Issue '{{ workflow.input.issue }}' could not be read from GitHub. {{ issue_resolver.output.notes }}"
+
+  - name: worktree_setup
+    description: Claims the issue and creates an isolated worktree and branch for it, using the worktree skill
+    model: claude-sonnet-5
+    input:
+      - issue_resolver.output.issue_number
+    system_prompt: |
+      You invoke the `worktree` skill and report what it did. The skill owns
+      the procedure — assigning, commenting, naming and creating the worktree.
+      Follow it as written; do not substitute your own steps and do not write
+      any implementation code.
+    prompt: |
+      /worktree #{{ issue_resolver.output.issue_number }}
+
+      Then report the worktree exactly as the skill left it. The absolute path
+      and branch name must match what is on disk — every later step runs there.
+    output:
+      worktree_path:
+        type: string
+        description: Absolute path to the created worktree. Empty when creation failed.
+      branch_name:
+        type: string
+        description: The branch created in the worktree
+      worktree_created:
+        type: boolean
+        description: True only when the worktree exists on disk
+      issue_assigned:
+        type: boolean
+        description: True when the issue was assigned
+      comment_posted:
+        type: boolean
+        description: True when the starting-work comment was posted
+      error:
+        type: string
+        description: What went wrong, empty on success
+    routes:
+      - to: worktree_verify
+
+  - name: worktree_verify
+    description: Independently confirms the worktree exists and is a git checkout, so that a wrong path fails here with a clear message rather than inside a later agent's working_dir resolution
+    type: script
+    command: python3
+    timeout: 60
+    input:
+      - worktree_setup.output.worktree_path
+      - worktree_setup.output.error
+    args:
+      - "-c"
+      - |
+        import json, os, subprocess, sys
+
+        def emit(payload):
+            print(json.dumps(payload))
+            sys.exit(0)
+
+        raw = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+        reported_error = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+
+        if not raw:
+            emit({
+                "ok": False,
+                "worktree_path": "",
+                "branch": "",
+                "error": "worktree_setup reported no path. " + reported_error,
+            })
+
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(path):
+            emit({
+                "ok": False,
+                "worktree_path": "",
+                "branch": "",
+                "error": "Worktree path does not exist: " + path + ". " + reported_error,
+            })
+
+        p = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            emit({
+                "ok": False,
+                "worktree_path": path,
+                "branch": "",
+                "error": "Not a git checkout: " + path + ". " + p.stderr.strip(),
+            })
+
+        emit({"ok": True, "worktree_path": path, "branch": p.stdout.strip(), "error": ""})
+      - "{{ worktree_setup.output.worktree_path }}"
+      - "{{ worktree_setup.output.error }}"
+    routes:
+      - to: worktree_setup_failed
+        when: "{{ not output.ok }}"
+      - to: planner
+
+  - name: worktree_setup_failed
+    type: terminate
+    status: failed
+    input:
+      - worktree_verify.output.error
+    reason: "{{ worktree_verify.output.error }}"
+
+  # ---------------------------------------------------------------------------
+  # Planning
+  # ---------------------------------------------------------------------------
+
+  - name: planner
+    description: Studies the codebase and produces an implementation plan for the issue, raising the questions it genuinely cannot answer from the code
+    model: claude-opus-5
+    reasoning:
+      effort: xhigh
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - issue_resolver.output.issue_number
+      - issue_resolver.output.issue_title
+      - issue_resolver.output.issue_body
+      - issue_resolver.output.issue_url
+      - issue_resolver.output.notes?
+      - workflow.input.ask_questions
+      - worktree_verify.output.worktree_path
+      - worktree_verify.output.branch
+      - ask_questions.output?
+      - plan_approval.output?
+      - planner.output?
+    system_prompt: |
+      You are a planning agent operating exactly like plan mode in a coding
+      CLI: you investigate the codebase, decide how the change should be made,
+      and write that down. You do not edit files, run generators, or make
+      commits. Reading, searching and running read-only commands is expected
+      and encouraged.
+
+      A plan is only useful if it is grounded. Name real files, real functions
+      and real commands that you have confirmed exist. A plan full of plausible
+      but unverified paths is worse than no plan, because it will be followed.
+    prompt: |
+      You are working in `{{ worktree_verify.output.worktree_path }}` on branch
+      `{{ worktree_verify.output.branch }}`.
+
+      ## The work
+
+      **Issue #{{ issue_resolver.output.issue_number }} — {{ issue_resolver.output.issue_title }}**
+      {{ issue_resolver.output.issue_url }}
+
+      {{ issue_resolver.output.issue_body }}
+      {% if issue_resolver.output.notes %}
+
+      *Flagged when the issue was loaded: {{ issue_resolver.output.notes }}*
+      {% endif %}
+
+      {% if planner is defined and planner.output %}
+      ## This is a revision
+
+      You already produced a plan. Revise it — do not start over, and keep
+      everything that was not challenged.
+
+      {% if ask_questions is defined and ask_questions.output.transcript %}
+      ### The human answered your questions
+
+      ```
+      {{ ask_questions.output.transcript }}
+      ```
+
+      Fold these answers into the plan. An answer that changes the approach
+      must change the plan, not just get appended to it. Any question you asked
+      that is missing above was skipped and stays unresolved — state the
+      assumption you are proceeding on.
+      {% endif %}
+
+      {% if plan_approval is defined and plan_approval.output.selected == 'revise' %}
+      ### The human asked for changes
+
+      ```
+      {{ plan_approval.output.additional_input.feedback }}
+      ```
+
+      Address this directly.
+      {% endif %}
+      {% endif %}
+
+      ## What to do
+
+      1. **Understand the current state.** Read the code that this change
+         touches. Follow the call paths. Check for an existing partial
+         implementation, a related helper, or a convention you should be
+         following. Read `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md` or the
+         README if they exist — they usually constrain the answer.
+
+      2. **Find how this repository builds, lints and tests itself.** Look at
+         the package manifest, the CI workflows, and the contributor guide.
+         The plan must name the exact commands, because the implementation
+         step will run them.
+
+      3. **Write the plan.** In `plan`, as markdown:
+         - **Approach** — the shape of the change in a few sentences, and any
+           real alternative you rejected, with the reason.
+         - **Changes** — one entry per file to add or modify, saying what
+           changes in it and why. Concrete paths only.
+         - **Verification** — the exact build, lint and test commands, and what
+           new test coverage the change needs.
+         - **Risks** — what could break, and anything deliberately out of scope.
+
+      4. **Raise your open questions.**
+         {% if workflow.input.ask_questions %}
+         Put a question in `open_questions` only when a human decision actually
+         changes the plan and the codebase cannot settle it: a product choice,
+         a behavioural trade-off, an ambiguity in the issue, an interaction
+         with something you have no visibility into.
+
+         Do not ask what you can find out by reading the code. Do not ask for
+         permission to proceed. Do not ask about style that the repository
+         already settles.
+
+         Each question must stand on its own — the human sees it alone, on its
+         own screen, with no other context. Return each entry as an object —
+         `{"question": "...", "choices": ["...", "..."]}` — and give `choices`
+         whenever the answer is a decision between options you can name: 2-4
+         candidate answers, each phrased as the decision itself rather than as
+         "yes"/"no". Put the option you would take by default first and mark it
+         by ending its text with ` (Recommended)`, so the reader can see your
+         recommendation without reading your reasoning — at most one choice per
+         question carries that suffix, and you leave it off entirely when you
+         genuinely have no preference. Picking a listed option is far cheaper
+         for a human than typing prose, and they can still write their own
+         answer instead. Omit `choices` only for genuinely open-ended questions
+         where you cannot name the alternatives. Either way, a skipped question
+         must still leave the plan actionable.
+
+         An empty list is the correct answer when nothing genuinely needs
+         deciding. Do not manufacture questions to look thorough.
+         {% else %}
+         The human has turned off the question gate, so return an empty
+         `open_questions` list. Where you would have asked, state the
+         assumption you are proceeding on in the plan's Risks section instead.
+         {% endif %}
+    output:
+      plan:
+        type: string
+        description: The implementation plan as markdown, covering approach, per-file changes, verification commands and risks
+      summary:
+        type: string
+        description: A two or three sentence description of the change, for the commit message and PR body
+      open_questions:
+        type: array
+        description: 'Self-contained questions a human must answer. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted only when the alternatives cannot be named. The default choice comes first and ends with " (Recommended)". Empty when nothing genuinely needs a human decision.'
+      verification_commands:
+        type: array
+        description: The exact build, lint and test commands this repository uses, as confirmed from its own configuration
+    routes:
+      - to: ask_questions
+        when: "{{ workflow.input.ask_questions and (output.open_questions | length) > 0 and ask_questions is not defined }}"
+      - to: plan_approval
+
+  - name: ask_questions
+    type: questions
+    description: Puts every open question to the human inside a single step, so answers can be revised with Back and the whole set costs one iteration
+    source: planner.output.open_questions
+    prompt: |
+      ## Issue #{{ issue_resolver.output.issue_number }} — {{ issue_resolver.output.issue_title }}
+
+      The planner raised {{ planner.output.open_questions | length }} open
+      question{{ 's' if (planner.output.open_questions | length) != 1 else '' }}
+      before it commits to an approach. Nothing has been written to the
+      repository yet.
+
+      Answer what you can — anything left unanswered becomes an assumption the
+      plan proceeds on. You can go back and revise an earlier answer at any
+      point before finishing.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: stopped
+    routes:
+      - to: planner
+
+  - name: plan_approval
+    type: human_gate
+    description: The approve-then-autopilot checkpoint — nothing is written to the repository until this gate is cleared
+    prompt: |
+      ## Implementation plan — issue #{{ issue_resolver.output.issue_number }}
+
+      **{{ issue_resolver.output.issue_title }}**
+      {{ issue_resolver.output.issue_url }}
+
+      {{ planner.output.summary }}
+
+      ---
+
+      {{ planner.output.plan }}
+
+      ---
+
+      **Worktree:** `{{ worktree_verify.output.worktree_path }}`
+      **Branch:** `{{ worktree_verify.output.branch }}`
+      {% if planner.output.verification_commands | length > 0 %}
+      **Verification:** {% for cmd in planner.output.verification_commands %}`{{ cmd }}`{% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+      {% if ask_questions is defined and ask_questions.output.transcript %}
+
+      <details><summary>Your answers</summary>
+
+      ```
+      {{ ask_questions.output.transcript }}
+      ```
+
+      </details>
+      {% endif %}
+
+      Approving starts autopilot implementation in the worktree.
+    options:
+      - label: Approve & implement
+        value: approve
+        route: coder
+      - label: Revise the plan
+        value: revise
+        route: planner
+        prompt_for: feedback
+      - label: Stop the workflow here
+        value: stop
+        route: stopped
+
+  # ---------------------------------------------------------------------------
+  # Implementation
+  # ---------------------------------------------------------------------------
+
+  - name: coder
+    description: Implements the approved plan on autopilot and verifies it with the repository's own build, lint and test commands
+    model: claude-sonnet-5
+    reasoning:
+      effort: high
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - planner.output.plan
+      - planner.output.summary
+      - planner.output.verification_commands
+      - issue_resolver.output.issue_number
+      - issue_resolver.output.issue_title
+      - worktree_verify.output.worktree_path
+      - worktree_verify.output.branch
+      - coder.output?
+      - implementation_stalled.output?
+    system_prompt: |
+      You implement an approved plan. The planning is done and the human has
+      signed off, so do not re-litigate the approach — build it.
+
+      You work only inside the worktree you are given. Do not commit, do not
+      push, and do not open a pull request; a later step owns all of that.
+
+      Verification is part of the job, not an optional extra. Code that has not
+      been built, linted and tested is not finished, and reporting it as
+      finished is the single most damaging thing you can do here.
+    prompt: |
+      Implement this plan in `{{ worktree_verify.output.worktree_path }}` (branch
+      `{{ worktree_verify.output.branch }}`), for issue
+      #{{ issue_resolver.output.issue_number }} — {{ issue_resolver.output.issue_title }}.
+
+      ## The approved plan
+
+      {{ planner.output.plan }}
+
+      {% if coder is defined and coder.output %}
+      ## Continuing — round {{ coder.output.round + 1 }}
+
+      What you completed last round:
+
+      {{ coder.output.summary }}
+
+      What was still outstanding:
+      {% for item in coder.output.blockers %}
+      - {{ item }}
+      {% endfor %}
+
+      Verification stood at: {{ coder.output.verification }}
+
+      Pick up from there. Do not redo work that is already done.
+      {% if implementation_stalled is defined and implementation_stalled.output.selected == 'continue' %}
+
+      The human reviewed the stall and told you to keep going.
+      {% endif %}
+      {% endif %}
+
+      ## How to work
+
+      1. Make the changes the plan calls for. Follow the conventions already in
+         the files you are editing rather than importing your own.
+      2. Add or update tests for behaviour you changed, as the plan's
+         verification section requires.
+      3. Run the repository's own checks and get them passing:
+         {% if planner.output.verification_commands | length > 0 %}
+         {% for cmd in planner.output.verification_commands %}
+         - `{{ cmd }}`
+         {% endfor %}
+         {% else %}
+         Find them in the package manifest, the CI workflows, or the
+         contributor guide, and run them.
+         {% endif %}
+      4. Only run checks that already exist. Do not introduce a new test
+         framework, linter or build tool to satisfy this step.
+
+      ## Scope
+
+      Implement the plan fully and correctly. Fix bugs you introduce, and fix
+      pre-existing bugs that your change makes reachable — but leave unrelated
+      problems alone.
+
+      ## Reporting
+
+      Set `complete: true` only when the plan is fully implemented **and** the
+      verification commands pass. If something is genuinely blocked — a missing
+      credential, a failing test you cannot reach, a decision that was never
+      settled — set `complete: false`, put the specifics in `blockers`, and say
+      what you tried. An honest incomplete report is useful. A false completion
+      wastes the review and merge stages downstream.
+
+      Set `round` to {% if coder is defined and coder.output %}{{ coder.output.round + 1 }}{% else %}1{% endif %}.
+    output:
+      complete:
+        type: boolean
+        description: True only when the plan is fully implemented and the verification commands pass
+      round:
+        type: number
+        description: Which implementation round this was, starting at 1
+      summary:
+        type: string
+        description: What was implemented this round
+      files_changed:
+        type: array
+        description: Paths of files added or modified, relative to the worktree root
+      verification:
+        type: string
+        description: Which verification commands were run and what they reported
+      blockers:
+        type: array
+        description: Specific reasons the work is not complete. Empty when complete is true.
+    routes:
+      - to: implementation_stalled
+        when: "{{ not output.complete }}"
+      - to: ship_draft
+
+  - name: implementation_stalled
+    type: human_gate
+    description: Reached when the coder used its whole round budget without finishing, so the human decides whether to keep going, ship what exists, or stop
+    prompt: |
+      ## Implementation did not finish
+
+      Issue #{{ issue_resolver.output.issue_number }} — {{ issue_resolver.output.issue_title }}
+
+      The coder stopped after {{ coder.output.round }} round(s) without
+      reporting completion.
+
+      **Last round:**
+
+      {{ coder.output.summary }}
+
+      **Still blocked on:**
+      {% for item in coder.output.blockers %}
+      - {{ item }}
+      {% endfor %}
+
+      **Verification:** {{ coder.output.verification }}
+
+      **Worktree:** `{{ worktree_verify.output.worktree_path }}`
+
+      Your changes are on disk and uncommitted. Continuing runs the coder
+      again; shipping opens a draft PR with the work as it stands.
+    options:
+      - label: Run the coder again
+        value: continue
+        route: coder
+      - label: Ship what exists as a draft PR
+        value: ship
+        route: ship_draft
+      - label: Stop the workflow here
+        value: stop
+        route: stopped
+
+  # ---------------------------------------------------------------------------
+  # Draft PR, review, reconcile
+  # ---------------------------------------------------------------------------
+
+  - name: ship_draft
+    description: Stages, commits, pushes and opens a draft pull request, using the git-workflow skill
+    model: claude-sonnet-5
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - worktree_verify.output.worktree_path
+      - issue_resolver.output.issue_number
+    system_prompt: |
+      You invoke the `git-workflow` skill and report what it did. The skill
+      owns the pipeline — what to stage, how to word the commit, and how to
+      open the PR. Follow it as written. You do not modify implementation code.
+    prompt: |
+      /git-workflow acdpr
+
+      Link the pull request to the issue by putting `Closes #{{ issue_resolver.output.issue_number }}`
+      in the PR body, then report what the skill produced.
+    output:
+      pr_url:
+        type: string
+        description: Full URL of the pull request
+      pr_number:
+        type: number
+        description: The pull request number
+      commit_sha:
+        type: string
+        description: SHA of the commit that was pushed
+      pushed:
+        type: boolean
+        description: True when the branch was pushed and the draft PR exists
+      warnings:
+        type: array
+        description: Anything the skill flagged or excluded, such as a skipped credentials file. Empty when there was nothing to report.
+    routes:
+      - to: review
+
+  - name: review
+    description: Reviews the pull request and applies the resulting fixes, using the code-review skill
+    model: claude-sonnet-5
+    reasoning:
+      effort: high
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - ship_draft.output.pr_number
+      - worktree_verify.output.worktree_path
+    system_prompt: |
+      You invoke the `code-review` skill and report what it did. The skill owns
+      which reviews run, how findings are ranked, and what happens next — the
+      pull request is the user's own, so its own path is to apply the fixes.
+      Follow it as written.
+    prompt: |
+      /code-review #{{ ship_draft.output.pr_number }}
+
+      Then report what was found and what was changed.
+    output:
+      all_resolved:
+        type: boolean
+        description: True when no blocking findings remain outstanding
+      blocking_found:
+        type: number
+        description: How many blocking findings the review turned up
+      summary:
+        type: string
+        description: What the review found and what was changed in response
+      unresolved:
+        type: array
+        description: Findings not acted on, each with the reason. Empty when nothing is outstanding.
+      pushed:
+        type: boolean
+        description: True when fixes were committed and pushed to the branch
+      merge_readiness:
+        type: string
+        description: One of ready, needs_work, do_not_merge
+    routes:
+      - to: publish
+
+
+  # ---------------------------------------------------------------------------
+  # Publish and merge
+  # ---------------------------------------------------------------------------
+
+  - name: publish
+    description: Takes the pull request out of draft and reports its CI status, using the gh-cli skill
+    model: claude-sonnet-5
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - ship_draft.output.pr_number
+      - ship_draft.output.pr_url
+      - worktree_verify.output.worktree_path
+    system_prompt: |
+      You invoke the `gh-cli` skill to take a pull request out of draft and
+      report its state. You do not merge it and you do not change any code.
+    prompt: |
+      Use the **gh-cli** skill to mark PR #{{ ship_draft.output.pr_number }}
+      ({{ ship_draft.output.pr_url }}) ready for review, then report its
+      mergeable state and CI check status.
+
+      Marking a draft ready is `gh pr ready` — the `git-workflow` skill has no
+      token for it, so do not reach for a token combo here.
+    output:
+      pr_url:
+        type: string
+        description: Full URL of the pull request
+      is_draft:
+        type: boolean
+        description: Whether the PR is still a draft. False on success.
+      mergeable:
+        type: string
+        description: GitHub's mergeable state, such as MERGEABLE or CONFLICTING
+      checks_summary:
+        type: string
+        description: Plain-language summary of the CI check status
+      error:
+        type: string
+        description: What went wrong, empty on success
+    routes:
+      - to: merge_gate
+
+  - name: merge_gate
+    type: human_gate
+    description: The last stop before merge — the human reads the PR and decides whether it lands
+    prompt: |
+      ## Ready to merge — issue #{{ issue_resolver.output.issue_number }}
+
+      **{{ issue_resolver.output.issue_title }}**
+
+      {{ publish.output.pr_url }}
+
+      {% if publish.output.error %}
+      > **Publishing reported a problem:** {{ publish.output.error }}
+      {% endif %}
+      {% if publish.output.is_draft %}
+      > **The PR is still a draft.**
+      {% endif %}
+
+      **Mergeable:** {{ publish.output.mergeable }}
+      **Checks:** {{ publish.output.checks_summary }}
+
+      ---
+
+      {% if review is defined %}
+      **Review:** {{ review.output.summary }}
+
+      {% if review.output.blocking_found > 0 %}
+      {{ review.output.blocking_found }} blocking finding(s) were raised and
+      {% if review.output.all_resolved %}all were resolved.{% else %}**not all were resolved.**{% endif %}
+      {% else %}
+      No blocking findings.
+      {% endif %}
+
+      {% if review.output.pushed %}
+      Fixes were committed and pushed to `{{ worktree_verify.output.branch }}`.
+      {% endif %}
+
+      {% if (review.output.unresolved | length) > 0 %}
+      **Deliberately not addressed:**
+      {% for item in review.output.unresolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% endif %}
+
+      ---
+
+      Merging squashes the PR, deletes the remote and local branch, and removes
+      the worktree at `{{ worktree_verify.output.worktree_path }}`.
+    options:
+      - label: Merge & clean up
+        value: merge
+        route: merge
+      - label: Don't merge (leave the PR open)
+        value: stop
+        route: stopped
+    routes:
+      - to: merge
+
+  - name: merge
+    description: Merges the pull request and cleans up the branch and worktree, using the merge-pr skill
+    model: claude-sonnet-5
+    # Pinned to the repository root, NOT the worktree — this step deletes that
+    # worktree, and an agent cannot remove the directory it is standing in.
+    working_dir: "{{ bootstrap.output.repo_root }}"
+    input:
+      - ship_draft.output.pr_number
+      - bootstrap.output.repo_root
+    system_prompt: |
+      You invoke the `merge-pr` skill and report what it did. The skill owns the
+      merge strategy and the cleanup, including which branches and worktrees are
+      yours to remove. Follow it as written.
+
+      A human already approved this merge at a gate, so do not ask again — but
+      do stop if the repository's own state makes merging unsafe.
+    prompt: |
+      /merge-pr #{{ ship_draft.output.pr_number }}
+
+      Then report what was merged and what was cleaned up.
+    output:
+      merged:
+        type: boolean
+        description: True when the pull request was squash-merged
+      merge_commit:
+        type: string
+        description: SHA of the squash-merge commit on the default branch
+      branch_deleted:
+        type: boolean
+        description: True when both the remote and local branch were deleted
+      worktree_removed:
+        type: boolean
+        description: True when the worktree was removed
+      issue_closed:
+        type: boolean
+        description: True when the linked issue was closed by the merge
+      cleanup_notes:
+        type: string
+        description: Anything left behind or needing manual attention. Empty when cleanup was complete.
+    routes:
+      - to: $end
+
+  - name: stopped
+    type: terminate
+    status: success
+    input:
+      - merge_gate.output?
+      - implementation_stalled.output?
+      - plan_approval.output?
+    reason: >-
+      Stopped at your request during
+      {%- if merge_gate is defined and merge_gate.output.selected == 'stop' %} the merge gate — the pull request is left open
+      {%- elif implementation_stalled is defined and implementation_stalled.output.selected == 'stop' %} the implementation checkpoint — changes are uncommitted in the worktree
+      {%- elif plan_approval is defined and plan_approval.output.selected == 'stop' %} plan approval — nothing was written to the repository
+      {%- else %} the open questions — nothing was written to the repository
+      {%- endif %}.
+
+output:
+  issue_number: "{{ issue_resolver.output.issue_number if issue_resolver is defined else 0 }}"
+  issue_url: "{{ issue_resolver.output.issue_url if issue_resolver is defined else '' }}"
+  worktree_path: "{{ worktree_verify.output.worktree_path if worktree_verify is defined else '' }}"
+  branch: "{{ worktree_verify.output.branch if worktree_verify is defined else '' }}"
+  plan: "{{ planner.output.plan if planner is defined else '' }}"
+  open_questions: "{{ planner.output.open_questions if planner is defined else [] }}"
+  open_questions_answered: "{{ ask_questions.output.answered_any if ask_questions is defined else false }}"
+  open_questions_answers: "{{ ask_questions.output.answers | tojson if ask_questions is defined else '{}' }}"
+  open_questions_transcript: "{{ ask_questions.output.transcript if ask_questions is defined else '' }}"
+  plan_approved: "{{ plan_approval.output.selected == 'approve' if plan_approval is defined else false }}"
+  implementation_complete: "{{ coder.output.complete if coder is defined else false }}"
+  implementation_rounds: "{{ coder.output.round if coder is defined else 0 }}"
+  files_changed: "{{ coder.output.files_changed if coder is defined else [] }}"
+  pr_url: "{{ ship_draft.output.pr_url if ship_draft is defined else '' }}"
+  pr_number: "{{ ship_draft.output.pr_number if ship_draft is defined else 0 }}"
+  review_blocking_found: "{{ review.output.blocking_found if review is defined else 0 }}"
+  review_summary: "{{ review.output.summary if review is defined else '' }}"
+  unresolved_findings: "{{ review.output.unresolved if review is defined else [] }}"
+  merged: "{{ merge.output.merged if merge is defined else false }}"
+  merge_commit: "{{ merge.output.merge_commit if merge is defined else '' }}"
+  worktree_removed: "{{ merge.output.worktree_removed if merge is defined else false }}"
+  cleanup_notes: "{{ merge.output.cleanup_notes if merge is defined else '' }}"
+  iterations: "{{ context.iteration }}"
