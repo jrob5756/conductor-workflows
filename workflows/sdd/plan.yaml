@@ -32,11 +32,17 @@
 #   conductor -V run workflows/sdd/plan.yaml --input purpose="..."
 #
 # Flow:
-#   architect → document_review (sub-workflow)
+#   architect
+#     → ask_questions         (when it has open questions and human input is allowed)
+#     → document_review       (otherwise)
+#   ask_questions (questions node — the whole set inside one step)
+#     → architect             (once the questions have been put to the human)
+#     → $end                  (abort)
+#   document_review (sub-workflow)
 #     → $end                  (when both reviews are approved)
 #     → fixer                 (when either review is not approved)
 #   fixer
-#     → review_escalation     (when the revision-round cap is reached)
+#     → review_escalation     (at the round cap with blocking issues still open)
 #     → architect             (when the feedback requires a fundamental rework)
 #     → document_review       (otherwise, after targeted revisions)
 #   review_escalation (human gate)
@@ -45,14 +51,17 @@
 #     → mark_accepted → $end  (accept the document as-is)
 #     → $end                  (stop)
 #
-# The document-review sub-workflow's technical reviewer can also pause and
-# escalate a genuine ambiguity to a human gate mid-review, when
-# allow_human_escalation is true (default). See workflows/document/review.yaml.
+# Review approval is gated on BLOCKING defects, not on hitting a score. The
+# thresholds are advisory anchors passed to the sub-workflow, and each
+# re-review is told which round it is and what was previously raised, so the
+# reviewers verify old defects were fixed rather than surfacing a fresh set of
+# nitpicks each pass. Without that, an LLM reviewer will always find something
+# and the fixer loop runs to the cap on every document.
 
 workflow:
   name: plan
-  description: Create a comprehensive solution design with implementation plan grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability, with a fixer agent applying targeted revisions between review rounds. Accepts an optional `design` input to produce only the implementation plan from an existing design document.
-  version: "2.4.0"
+  description: Create a comprehensive solution design with implementation plan grounded in the codebase, reviewed by the document-review sub-workflow for technical accuracy and readability, with a fixer agent applying targeted revisions between review rounds. Puts the architect's open questions to a human before review, and accepts an optional `design` input to produce only the implementation plan from an existing design document.
+  version: "3.0.0"
   entry_point: architect
 
   runtime:
@@ -98,17 +107,27 @@ workflow:
       required: false
       default: 3
       description: Max revision rounds without reviewer sign-off before escalating to a human gate instead of looping indefinitely
+    technical_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Advisory technical score (0-100) passed to the document-review sub-workflow. Review approval is gated on blocking defects, not this number.
+    readability_threshold:
+      type: number
+      required: false
+      default: 90
+      description: Advisory readability score (0-100) passed to the document-review sub-workflow. Review approval is gated on blocking defects, not this number.
     allow_human_escalation:
       type: boolean
       required: false
       default: true
-      description: Whether the document-review sub-workflow's technical reviewer may pause and escalate genuine ambiguities to a human gate, instead of guessing
+      description: Whether the workflow may pause to ask a human questions — the architect surfaces its open questions after drafting, and the document-review technical reviewer may ask about facts it cannot resolve on its own
 
   context:
     mode: explicit
 
   limits:
-    max_iterations: 50
+    max_iterations: 120
 
 agents:
   - name: architect
@@ -121,7 +140,9 @@ agents:
       - workflow.input.purpose
       - workflow.input.output_path?
       - workflow.input.design?
+      - workflow.input.allow_human_escalation?
       - architect.output?
+      - ask_questions.output?
       - document_review.output?
       - fixer.output?
     system_prompt: |
@@ -154,6 +175,44 @@ agents:
       {% endif %}
 
       **Purpose:** {{ workflow.input.purpose }}
+
+      {% if ask_questions is defined and ask_questions.output.answered_any %}
+      ## ANSWERS TO YOUR OPEN QUESTIONS
+
+      A human stakeholder went through your open questions one at a time.
+      Here is the transcript:
+
+      {{ ask_questions.output.transcript }}
+
+      **IMPORTANT:** You are revising the existing document at
+      `{{ architect.output.file_path }}`. Read it and update it in place — do
+      not create a new file or change the file name.
+
+      Apply these answers throughout:
+
+      1. **Replace assumptions with decisions.** Anywhere you hedged, guessed,
+         or wrote a placeholder because the answer was unknown, rewrite it as a
+         settled decision and propagate the consequences through the affected
+         epics, tasks, and file lists.
+      2. **Retire the questions that were answered.** Move each answered item
+         out of **Open Questions** and record the resolution where it belongs —
+         as a decision, constraint, or acceptance criterion. Do not leave an
+         answered question sitting in the Open Questions section.
+      3. **Keep the ones that were not answered.** A question missing from the
+         transcript above was skipped. Leave those under **Open Questions**
+         with your working assumption stated explicitly, so a reader knows what
+         was assumed rather than confirmed.
+      4. **Preserve everything else.** Do not rewrite sections the answers do
+         not touch.
+      {% elif ask_questions is defined %}
+      ## PROCEEDING WITHOUT ANSWERS
+
+      You raised open questions and the human skipped all of them. Make sure
+      every assumption behind those questions is written down explicitly in the
+      document — under **Open Questions** or alongside the decision it affects —
+      so a reader knows what was assumed rather than confirmed. Revise the
+      existing document at `{{ architect.output.file_path }}` in place.
+      {% endif %}
 
       {% if document_review is defined and document_review.output and document_review.output.technical_review_score and not document_review.output.technical_review_approved %}
       **Technical Review Feedback (Score: {{ document_review.output.technical_review_score }}/100):**
@@ -320,6 +379,39 @@ agents:
       {% if workflow.input.design %}In plan-only mode, surface any gaps,
       ambiguities, or inconsistencies in the source design that prevented
       confident planning.{% endif %}
+      {% if workflow.input.allow_human_escalation and ask_questions is not defined %}
+
+      **Each question will be put to a human individually, on its own screen,
+      before this plan is reviewed.** Return them in the `open_questions`
+      output field as objects — `{"question": "...", "choices": ["...", "..."]}`
+      — one self-contained question per entry. The reader sees only that entry,
+      so include the context needed to answer it and keep it to something
+      answerable in a sentence or two.
+
+      Give `choices` whenever the answer is a decision between options you can
+      name: 2-4 candidate answers, each phrased as the decision itself rather
+      than as "yes"/"no". Put the option you would take by default first and
+      mark it by ending its text with ` (Recommended)`, so the reader can see
+      your recommendation without reading your reasoning — at most one choice
+      per question carries that suffix, and you leave it off entirely when you
+      genuinely have no preference. A human picking a listed option is far
+      cheaper than typing prose, and they can still write their own answer
+      instead. Omit `choices` only for genuinely open-ended questions where you
+      cannot name the alternatives.
+
+      Raise a question when a human's answer would actually change the plan —
+      an unstated requirement or constraint, a business or product decision
+      that is not yours to make, a choice between viable approaches where the
+      trade-off depends on priorities you do not know, or missing context you
+      could not recover from the codebase or documentation.
+
+      Do not ask about anything you can determine yourself by reading the code
+      or searching documentation — investigate it instead. Do not pad the list;
+      if drafting genuinely raised nothing a human needs to settle, return an
+      empty `open_questions` list and say so in this section. Be honest either
+      way: unasked questions become silent assumptions, and padding the list
+      wastes a stakeholder's time.
+      {% endif %}
 
       ### Implementation Phases
       Break down the implementation into logical phases with exit criteria.
@@ -415,8 +507,33 @@ agents:
       revision_notes:
         type: string
         description: Summary of changes made in this revision (empty on first draft)
+      open_questions:
+        type: array
+        description: 'Questions a human stakeholder must answer, mirroring the document''s Open Questions section. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted only when the alternatives cannot be named. The default choice comes first and ends with " (Recommended)". Empty when drafting raised nothing that needs a human decision.'
     routes:
+      - to: ask_questions
+        when: "{{ workflow.input.allow_human_escalation and (output.open_questions | length) > 0 and ask_questions is not defined }}"
       - to: document_review
+
+  - name: ask_questions
+    type: questions
+    description: Puts every open question to the human inside a single step, so answers can be revised with Back and the whole set costs one iteration
+    source: architect.output.open_questions
+    prompt: |
+      The architect raised {{ architect.output.open_questions | length }} open
+      question{{ 's' if (architect.output.open_questions | length) != 1 else '' }}
+      while drafting `{{ architect.output.file_path }}`.
+
+      Answer what you can — anything left unanswered becomes a silent
+      assumption the plan proceeds on. You can go back and revise an earlier
+      answer at any point before finishing.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: $end
+    routes:
+      - to: architect
 
   - name: document_review
     description: Reviews the plan document for technical accuracy and readability via the document-review sub-workflow
@@ -424,13 +541,22 @@ agents:
     workflow: ../document/review.yaml
     input:
       - workflow.input.purpose
+      - workflow.input.technical_threshold?
+      - workflow.input.readability_threshold?
+      - workflow.input.allow_human_escalation?
       - architect.output.file_path
+      - fixer.output?
+      - document_review.output?
     input_mapping:
       document_path: "{{ architect.output.file_path }}"
       purpose: "{{ workflow.input.purpose }}"
-      technical_threshold: "90"
-      readability_threshold: "90"
+      technical_threshold: "{{ workflow.input.technical_threshold | default(90, true) }}"
+      readability_threshold: "{{ workflow.input.readability_threshold | default(90, true) }}"
       allow_human_escalation: "{{ workflow.input.allow_human_escalation }}"
+      # Round context so a re-review verifies the previously raised defects were
+      # fixed instead of re-scoring from scratch and inventing new findings.
+      review_round: "{{ (fixer.output.review_round + 1) if fixer is defined else 1 }}"
+      prior_blocking_issues: "{{ document_review.output.technical_review_blocking_issues if document_review is defined else [] }}"
     routes:
       - to: $end
         when: "{{ document_review.output.technical_review_approved and document_review.output.readability_review_approved }}"
@@ -486,14 +612,23 @@ agents:
 
       {{ document_review.output.technical_review_feedback }}
 
-      **Critical technical issues:**
-      {% for issue in document_review.output.technical_review_critical_issues %}
+      **Blocking technical issues — these gate approval and must all be resolved:**
+      {% for issue in document_review.output.technical_review_blocking_issues %}
       - {{ issue }}
       {% endfor %}
 
+      {% if document_review.output.technical_review_suggestions %}
+      **Non-blocking suggestions** — apply only the ones that are quick and
+      clearly improve the document. These do NOT gate approval; skipping them
+      is fine and they must not be recorded as unresolved issues.
+      {% for item in document_review.output.technical_review_suggestions %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
       The readability review did not run this round — the review sub-workflow
-      short-circuits when the technical score is below its threshold. Focus this
-      pass on technical accuracy and completeness.
+      short-circuits when the technical review is not approved. Focus this pass
+      on technical accuracy and completeness.
       {% else %}
       ### Technical review — {{ document_review.output.technical_review_score }}/100 (APPROVED)
 
@@ -503,11 +638,22 @@ agents:
 
       {{ document_review.output.readability_review_feedback }}
 
-      **Critical readability issues:**
-      {% for issue in document_review.output.readability_review_critical_issues %}
+      **Blocking readability issues — these gate approval and must all be resolved:**
+      {% for issue in document_review.output.readability_review_blocking_issues %}
       - {{ issue }}
       {% endfor %}
+
+      {% if document_review.output.readability_review_suggestions %}
+      **Non-blocking suggestions** — optional polish. These do NOT gate approval.
+      {% for item in document_review.output.readability_review_suggestions %}
+      - {{ item }}
+      {% endfor %}
       {% endif %}
+      {% endif %}
+
+      **Clearing every blocking issue is what ends this loop.** Resolve them
+      completely and precisely; do not spend the pass on suggestions at their
+      expense.
 
       ---
 
@@ -571,9 +717,11 @@ agents:
       **Otherwise:**
       {% endif %}
 
-      1. **Resolve every critical issue.** Work the critical issues list first,
-         then the narrative feedback. Anything you cannot resolve goes in
-         `unresolved_issues` with the reason — never silently skip it.
+      1. **Resolve every blocking issue.** Work the blocking list first, then
+         the narrative feedback. Anything you cannot resolve goes in
+         `unresolved_issues` with the reason — never silently skip it. Only
+         blocking issues belong in `unresolved_issues`; skipped suggestions do
+         not count as unresolved.
       2. **Verify before you write.** Read the referenced source files and search
          documentation to confirm the facts you are correcting. Every file path,
          task, and prerequisite you touch must hold up against the current code.
@@ -615,10 +763,12 @@ agents:
         description: Number of failed review rounds handled so far, including this one. 1 on the first run, previous round + 1 on every later run.
       all_issues_resolved:
         type: boolean
-        description: Whether every issue raised by the review was resolved
+        description: Whether every BLOCKING issue raised by the review was resolved this pass. Skipped non-blocking suggestions do not make this false.
     routes:
+      # Only pull in a human when the fixer could not clear the blocking issues,
+      # or as a hard backstop if the loop somehow keeps going past the cap.
       - to: review_escalation
-        when: "{{ output.review_round >= (workflow.input.max_review_rounds | default(3, true)) }}"
+        when: "{{ (output.review_round >= (workflow.input.max_review_rounds | default(3, true)) and not output.all_issues_resolved) or output.review_round >= ((workflow.input.max_review_rounds | default(3, true)) + 2) }}"
       - to: architect
         when: "{{ output.escalate_to_architect and output.escalation_count <= (workflow.input.max_architect_escalations | default(2, true)) }}"
       - to: document_review
@@ -631,7 +781,18 @@ agents:
       {{ fixer.output.review_round }} revision rounds without reviewer sign-off
       (limit: {{ workflow.input.max_review_rounds | default(3, true) }}).
 
-      **Latest scores:** technical {{ document_review.output.technical_review_score }}/100{% if document_review.output.technical_review_approved %}, readability {{ document_review.output.readability_review_score }}/100{% else %} (readability did not run — technical review short-circuited){% endif %}. Both thresholds are 90.
+      **Latest scores (advisory):** technical {{ document_review.output.technical_review_score }}/100{% if document_review.output.technical_review_approved %}, readability {{ document_review.output.readability_review_score }}/100{% else %} (readability did not run — the technical review short-circuited){% endif %}. Approval is gated on blocking defects, not on these numbers.
+
+      **Blocking issues still open:**
+      {% if document_review.output.technical_review_approved %}
+      {% for item in document_review.output.readability_review_blocking_issues %}
+      - {{ item }}
+      {% endfor %}
+      {% else %}
+      {% for item in document_review.output.technical_review_blocking_issues %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
 
       **Fixes applied in the latest round:**
       {% for item in fixer.output.issues_fixed %}
@@ -674,16 +835,21 @@ agents:
     routes:
       - to: $end
 
-# `fixer` and `mark_accepted` only run when a review round fails, so every
-# reference to them is guarded with `is defined` to keep the output valid on
-# the straight-through path.
+# `fixer` and `mark_accepted` only run when a review round fails, and
+# `document_review` is skipped entirely when a human aborts the
+# ask_questions step, so every reference to them is guarded with
+# `is defined` to keep the output valid on all paths.
 output:
   purpose: "{{ workflow.input.purpose }}"
   plan_file: "{{ architect.output.file_path }}"
-  technical_review_score: "{{ document_review.output.technical_review_score }}"
-  readability_review_score: "{{ document_review.output.readability_review_score }}"
-  technical_review_feedback: "{{ document_review.output.technical_review_feedback }}"
-  readability_review_feedback: "{{ document_review.output.readability_review_feedback }}"
+  technical_review_score: "{{ document_review.output.technical_review_score if document_review is defined else 0 }}"
+  readability_review_score: "{{ document_review.output.readability_review_score if document_review is defined else 0 }}"
+  technical_review_feedback: "{{ document_review.output.technical_review_feedback if document_review is defined else '' }}"
+  readability_review_feedback: "{{ document_review.output.readability_review_feedback if document_review is defined else '' }}"
+  open_questions: "{{ architect.output.open_questions }}"
+  open_questions_answered: "{{ ask_questions.output.answered_any if ask_questions is defined else false }}"
+  open_questions_answers: "{{ ask_questions.output.answers | tojson if ask_questions is defined else '{}' }}"
+  open_questions_transcript: "{{ ask_questions.output.transcript if ask_questions is defined else '' }}"
   revision_rounds: "{{ fixer.output.review_round if fixer is defined else 0 }}"
   unresolved_issues: "{{ fixer.output.unresolved_issues | join('; ') if fixer is defined else '' }}"
   human_accepted: "{{ mark_accepted.output.human_accepted if mark_accepted is defined else 'false' }}"
