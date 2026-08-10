@@ -23,3 +23,6 @@ workflows:
   sdd-implement:
     description: "Implement a feature based on an implementation plan document, with epic-level and plan-level review"
     path: workflows/sdd/implement.yaml
+  ship:
+    description: "Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a human question gate, implements on autopilot, opens a draft PR, runs a code review and reconciles the findings, then publishes and merges behind a human gate with full branch and worktree cleanup"
+    path: workflows/ship/workflow.yaml
