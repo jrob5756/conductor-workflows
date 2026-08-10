@@ -6,14 +6,25 @@
 #
 # Reviewers do NOT modify the document. They produce scores and feedback.
 #
+# Approval is gated on BLOCKING issues, not on the score. A reviewer approves
+# when nothing blocking remains and the score clears the (advisory) threshold,
+# OR when the document is merely imperfect rather than defective. This is what
+# keeps a caller's revise → re-review loop from running forever: an LLM
+# reviewer will almost always find *something* to say, so "no remaining
+# defects" is a reachable bar where "score >= 90" is not.
+#
+# Callers that loop should pass `review_round` and `prior_blocking_issues` so
+# a re-review verifies the previously raised defects were fixed instead of
+# re-scoring from scratch and surfacing a fresh crop of nitpicks.
+#
 # Flow:
 #   technical_reviewer
 #     → technical_escalation  (only if allow_human_escalation and the reviewer
 #                              flags a genuine ambiguity it cannot resolve)
-#     → readability_reviewer  (only if technical score >= technical_threshold)
+#     → readability_reviewer  (only if the technical review is approved)
 #     → $end                  (otherwise short-circuits and returns)
-#   technical_escalation (human gate)
-#     → technical_reviewer    (re-review, with human answers or a skip note)
+#   technical_escalation (questions node — the whole set inside one step)
+#     → technical_reviewer    (re-review, with the human's answers)
 #
 # Usage:
 #   conductor run document-review --input document_path="docs/my-design.md"
@@ -28,11 +39,16 @@
 #     --input document_path="docs/my-design.md" \
 #     --input technical_threshold=80 \
 #     --input readability_threshold=70
+#
+# Re-review after a revision pass (from a looping parent workflow):
+#   input_mapping:
+#     review_round: "{{ fixer.output.review_round }}"
+#     prior_blocking_issues: "{{ document_review.output.technical_review_blocking_issues }}"
 
 workflow:
   name: document-review
-  description: Review-only workflow that scores an existing markdown document on technical accuracy and readability, short-circuiting if the technical score is below the technical threshold, optionally letting the technical reviewer escalate genuine ambiguities to a human gate
-  version: "1.1.0"
+  description: Review-only workflow that scores an existing markdown document on technical accuracy and readability, gating approval on blocking defects rather than an absolute score so a caller's revise/re-review loop converges, short-circuiting when the technical review is not approved, and optionally letting the technical reviewer ask a human questions it cannot resolve on its own
+  version: "2.0.0"
   entry_point: technical_reviewer
 
   runtime:
@@ -68,17 +84,27 @@ workflow:
       type: number
       required: false
       default: 90
-      description: Minimum score (0-100) the technical review must reach for the readability review to run, and for the technical review to be considered approved
+      description: Advisory score (0-100) a technically sound document is expected to reach. Approval is gated on blocking issues, not this number; the score must simply stay consistent with the blocking list.
     readability_threshold:
       type: number
       required: false
       default: 90
-      description: Minimum score (0-100) the readability review must reach to be considered approved
+      description: Advisory score (0-100) a well-structured document is expected to reach. Approval is gated on blocking issues, not this number.
     allow_human_escalation:
       type: boolean
       required: false
       default: false
       description: Whether the technical reviewer may pause and escalate genuine ambiguities to a human via a gate, instead of guessing
+    review_round:
+      type: number
+      required: false
+      default: 1
+      description: Which review pass this is. 1 is the first review of a fresh document; 2+ means the document was revised in response to earlier feedback and should be re-reviewed against the issues previously raised rather than re-scored from scratch.
+    prior_blocking_issues:
+      type: array
+      required: false
+      default: []
+      description: Blocking issues raised by the previous technical review round. On round 2+ the reviewer verifies these were resolved instead of surfacing a fresh set of findings.
 
   context:
     mode: explicit
@@ -98,6 +124,8 @@ agents:
       - workflow.input.purpose?
       - workflow.input.technical_threshold
       - workflow.input.allow_human_escalation?
+      - workflow.input.review_round?
+      - workflow.input.prior_blocking_issues?
       - technical_reviewer.output?
       - technical_escalation.output?
     system_prompt: |
@@ -113,6 +141,12 @@ agents:
       - Soundness of any decisions, recommendations, or conclusions
       - Realistic assessment of risks, trade-offs, and alternatives
       - Whether assumptions are explicit and ambiguities are flagged
+
+      You review to a professional standard, not an ideal one. Your job is to
+      decide whether a document is *fit to act on*, not whether it is the best
+      document that could theoretically be written. You separate defects that
+      genuinely must be fixed from improvements that would merely be nice, and
+      you never hold a document back over the latter.
     prompt: |
       Review the document for **technical accuracy and completeness**.
 
@@ -132,9 +166,41 @@ agents:
       content and judge it on its own terms.
       {% endif %}
 
-      **Approval Threshold:** {{ workflow.input.technical_threshold }}/100
+      **Advisory score anchor:** {{ workflow.input.technical_threshold }}/100
 
       ---
+
+      {% if workflow.input.review_round and workflow.input.review_round > 1 %}
+      ## RE-REVIEW — Round {{ workflow.input.review_round }}
+
+      This document has already been reviewed and revised in response to that
+      feedback. **You are not reviewing it fresh.**
+
+      {% if workflow.input.prior_blocking_issues %}
+      The previous round raised these blocking issues:
+      {% for issue in workflow.input.prior_blocking_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% endif %}
+
+      Your job this round is narrow:
+
+      1. **Verify the issues above were actually resolved.** Check each one
+         against the current document. An issue that is genuinely fixed is
+         closed — do not re-open it because you would have fixed it differently.
+      2. **Only raise a NEW blocking issue if it is a real defect** — something
+         factually wrong, infeasible, or missing in a way that would cause the
+         reader to act incorrectly. A point you did not think to raise last
+         round is not automatically blocking now.
+      3. **Do not move the goalposts.** Polish, alternative phrasings, extra
+         detail you would have liked, and stylistic preferences are
+         `suggestions`, never `blocking_issues`. If the previous round's
+         defects are fixed and no genuine new defect exists, **approve the
+         document.**
+
+      A document that keeps failing review over a rotating cast of minor
+      observations is a review failure, not a document failure.
+      {% endif %}
 
       ## Fact-Checking
 
@@ -165,68 +231,137 @@ agents:
       | **Simplicity** | Is the proposed approach the minimum viable one? Flag unnecessary abstraction, configurability, or scope creep. |
       | **Assumption Transparency** | Are assumptions explicitly stated? Are ambiguities flagged with the chosen interpretation? |
 
+      ---
+
+      ## Blocking vs. Advisory
+
+      Sort every finding into exactly one of two buckets. This classification —
+      not the score — determines whether the document is approved.
+
+      **`blocking_issues`** — the document is *wrong or unusable* until this is
+      fixed. A finding is blocking only if you can say yes to one of these:
+      - A factual claim is incorrect and a reader acting on it would be misled
+      - The proposed approach is infeasible, or contradicts how the system works
+      - Something required for the document to serve its purpose is missing
+        entirely — not merely thinner than you would like
+      - A decision or conclusion does not follow from the evidence given
+
+      **`suggestions`** — everything else. Improvements, additional detail,
+      alternative approaches worth considering, hedges you would phrase
+      differently, sections you would have expanded. These are recorded and
+      returned, but they **do not** block approval and must never be recycled
+      into `blocking_issues` on a later round.
+
+      When you are unsure which bucket a finding belongs in, it is a
+      **suggestion**. Reserve `blocking_issues` for defects you would insist on
+      fixing before letting a colleague act on this document.
+
+      ## Scoring
+
+      The score is **advisory** and exists to communicate quality, not to gate
+      approval. Anchor it to this scale:
+
+      | Score | Meaning |
+      |-------|---------|
+      | 90-100 | Technically sound. No defects. Remaining notes are polish. |
+      | 75-89 | Usable, but has at least one genuine defect worth fixing first. |
+      | 50-74 | Materially flawed — several real errors or significant gaps. |
+      | 0-49 | Fundamentally wrong or unusable as-is. |
+
+      **The score and the blocking list must agree.** If you list no blocking
+      issues, the score belongs at {{ workflow.input.technical_threshold }} or
+      above. If you score below {{ workflow.input.technical_threshold }}, you
+      must be able to name the specific blocking defect that justifies it. Do
+      not score a defect-free document in the eighties because it could
+      hypothetically be better — that is precisely the failure this rubric
+      exists to prevent.
+
+      **`approved` is true when `blocking_issues` is empty.** Nothing else.
+
       {% if workflow.input.allow_human_escalation %}
       {% if technical_escalation is defined %}
       ## Human Escalation Follow-up
 
-      You previously escalated these questions to a human:
-      {% for q in technical_reviewer.output.escalation_questions %}
-      - {{ q }}
-      {% endfor %}
+      You escalated your unresolved questions to a human.
 
-      {% if technical_escalation.output.selected == 'answer' %}
-      The human answered:
-      {{ technical_escalation.output.additional_input.human_answers }}
+      {% if technical_escalation.output.answered_any %}
+      Their answers, question by question:
 
-      Use these answers to finalize your review now.
+      {{ technical_escalation.output.transcript }}
+
+      Use these answers to finalize your review now. Any question you asked
+      that is missing above was skipped — settle it with your own best
+      judgment and say what you assumed.
       {% else %}
       The human chose to skip answering. Finalize your review using your best
       judgment given the available information.
       {% endif %}
       Do not escalate again — provide a final score, approval, feedback, and
-      critical issues below.
+      issue lists below.
       {% else %}
       ## Escalating to a Human
 
-      If, and only if, you encounter a genuine ambiguity you cannot resolve
-      through fact-checking or codebase inspection — such as a policy
-      decision, business trade-off, or missing information only a human
-      stakeholder can supply — you may escalate instead of guessing. Set
-      `needs_human_escalation` to `true` and list the specific questions in
-      `escalation_questions`. Still provide your best-effort `score`,
-      `approved`, `feedback`, and `critical_issues` in case escalation is
-      skipped. Use this sparingly — most findings belong in
-      `critical_issues`, not an escalation.
+      A human stakeholder is available to answer questions during this review.
+
+      If the document's correctness turns on something you cannot settle by
+      reading the codebase or searching documentation — an undocumented
+      business rule, a policy or compliance constraint, a deliberate trade-off
+      only the owning team can confirm, or context that simply does not exist
+      in writing — **ask rather than assume.** Set `needs_human_escalation` to
+      `true` and put the specific questions in `escalation_questions`.
+
+      Ask when the answer would change your verdict. Do not ask about things
+      you can verify yourself, and do not ask for opinions on findings you have
+      already decided — those belong in `blocking_issues` or `suggestions`.
+
+      Return each entry as an object — `{"question": "...", "choices": ["...",
+      "..."]}` — phrased so it can be answered in a sentence or two. Give
+      `choices` whenever the answer is a decision between readings you can
+      name. Put the reading you would assume by default first and mark it by
+      ending its text with ` (Recommended)`, so the reader can see your
+      recommendation without reading your reasoning — at most one choice per
+      question carries that suffix, and you leave it off entirely when you
+      genuinely have no preference. A human picking a listed option is far
+      cheaper than typing prose, and they can still write their own answer
+      instead. Omit `choices` only when you cannot name the alternatives.
+
+      Still provide your best-effort `score`, `approved`, `feedback`,
+      `blocking_issues`, and `suggestions` alongside the questions, in case the
+      human chooses to skip answering.
       {% endif %}
       {% endif %}
 
       Provide:
-      1. A score from 0-100
-      2. Whether the technical content is approved (score >= {{ workflow.input.technical_threshold }})
-      3. Specific feedback on technical issues
-      4. List of critical technical issues that must be addressed
+      1. A score from 0-100, consistent with the blocking list per the scoring rubric
+      2. `approved` — true when `blocking_issues` is empty
+      3. Narrative feedback on the technical content
+      4. `blocking_issues` — defects that must be fixed before this document can be acted on
+      5. `suggestions` — non-blocking improvements, recorded but not gating
       {% if workflow.input.allow_human_escalation and technical_escalation is not defined %}
-      5. Whether you need to escalate a genuine ambiguity to a human, and if so, the specific questions
+      6. Whether you need a human to answer something, and if so, the specific questions
       {% endif %}
     output:
       score:
         type: number
-        description: Technical accuracy score from 0-100
+        description: Advisory technical accuracy score from 0-100, consistent with the blocking list
       approved:
         type: boolean
-        description: Whether the technical content meets the threshold
+        description: Whether the technical content is fit to act on. True exactly when blocking_issues is empty.
       feedback:
         type: string
-        description: Detailed feedback on technical issues
-      critical_issues:
+        description: Detailed narrative feedback on the technical content
+      blocking_issues:
         type: array
-        description: List of critical technical issues that must be addressed
+        description: Defects that must be fixed before the document can be acted on. Empty means approved.
+      suggestions:
+        type: array
+        description: Non-blocking improvements. Recorded for the author but never gate approval.
       needs_human_escalation:
         type: boolean
-        description: Whether the reviewer wants to escalate a genuine ambiguity to a human before finalizing
+        description: Whether the reviewer needs a human to answer a question before it can finalize its verdict
       escalation_questions:
         type: array
-        description: Specific questions for the human, populated only when needs_human_escalation is true
+        description: 'Specific questions for the human, populated only when needs_human_escalation is true. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted only when the alternatives cannot be named. The default choice comes first and ends with " (Recommended)".'
     routes:
       - to: technical_escalation
         when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and technical_escalation is not defined }}"
@@ -235,30 +370,25 @@ agents:
       - to: $end
 
   - name: technical_escalation
-    type: human_gate
-    description: Lets a human answer the technical reviewer's open questions, when human escalation is enabled and the reviewer flags a genuine ambiguity
+    type: questions
+    description: Puts the technical reviewer's unresolved questions to the human one at a time, recording a per-question answer the reviewer can act on rather than one free-text blob
+    source: technical_reviewer.output.escalation_questions
     prompt: |
       ## Technical Review Escalation
 
-      The technical reviewer has flagged questions it cannot resolve on its
-      own for `{{ workflow.input.document_path }}`:
+      The technical reviewer flagged questions it cannot resolve on its own for
+      `{{ workflow.input.document_path }}`.
 
-      {% for q in technical_reviewer.output.escalation_questions %}
-      - {{ q }}
-      {% endfor %}
-
-      **Reviewer's current best-effort assessment:** {{ technical_reviewer.output.score }}/100
+      **Its current best-effort assessment:** {{ technical_reviewer.output.score }}/100
       {{ technical_reviewer.output.feedback }}
 
-      How would you like to proceed?
-    options:
-      - label: Answer the questions
-        value: answer
-        route: technical_reviewer
-        prompt_for: human_answers
-      - label: Skip — let the reviewer finalize without answers
-        value: skip
-        route: technical_reviewer
+      Anything you skip, the reviewer will settle with its own best judgment.
+      You can go back and revise an earlier answer before finishing.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    routes:
+      - to: technical_reviewer
 
   - name: readability_reviewer
     description: Reviews the document for structure, clarity, and readability
@@ -270,6 +400,7 @@ agents:
       - workflow.input.document_path
       - workflow.input.purpose?
       - workflow.input.readability_threshold
+      - workflow.input.review_round?
       - technical_reviewer.output
     system_prompt: |
       You are a Senior Technical Writer and Document Reviewer. You evaluate
@@ -283,6 +414,12 @@ agents:
       - Appropriate detail level for the target audience
       - Effective use of tables, diagrams, lists, and section organization
       - Whether key ideas, decisions, and open questions are clearly framed
+
+      You review to a professional standard, not an ideal one. A document that
+      communicates clearly to its audience passes, even when you can imagine a
+      better-written version of it. You separate structural defects that
+      genuinely impede understanding from stylistic preferences, and you never
+      hold a document back over the latter.
     prompt: |
       Review the document for **structure, clarity, and readability**.
 
@@ -296,12 +433,22 @@ agents:
       {{ workflow.input.purpose }}
       {% endif %}
 
-      **Approval Threshold:** {{ workflow.input.readability_threshold }}/100
+      **Advisory score anchor:** {{ workflow.input.readability_threshold }}/100
 
       **Technical Review Status:** This document scored
       {{ technical_reviewer.output.score }}/100 on technical accuracy.
 
       ---
+
+      {% if workflow.input.review_round and workflow.input.review_round > 1 %}
+      ## RE-REVIEW — Round {{ workflow.input.review_round }}
+
+      This document has already been reviewed and revised. Judge whether it now
+      reads clearly — not whether it matches how you would have written it. If
+      the structure is sound and the prose is clear, **approve it.** Rewording
+      preferences and further polish are `suggestions`, never
+      `blocking_issues`.
+      {% endif %}
 
       ## Evaluation Criteria
 
@@ -320,24 +467,69 @@ agents:
       | **Conciseness** | Is the document free of redundancy, filler, and unnecessary verbosity? |
       | **Actionability** | After reading, would the intended audience know what to think, decide, or do? |
 
+      ---
+
+      ## Blocking vs. Advisory
+
+      Sort every finding into exactly one of two buckets. This classification —
+      not the score — determines whether the document is approved.
+
+      **`blocking_issues`** — a reader cannot reliably use the document as
+      written. A finding is blocking only if you can say yes to one of these:
+      - The organization actively misleads, or key information cannot be found
+      - A passage is ambiguous enough that readers would reach different conclusions
+      - Formatting is broken in a way that obscures meaning (malformed tables,
+        unreadable code blocks, broken structure)
+      - The document ends without the reader knowing what to think, decide, or do
+
+      **`suggestions`** — everything else. Tighter phrasing, reordering,
+      additional headings, tone, trimming, sections you would have expanded.
+      These are recorded and returned, but they **do not** block approval and
+      must never be recycled into `blocking_issues` on a later round.
+
+      When you are unsure which bucket a finding belongs in, it is a
+      **suggestion**.
+
+      ## Scoring
+
+      The score is **advisory** and exists to communicate quality, not to gate
+      approval. Anchor it to this scale:
+
+      | Score | Meaning |
+      |-------|---------|
+      | 90-100 | Clear and well-organized. Remaining notes are polish. |
+      | 75-89 | Readable, but at least one passage genuinely impedes understanding. |
+      | 50-74 | Hard to follow — structural problems throughout. |
+      | 0-49 | Unusable as written. |
+
+      **The score and the blocking list must agree.** No blocking issues means
+      the score belongs at {{ workflow.input.readability_threshold }} or above.
+      Scoring below it requires naming the specific blocking defect.
+
+      **`approved` is true when `blocking_issues` is empty.** Nothing else.
+
       Provide:
-      1. A score from 0-100
-      2. Whether the structure/readability is approved (score >= {{ workflow.input.readability_threshold }})
-      3. Specific feedback on structure and clarity issues
-      4. List of critical readability issues that must be addressed
+      1. A score from 0-100, consistent with the blocking list
+      2. `approved` — true when `blocking_issues` is empty
+      3. Narrative feedback on structure and clarity
+      4. `blocking_issues` — defects that genuinely impede understanding
+      5. `suggestions` — non-blocking improvements, recorded but not gating
     output:
       score:
         type: number
-        description: Structure and readability score from 0-100
+        description: Advisory structure and readability score from 0-100, consistent with the blocking list
       approved:
         type: boolean
-        description: Whether the document structure meets the threshold
+        description: Whether the document reads clearly enough to use. True exactly when blocking_issues is empty.
       feedback:
         type: string
-        description: Detailed feedback on structure and readability
-      critical_issues:
+        description: Detailed narrative feedback on structure and readability
+      blocking_issues:
         type: array
-        description: List of critical structure/readability issues that must be addressed
+        description: Structural or clarity defects that genuinely impede understanding. Empty means approved.
+      suggestions:
+        type: array
+        description: Non-blocking improvements. Recorded for the author but never gate approval.
     routes:
       - to: $end
 
@@ -345,10 +537,16 @@ output:
   document_path: "{{ workflow.input.document_path }}"
   technical_threshold: "{{ workflow.input.technical_threshold }}"
   readability_threshold: "{{ workflow.input.readability_threshold }}"
+  review_round: "{{ workflow.input.review_round }}"
   technical_review_score: "{{ technical_reviewer.output.score }}"
   technical_review_approved: "{{ technical_reviewer.output.approved }}"
   technical_review_feedback: "{{ technical_reviewer.output.feedback }}"
-  technical_review_critical_issues: "{{ technical_reviewer.output.critical_issues }}"
+  # `*_critical_issues` is retained as an alias for the blocking list so
+  # external consumers of this published workflow keep working. Callers in this
+  # repo use `*_blocking_issues`; prefer that name for anything new.
+  technical_review_critical_issues: "{{ technical_reviewer.output.blocking_issues }}"
+  technical_review_blocking_issues: "{{ technical_reviewer.output.blocking_issues }}"
+  technical_review_suggestions: "{{ technical_reviewer.output.suggestions }}"
   technical_review_escalated: "{{ technical_escalation is defined }}"
   # Each readability output is a single bare {{ ... }} ternary so Conductor
   # preserves the native type (number/bool/string/list) when the readability
@@ -358,4 +556,6 @@ output:
   readability_review_score: "{{ readability_reviewer.output.score if readability_reviewer is defined else 0 }}"
   readability_review_approved: "{{ readability_reviewer.output.approved if readability_reviewer is defined else false }}"
   readability_review_feedback: "{{ readability_reviewer.output.feedback if readability_reviewer is defined else '' }}"
-  readability_review_critical_issues: "{{ readability_reviewer.output.critical_issues if readability_reviewer is defined else [] }}"
+  readability_review_critical_issues: "{{ readability_reviewer.output.blocking_issues if readability_reviewer is defined else [] }}"
+  readability_review_blocking_issues: "{{ readability_reviewer.output.blocking_issues if readability_reviewer is defined else [] }}"
+  readability_review_suggestions: "{{ readability_reviewer.output.suggestions if readability_reviewer is defined else [] }}"
