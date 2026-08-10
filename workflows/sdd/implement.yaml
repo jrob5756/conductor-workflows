@@ -30,8 +30,12 @@
 # Human escalation:
 #   Either reviewer may put questions to a human whenever its verdict turns on
 #   something the code and the plan cannot settle, on any round. The human can
-#   skip any question or abort the run from the question gate. Disable entirely
-#   with --input allow_human_escalation=false.
+#   skip any question or abort the run from the question gate. This is the only
+#   point at which the workflow asks for human input — there is no round-cap
+#   gate. An epic that exhausts max_epic_review_rounds is committed as-is with
+#   its unresolved issues flagged in the plan, and the final plan_reviewer pass
+#   is told to give it extra scrutiny. Disable questions entirely with
+#   --input allow_human_escalation=false for a fully unattended run.
 #
 # Usage:
 #   conductor run examples/implement.yaml --input plan="Path to implementation plan document"
@@ -88,7 +92,7 @@ workflow:
     max_epic_review_rounds:
       type: number
       default: 4
-      description: Max coder<->epic_reviewer rounds for a single epic before escalating to a human gate instead of looping indefinitely
+      description: Max epic_fixer<->epic_reviewer rounds for a single epic. At the cap the epic is committed as-is with its unresolved issues flagged in the plan for the final plan_reviewer pass, rather than looping indefinitely.
     allow_human_escalation:
       type: boolean
       required: false
@@ -672,7 +676,7 @@ agents:
         when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and (output.escalation_questions | length) > 0 }}"
       - to: committer
         when: "{{ (output.blocking_issues | length) == 0 }}"
-      - to: epic_review_escalation
+      - to: mark_round_cap_reached
         when: "{{ output.review_round >= workflow.input.max_epic_review_rounds }}"
       - to: epic_fixer
 
@@ -815,45 +819,12 @@ agents:
     routes:
       - to: epic_reviewer
 
-  - name: epic_review_escalation
-    type: human_gate
-    description: Escalate when an epic hasn't converged after several coder<->epic_reviewer rounds
-    prompt: |
-      **Epic {{ coder.output.current_epic }}** has been through
-      {{ epic_reviewer.output.review_round }} review rounds without approval
-      (limit: {{ workflow.input.max_epic_review_rounds }}).
-
-      **Latest reviewer feedback:**
-      {{ epic_reviewer.output.feedback }}
-
-      **Outstanding blocking issues:**
-      {% for issue in epic_reviewer.output.blocking_issues %}
-      - {{ issue }}
-      {% endfor %}
-
-      **Strengths noted:**
-      {% for strength in epic_reviewer.output.strengths %}
-      - {{ strength }}
-      {% endfor %}
-
-      How would you like to proceed?
-    options:
-      - label: Continue fixing (one more round)
-        value: continue
-        route: epic_fixer
-      - label: Force-approve and flag for plan review
-        value: force_approve
-        route: mark_force_approved
-      - label: Stop the workflow here
-        value: stop
-        route: $end
-
-  - name: mark_force_approved
+  - name: mark_round_cap_reached
     type: set
-    description: Record that this epic was force-approved past the review-round cap, so the committer can flag it for plan_reviewer
+    description: Record that this epic exhausted its review rounds without sign-off, so the committer flags it and the final plan_reviewer gives it extra scrutiny
     values:
-      force_approved_epic: "{{ coder.output.current_epic }}"
-      force_approved_note: "Force-approved after {{ epic_reviewer.output.review_round }} review rounds without reviewer sign-off. Outstanding: {{ epic_reviewer.output.blocking_issues | join('; ') }}"
+      capped_epic: "{{ coder.output.current_epic }}"
+      capped_note: "Accepted after {{ epic_reviewer.output.review_round }} review rounds without reviewer sign-off (cap: {{ workflow.input.max_epic_review_rounds }}). Unresolved: {{ epic_reviewer.output.blocking_issues | join('; ') }}"
     routes:
       - to: committer
 
@@ -880,11 +851,11 @@ agents:
       {% set impl = epic_fixer.output if fixed else coder.output %}
       **Epic:** {{ coder.output.current_epic }}
 
-      {% if mark_force_approved is defined and mark_force_approved.output.force_approved_epic == coder.output.current_epic %}
-      **IMPORTANT:** This epic was force-approved by a human operator after
-      hitting the review-round cap — the automated epic_reviewer had NOT
-      approved it. When updating the plan document, add a note under this
-      epic's status: "⚠️ {{ mark_force_approved.output.force_approved_note }}"
+      {% if mark_round_cap_reached is defined and mark_round_cap_reached.output.capped_epic == coder.output.current_epic %}
+      **IMPORTANT:** This epic exhausted its review rounds without sign-off —
+      the epic_reviewer had NOT approved it, and it is being committed anyway
+      so the run can make progress. When updating the plan document, add a note
+      under this epic's status: "⚠️ {{ mark_round_cap_reached.output.capped_note }}"
       so the final plan_reviewer pass is aware this epic needs extra scrutiny.
       {% endif %}
 
@@ -1398,7 +1369,7 @@ output:
   last_commit: "{{ committer.output.commit_message if committer is defined else '' }}"
   epic_review_decision: "{{ epic_reviewer.output.decision if epic_reviewer is defined else '' }}"
   epic_review_rounds: "{{ epic_reviewer.output.review_round if epic_reviewer is defined else 0 }}"
-  force_approved_epic: "{{ mark_force_approved.output.force_approved_epic if mark_force_approved is defined else '' }}"
+  capped_epic: "{{ mark_round_cap_reached.output.capped_epic if mark_round_cap_reached is defined else '' }}"
   plan_review_decision: "{{ plan_reviewer.output.decision if plan_reviewer is defined else '' }}"
   plan_review_suggestions: "{{ plan_reviewer.output.suggestions | json if plan_reviewer is defined else '[]' }}"
   human_questions_answered: "{{ (epic_reviewer_questions is defined and epic_reviewer_questions.output.answered_any) or (plan_reviewer_questions is defined and plan_reviewer_questions.output.answered_any) }}"
