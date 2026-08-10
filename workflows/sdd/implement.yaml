@@ -2,24 +2,46 @@
 #
 # This example demonstrates an implementation workflow that mirrors
 # the /implement command pattern. It shows:
-# - Epic selector agent (Sonnet) for identifying the next epic to implement
-# - Coder agent (Opus) for deep research, analysis, and implementation
-# - Epic reviewer agent (Sonnet) for per-epic quality assessment
-# - Committer agent (Sonnet) for git commits and plan updates
-# - Plan reviewer agent (Opus) for holistic review of all changes
-# - Fixer agent (Sonnet) for addressing plan-level issues
+# - Epic selector agent for identifying the next epic to implement
+# - Coder agent for deep research, analysis, and first-pass implementation
+# - Epic reviewer agent for per-epic quality assessment
+# - Epic fixer agent for narrow, fix-only revision rounds
+# - Committer agent for git commits and plan updates
+# - Plan reviewer agent for holistic review of all changes
+# - Fixer agent for addressing plan-level issues
 #
 # Architecture Decision:
 # - Epic selector enforces one-epic-at-a-time execution
-# - Opus excels at deep reasoning, codebase analysis, and implementation
-# - Sonnet excels at focused review, selection, and documentation tasks
+# - The coder implements an epic once; the epic_fixer owns every revision
+#   round, so a re-review never re-runs codebase research or re-writes passing
+#   tests — the two failure modes that grow a diff and re-trigger scope-creep
+#   findings
 # - Two-tier review: epic-level (fast) and plan-level (thorough)
+#
+# Review convergence:
+#   Reviewers read the actual working-tree diff, not the implementer's summary
+#   of it, and approval is gated on BLOCKING defects rather than on an ideal
+#   standard. An LLM reviewer will always find *something* to say, so "no
+#   remaining defects" is a reachable bar where "nothing left to improve" is
+#   not. Re-reviews verify the previous round's blocking issues were fixed
+#   instead of re-scoring from scratch, which is what stops every epic from
+#   grinding through the round cap into a human gate.
+#
+# Human escalation:
+#   Either reviewer may put questions to a human whenever its verdict turns on
+#   something the code and the plan cannot settle, on any round. The human can
+#   skip any question or abort the run from the question gate. Disable entirely
+#   with --input allow_human_escalation=false.
 #
 # Usage:
 #   conductor run examples/implement.yaml --input plan="Path to implementation plan document"
 #
 # With specific epic:
 #   conductor run examples/implement.yaml --input plan="..." --input epic="EPIC-001"
+#
+# Fully unattended (no question gates):
+#   conductor run examples/implement.yaml --input plan="..." \
+#     --input allow_human_escalation=false
 #
 # With verbose output:
 #   conductor -V run examples/implement.yaml --input plan="..."
@@ -67,6 +89,11 @@ workflow:
       type: number
       default: 4
       description: Max coder<->epic_reviewer rounds for a single epic before escalating to a human gate instead of looping indefinitely
+    allow_human_escalation:
+      type: boolean
+      required: false
+      default: true
+      description: Whether a reviewer may pause the workflow to ask a human questions it cannot resolve from the code or the plan. Reviewers may ask on any round; set false for a fully unattended run.
 
   context:
     mode: accumulate
@@ -200,7 +227,6 @@ agents:
     input:
       - workflow.input.plan
       - epic_selector.output
-      - epic_reviewer.output?
     system_prompt: |
       You are a Senior Software Engineer agent. Your task is to implement code changes
       for ONE specific epic that has been assigned to you.
@@ -247,16 +273,6 @@ agents:
         overly conservative, proceed with the epic.
       {% endif %}
 
-      {% if epic_reviewer is defined and epic_reviewer.output and epic_reviewer.output.decision == "REQUEST_CHANGES" %}
-      **Previous Implementation Failed Review - Fix These Issues:**
-      {{ epic_reviewer.output.feedback }}
-
-      **Specific Issues to Address:**
-      {% for issue in epic_reviewer.output.issues %}
-      - {{ issue }}
-      {% endfor %}
-      {% endif %}
-
       ## IMPLEMENTATION TASKS
 
       You are implementing ONLY: **{{ epic_selector.output.current_epic }}**
@@ -292,6 +308,10 @@ agents:
       5. **Verify All Tests Pass**
          - Run the full test suite to confirm no regressions
          - Ensure your new tests all pass
+         - Record the exact commands you ran and their outcome in
+           `verification_evidence`, and set `tests_pass` honestly. The reviewer
+           treats a failing or unrun suite as a blocking defect, so do not
+           claim a green run you did not perform.
 
       6. **Document Your Changes**
          - Add inline comments only where the logic is not self-evident
@@ -320,6 +340,12 @@ agents:
       implementation_notes:
         type: string
         description: Notes about the implementation, decisions made, and any concerns
+      tests_pass:
+        type: boolean
+        description: Whether the full test suite was actually run and passed. Report honestly — false (with the reason in verification_evidence) is a valid answer, a false green is a blocking defect.
+      verification_evidence:
+        type: array
+        description: The exact build, lint and test commands run to verify this epic, each with its outcome (e.g. "pytest -q — 148 passed, 0 failed"). This is the evidence the reviewer checks the work against.
     routes:
       - to: epic_reviewer
 
@@ -330,16 +356,32 @@ agents:
     reasoning:
       effort: xhigh
     input:
+      - workflow.input.plan
+      - workflow.input.max_epic_review_rounds
+      - workflow.input.allow_human_escalation?
       - coder.output
+      - epic_fixer.output?
+      - epic_reviewer.output?
+      - epic_reviewer_questions.output?
     system_prompt: |
       You are a Code Review agent. You conduct thorough reviews of code changes
       to ensure quality, correctness, and adherence to best practices.
 
       You are critical but constructive, providing specific, actionable feedback
       that helps improve the code.
+
+      You review to a professional standard, not an ideal one. Your job is to
+      decide whether this epic is fit to commit — not whether it is the best
+      code that could conceivably be written. An implementation that correctly
+      and safely delivers its epic passes, even when you can imagine a version
+      you would have liked better.
     prompt: |
       Review the implementation changes for the following epic.
 
+      {% set fixed = epic_fixer is defined and epic_fixer.output and epic_fixer.output.current_epic == coder.output.current_epic %}
+      {% set impl = epic_fixer.output if fixed else coder.output %}
+      {% set from_fixer = context.history and context.history[-1] == 'epic_fixer' %}
+      {% set from_questions = context.history and context.history[-1] == 'epic_reviewer_questions' %}
       **Epic:** {{ coder.output.current_epic }}
 
       **Your Previous Review (if any, for round-tracking):**
@@ -350,37 +392,123 @@ agents:
       (This is the first review in this workflow run — start at round 1.)
       {% endif %}
 
-      If the epic above differs from "Epic reviewed" here, this is a NEW
-      epic: set `review_round` to 1. Otherwise you are reviewing the SAME
-      epic again after requesting changes: set `review_round` to the
-      previous round + 1. Always set `epic_reviewed` to the current epic
-      identifier so the next round can detect epic changes correctly.
+      If the epic above differs from "Epic reviewed" here, this is a NEW epic:
+      set `review_round` to 1.
+      {% if from_questions %}
+      You are resuming after a human answered your questions — no new code was
+      written, so this is **not** a new round. Keep `review_round` at
+      {{ epic_reviewer.output.review_round | default(1) }}.
+      {% elif from_fixer %}
+      The epic_fixer has revised the code since your last review, so this IS a
+      new round: set `review_round` to
+      {{ (epic_reviewer.output.review_round | default(0)) + 1 }}.
+      {% endif %}
+      Always set `epic_reviewed` to the current epic identifier so the next
+      round can detect epic changes correctly.
 
       **Epic Details:**
       {{ coder.output.epic_details }}
 
+      {% if fixed %}
+      The `epic_fixer` has since revised this epic in response to your last
+      review. The report below is the fixer's account of the current state.
+      {% endif %}
+
       **Changes Made:**
-      {% for change in coder.output.changes_made %}
+      {% for change in impl.changes_made %}
       - {{ change }}
       {% endfor %}
 
       **Files Modified:**
-      {% for file in coder.output.files_modified %}
+      {% for file in impl.files_modified %}
       - {{ file }}
       {% endfor %}
 
       **Tests Added:**
-      {% for test in coder.output.tests_added %}
+      {% for test in impl.tests_added %}
       - {{ test }}
       {% endfor %}
 
       **Edge Cases Handled:**
-      {% for edge_case in coder.output.edge_cases_handled %}
+      {% for edge_case in impl.edge_cases_handled %}
       - {{ edge_case }}
       {% endfor %}
 
+      **Verification the implementer reports running:**
+      Test suite passed: {{ impl.tests_pass | default('(not reported)') }}
+      {% for evidence in impl.verification_evidence | default([]) %}
+      - {{ evidence }}
+      {% endfor %}
+
       **Implementation Notes:**
-      {{ coder.output.implementation_notes }}
+      {{ impl.implementation_notes }}
+
+      ---
+
+      ## READ THE ACTUAL CODE FIRST
+
+      Everything above is the implementer's own account of its work. **It is a
+      claim, not evidence.** The epic has not been committed yet, so the changes
+      are sitting in the working tree and you can read them directly:
+
+      ```
+      git status --short          # every changed and untracked path
+      git diff HEAD               # the actual line-level changes
+      ```
+
+      Read new (untracked) files directly — they will not appear in the diff.
+      Review the diff, not the summary. A finding you cannot point to a
+      specific file and line for is not a finding.
+
+      Note that the implementer is *instructed* to update this epic's status
+      markers in the plan document (`{{ workflow.input.plan }}`). Those edits
+      are in scope by design — never flag them as scope creep.
+
+      {% if from_fixer %}
+      ## RE-REVIEW — Round {{ (epic_reviewer.output.review_round | default(0)) + 1 }} of at most {{ workflow.input.max_epic_review_rounds }}
+
+      You already reviewed this epic and the `epic_fixer` has revised it in
+      response to your feedback. **You are not reviewing it fresh.**
+
+      {% if epic_fixer.output.fixes_applied %}
+      What the fixer reports changing:
+      {% for fix in epic_fixer.output.fixes_applied %}
+      - {{ fix }}
+      {% endfor %}
+      {% endif %}
+
+      {% if epic_reviewer.output.blocking_issues %}
+      You raised these blocking issues last round:
+      {% for issue in epic_reviewer.output.blocking_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% endif %}
+
+      {% if epic_reviewer.output.suggestions %}
+      And these were your NON-blocking suggestions last round. They did not
+      block approval then and they cannot block it now, whether or not the
+      fixer adopted them:
+      {% for suggestion in epic_reviewer.output.suggestions %}
+      - {{ suggestion }}
+      {% endfor %}
+      {% endif %}
+
+      Your job this round is narrow:
+
+      1. **Verify the issues above were actually resolved.** Check each one
+         against the current diff. An issue that is genuinely fixed is closed —
+         do not re-open it because you would have fixed it differently.
+      2. **Only raise a NEW blocking issue if it is a real defect** — something
+         broken, unsafe, or missing that would ship a bug. A point you did not
+         think to raise last round is not automatically blocking now.
+      3. **Do not move the goalposts.** Polish, alternative structures, extra
+         test cases you would have liked, naming preferences, and additional
+         hardening are `suggestions`, never `blocking_issues`. If last round's
+         defects are fixed and no genuine new defect exists, **APPROVE.**
+
+      An epic that keeps failing review over a rotating cast of minor
+      observations is a review failure, not an implementation failure.
+      {% endif %}
 
       ## REVIEW TASKS
 
@@ -390,11 +518,11 @@ agents:
          - Ensure no requirements were missed
 
       2. **Scope Containment**
-         - Verify every changed line traces to a specific task in THIS epic
-         - Flag any modified files NOT specified in the epic details
+         - Verify every changed line in the diff traces to a specific task in THIS epic
+         - Flag any modified files NOT specified in the epic details (excluding
+           the plan document's own status updates)
          - Flag any drive-by changes: formatting, style adjustments, comment rewrites, or refactoring outside the epic's scope
          - Flag unnecessary abstractions, configurability, or flexibility not in the plan
-         - The test: every changed line should trace directly to an ITEM in this epic
 
       3. **Code Quality**
          - Check for bugs, errors, or logical issues
@@ -402,33 +530,128 @@ agents:
          - Ensure code is clean and well-documented
          - Confirm code follows existing patterns and conventions
 
-      4. **Test-First Verification**
-         - Verify tests exist for the new functionality
-         - Check that tests were written to define behavior (not just retroactively validate it)
-         - Check that tests cover edge cases and error conditions
+      4. **Test Verification**
+         - Verify tests exist in the diff for the new functionality
+         - Check that tests cover the epic's edge cases and error conditions
+         - Confirm the suite actually passes. If the implementer did not report
+           a green run, run it yourself before deciding.
 
-      Provide your decision: APPROVE or REQUEST_CHANGES.
+      ---
+
+      ## Blocking vs. Advisory
+
+      Sort every finding into exactly one of two buckets. This classification —
+      nothing else — determines your decision.
+
+      **`blocking_issues`** — the epic is *wrong or unsafe to commit* until this
+      is fixed. A finding is blocking only if you can say yes to one of these:
+      - It is a defect: the code is incorrect, crashes, or does the wrong thing
+      - A requirement or acceptance criterion of THIS epic is not met
+      - Tests for the epic's behavior are absent, or the suite does not pass
+      - The change is unsafe: a security hole, data loss, or a silent failure
+      - It is real scope creep: changed lines that trace to no task in this epic
+
+      **`suggestions`** — everything else. Refactors you would prefer, extra
+      test cases, naming, comments, defensive hardening, structure you would
+      have chosen differently. These are recorded and passed to the coder, but
+      they **do not** block approval and must never be recycled into
+      `blocking_issues` on a later round.
+
+      When you are unsure which bucket a finding belongs in, it is a
+      **suggestion**. Reserve `blocking_issues` for things you would insist on
+      fixing before letting this land in the repository.
+
+      ## Your Decision
+
+      **`decision` is "APPROVE" when `blocking_issues` is empty, and
+      "REQUEST_CHANGES" when it is not. Nothing else.**
+
+      The two must agree: do not request changes while listing no blocking
+      issue, and do not approve while listing one. **Routing follows
+      `blocking_issues`, not the string** — an empty blocking list commits the
+      epic no matter what you put in `decision`, so never park a real defect in
+      `suggestions` expecting "REQUEST_CHANGES" to hold it back. Do not
+      withhold approval because the implementation could hypothetically be
+      better — a defect-free epic with a long `suggestions` list is an APPROVE.
 
       The `decision` output field MUST be a single plain string — either the
       literal string "APPROVE" or the literal string "REQUEST_CHANGES". Do
       NOT return an object, nested fields, or any other structure for this
       field.
 
-      If REQUEST_CHANGES, provide specific, actionable feedback.
-      If changes include scope creep (untraced modifications), this alone is grounds for REQUEST_CHANGES.
+      {% if workflow.input.allow_human_escalation %}
+      {% if from_questions %}
+      ## Human Escalation Follow-up
+
+      You escalated your unresolved questions to a human.
+
+      {% if epic_reviewer_questions.output.answered_any %}
+      Their answers, question by question:
+
+      {{ epic_reviewer_questions.output.transcript }}
+
+      Use these answers to finalize your review now. Any question you asked
+      that is missing above was skipped — settle it with your own best
+      judgment and say what you assumed.
+      {% else %}
+      The human chose to skip answering. Finalize your review using your best
+      judgment given the available information.
+      {% endif %}
+      Give your decision for this round now. You may escalate again later if a
+      genuinely new ambiguity appears, but do not re-ask something the human
+      has already answered or deliberately skipped — a skipped question is an
+      answer: it means "use your own judgment."
+      {% else %}
+      ## Escalating to a Human
+
+      A human is available to answer questions during this review.
+
+      If your verdict turns on something you cannot settle by reading the diff,
+      the plan, or the codebase — an unstated requirement, a product decision
+      the plan does not record, a deliberate trade-off only the owner can
+      confirm, or an ambiguity in the epic's acceptance criteria — **ask rather
+      than assume.** Set `needs_human_escalation` to `true` and put the specific
+      questions in `escalation_questions`.
+
+      Ask only when the answer would change your decision. Do not ask about
+      anything you can verify yourself from the code, and do not ask for an
+      opinion on a finding you have already made — that belongs in
+      `blocking_issues` or `suggestions`. "Is this good enough?" is not a
+      question for a human; it is your job.
+
+      Return each entry as an object — `{"question": "...", "choices": ["...",
+      "..."]}` — self-contained, since the reader sees it alone with no other
+      context, and answerable in a sentence or two. Give `choices` whenever the
+      answer is a decision between readings you can name. Put the reading you
+      would assume by default first and mark it by ending its text with
+      ` (Recommended)`, so the reader can see your recommendation without
+      reading your reasoning — at most one choice per question carries that
+      suffix, and you leave it off entirely when you genuinely have no
+      preference. A human picking a listed option is far cheaper than typing
+      prose, and they can still write their own answer instead. Omit `choices`
+      only when you cannot name the alternatives.
+
+      Still give your best-effort decision, feedback, and issue lists alongside
+      the questions, in case the human skips answering.
+      {% endif %}
+      {% endif %}
     output:
       decision:
         type: string
         description: |
           Review decision — a single plain string with one of two exact values:
-          "APPROVE" or "REQUEST_CHANGES". Do NOT return an object or nested
+          "APPROVE" or "REQUEST_CHANGES". Must be "APPROVE" exactly when
+          blocking_issues is empty. Do NOT return an object or nested
           fields — just one string.
       feedback:
         type: string
         description: Detailed feedback on the implementation
-      issues:
+      blocking_issues:
         type: array
-        description: List of specific issues that need to be addressed
+        description: Defects that make the epic wrong or unsafe to commit. Empty means APPROVE. Never includes polish, preference, or optional hardening.
+      suggestions:
+        type: array
+        description: Non-blocking improvements. Passed to the epic_fixer for consideration but never gate approval, and never promoted to blocking on a later round.
       strengths:
         type: array
         description: List of things done well in the implementation
@@ -438,12 +661,159 @@ agents:
       review_round:
         type: number
         description: This epic's review round number. 1 for a fresh epic; previous round + 1 when re-reviewing the SAME epic after REQUEST_CHANGES; resets to 1 whenever the epic changes.
+      needs_human_escalation:
+        type: boolean
+        description: Whether you need a human to answer something before you can finalize this epic's verdict. False unless a human's answer would actually change your decision.
+      escalation_questions:
+        type: array
+        description: 'Questions for the human, populated only when needs_human_escalation is true. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted only when the alternatives cannot be named. The default choice comes first and ends with " (Recommended)".'
     routes:
+      - to: epic_reviewer_questions
+        when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and (output.escalation_questions | length) > 0 }}"
       - to: committer
-        when: "{{ output.decision == 'APPROVE' }}"
+        when: "{{ (output.blocking_issues | length) == 0 }}"
       - to: epic_review_escalation
-        when: "{{ output.decision == 'REQUEST_CHANGES' and output.review_round >= workflow.input.max_epic_review_rounds }}"
-      - to: coder
+        when: "{{ output.review_round >= workflow.input.max_epic_review_rounds }}"
+      - to: epic_fixer
+
+  - name: epic_reviewer_questions
+    type: questions
+    description: Puts the epic reviewer's unresolved questions to the human inside a single step, so answers can be revised with Back and the whole set costs one iteration
+    source: epic_reviewer.output.escalation_questions
+    prompt: |
+      ## Epic review — {{ coder.output.current_epic }}
+
+      The epic reviewer flagged
+      {{ epic_reviewer.output.escalation_questions | length }}
+      question{{ 's' if (epic_reviewer.output.escalation_questions | length) != 1 else '' }}
+      it cannot resolve from the code or the plan. Nothing has been committed
+      yet.
+
+      **Its current best-effort verdict:** {{ epic_reviewer.output.decision }}
+
+      Answer what you can — anything left unanswered is settled by the
+      reviewer's own judgment. You can go back and revise an earlier answer at
+      any point before finishing.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: $end
+    routes:
+      - to: epic_reviewer
+
+  - name: epic_fixer
+    description: Resolves the epic reviewer's blocking issues with a narrow, fix-only pass instead of re-running the full implementation
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: medium
+    input:
+      - workflow.input.plan
+      - epic_selector.output
+      - coder.output
+      - epic_reviewer.output
+    system_prompt: |
+      You are a Senior Software Engineer agent specializing in resolving code
+      review feedback on a single epic.
+
+      You make targeted, minimal fixes. You do not re-implement work that
+      already passes, you do not refactor code the reviewer did not flag, and
+      you do not improve things nobody asked you to improve. The smallest
+      correct change that clears the review is the right change.
+    prompt: |
+      The epic reviewer found blocking defects in this epic's implementation.
+      Fix them.
+
+      **Epic:** {{ coder.output.current_epic }}
+
+      **Epic Details:**
+      {{ coder.output.epic_details }}
+
+      **Review round:** {{ epic_reviewer.output.review_round }} of at most
+      {{ workflow.input.max_epic_review_rounds }}
+
+      **Reviewer feedback:**
+      {{ epic_reviewer.output.feedback }}
+
+      **Blocking issues you must resolve:**
+      {% for issue in epic_reviewer.output.blocking_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      {% if epic_reviewer.output.suggestions %}
+      **Non-blocking suggestions** — these did NOT block approval. Adopt one
+      only if it is trivially safe and clearly correct; skipping all of them is
+      the right default. Do not let them expand the diff.
+      {% for suggestion in epic_reviewer.output.suggestions %}
+      - {{ suggestion }}
+      {% endfor %}
+      {% endif %}
+
+      ## FIX TASKS
+
+      1. **Read the current diff.** The epic is not committed yet, so the work
+         is in the working tree:
+
+         ```
+         git status --short          # every changed and untracked path
+         git diff HEAD               # the actual line-level changes
+         ```
+
+         Fix what is actually there, not what the reports above describe.
+
+      2. **Resolve each blocking issue, and only those.** For every issue,
+         make the smallest change that resolves it. Do not redo the codebase
+         research the coder already did, do not restructure working code, and
+         do not rewrite tests that already pass.
+
+      3. **Do not grow the diff.** Every line you add must trace to a blocking
+         issue above or to a task in THIS epic. New abstractions, extra
+         hardening, adjacent cleanups, and unrequested improvements are what
+         get an epic flagged for scope creep — adding more will fail review
+         again. If you notice an unrelated problem, record it in
+         `implementation_notes` and leave it alone.
+
+      4. **Re-run the full test suite.** Confirm the fixes work and nothing
+         regressed. Set `tests_pass` and `verification_evidence` from the
+         commands you actually ran this round.
+
+      5. **Report what you did.** In `fixes_applied`, state issue by issue what
+         you changed to resolve it. If you believe a flagged issue is not a real
+         defect, say so explicitly in `implementation_notes` and explain why,
+         rather than silently ignoring it.
+
+      **STOP once the listed issues are resolved. Do NOT implement other epics.**
+    output:
+      current_epic:
+        type: string
+        description: The epic that was fixed. Copy the "Epic:" value verbatim so the reviewer can tell this fix pass applies to the epic under review.
+      fixes_applied:
+        type: array
+        description: One entry per blocking issue, stating what changed to resolve it
+      files_modified:
+        type: array
+        description: The full list of files created or modified for this epic, including the coder's original changes
+      changes_made:
+        type: array
+        description: The full list of changes making up this epic after the fixes
+      tests_added:
+        type: array
+        description: The full list of tests added or updated for this epic
+      edge_cases_handled:
+        type: array
+        description: The full list of edge cases handled for this epic
+      implementation_notes:
+        type: string
+        description: Notes on the fixes, any flagged issue you disagree with and why, and any unrelated problems you deliberately left alone
+      tests_pass:
+        type: boolean
+        description: Whether the full test suite was actually run and passed after the fixes. Report honestly — a false green is a blocking defect.
+      verification_evidence:
+        type: array
+        description: The exact build, lint and test commands run this round, each with its outcome
+    routes:
+      - to: epic_reviewer
 
   - name: epic_review_escalation
     type: human_gate
@@ -456,8 +826,8 @@ agents:
       **Latest reviewer feedback:**
       {{ epic_reviewer.output.feedback }}
 
-      **Outstanding issues:**
-      {% for issue in epic_reviewer.output.issues %}
+      **Outstanding blocking issues:**
+      {% for issue in epic_reviewer.output.blocking_issues %}
       - {{ issue }}
       {% endfor %}
 
@@ -468,9 +838,9 @@ agents:
 
       How would you like to proceed?
     options:
-      - label: Continue reviewing (one more round)
+      - label: Continue fixing (one more round)
         value: continue
-        route: coder
+        route: epic_fixer
       - label: Force-approve and flag for plan review
         value: force_approve
         route: mark_force_approved
@@ -483,7 +853,7 @@ agents:
     description: Record that this epic was force-approved past the review-round cap, so the committer can flag it for plan_reviewer
     values:
       force_approved_epic: "{{ coder.output.current_epic }}"
-      force_approved_note: "Force-approved after {{ epic_reviewer.output.review_round }} review rounds without reviewer sign-off. Outstanding: {{ epic_reviewer.output.issues | join('; ') }}"
+      force_approved_note: "Force-approved after {{ epic_reviewer.output.review_round }} review rounds without reviewer sign-off. Outstanding: {{ epic_reviewer.output.blocking_issues | join('; ') }}"
     routes:
       - to: committer
 
@@ -496,6 +866,7 @@ agents:
     input:
       - workflow.input.plan
       - coder.output
+      - epic_fixer.output?
       - epic_reviewer.output
     system_prompt: |
       You are a Commit and Documentation agent. Your job is to:
@@ -505,6 +876,8 @@ agents:
     prompt: |
       The following epic has been implemented and approved.
 
+      {% set fixed = epic_fixer is defined and epic_fixer.output and epic_fixer.output.current_epic == coder.output.current_epic %}
+      {% set impl = epic_fixer.output if fixed else coder.output %}
       **Epic:** {{ coder.output.current_epic }}
 
       {% if mark_force_approved is defined and mark_force_approved.output.force_approved_epic == coder.output.current_epic %}
@@ -519,12 +892,12 @@ agents:
       {{ coder.output.epic_details }}
 
       **Changes Made:**
-      {% for change in coder.output.changes_made %}
+      {% for change in impl.changes_made %}
       - {{ change }}
       {% endfor %}
 
       **Files Modified:**
-      {% for file in coder.output.files_modified %}
+      {% for file in impl.files_modified %}
       - {{ file }}
       {% endfor %}
 
@@ -611,9 +984,12 @@ agents:
       effort: max
     input:
       - workflow.input.plan
+      - workflow.input.allow_human_escalation?
       - epic_selector.output
       - coder.output
       - committer.output
+      - fixer.output?
+      - plan_reviewer_questions.output?
     system_prompt: |
       You are a Senior Architecture Reviewer. Your job is to perform a holistic review
       of the entire implementation after all epics have been completed.
@@ -687,7 +1063,88 @@ agents:
          - Ensure commit messages are clear and descriptive
          - Check for any commits that should be squashed or amended
 
-      Provide your decision: APPROVE or REQUEST_CHANGES.
+      ---
+
+      ## Blocking vs. Advisory
+
+      Sort every finding into exactly one of two buckets. This classification —
+      nothing else — determines your decision.
+
+      A finding is **blocking** only if the implementation is *wrong or unsafe
+      to ship* until it is fixed:
+      - A defect: the code is incorrect, crashes, or does the wrong thing
+      - A requirement of the plan is not delivered
+      - Components do not actually integrate, or the suite does not pass
+      - The change is unsafe: a security hole, data loss, or a silent failure
+      - Real scope creep: shipped changes that trace to no task in the plan
+
+      Everything else is a **suggestion**: refactors you would prefer, extra
+      test cases, naming, comments, defensive hardening, structure you would
+      have chosen differently. Record them in `suggestions` — they do not block
+      approval and must never be recycled into a blocking list on a later round.
+
+      When you are unsure which bucket a finding belongs in, it is a
+      **suggestion**. The per-epic reviewer has already approved every epic;
+      your job is to catch what only a whole-implementation view can reveal,
+      not to re-litigate work that already passed.
+
+      {% if fixer is defined and fixer.output %}
+      ## RE-REVIEW
+
+      You already reviewed this implementation and the fixer has revised it in
+      response to your feedback. **You are not reviewing it fresh.**
+
+      You raised these issues last round:
+      {% for issue in plan_reviewer.output.architecture_issues %}
+      - (architecture) {{ issue }}
+      {% endfor %}
+      {% for issue in plan_reviewer.output.code_issues %}
+      - (code) {{ issue }}
+      {% endfor %}
+      {% for issue in plan_reviewer.output.documentation_issues %}
+      - (documentation) {{ issue }}
+      {% endfor %}
+      {% for gap in plan_reviewer.output.test_gaps %}
+      - (test gap) {{ gap }}
+      {% endfor %}
+
+      {% if plan_reviewer.output.suggestions %}
+      And these were your NON-blocking suggestions. They did not block approval
+      then and they cannot block it now, whether or not the fixer adopted them:
+      {% for suggestion in plan_reviewer.output.suggestions %}
+      - {{ suggestion }}
+      {% endfor %}
+      {% endif %}
+
+      What the fixer reports doing:
+      {{ fixer.output.fix_notes }}
+      {% if fixer.output.all_issues_resolved == false %}
+      The fixer reports it did NOT resolve everything.
+      {% endif %}
+
+      Verify the issues above were actually resolved. An issue that is
+      genuinely fixed is closed — do not re-open it because you would have
+      fixed it differently. Only raise a NEW blocking issue if it is a real
+      defect; a point you did not think to raise last round is not
+      automatically blocking now. Polish and preference stay in `suggestions`.
+
+      If last round's issues are fixed and no genuine new defect exists,
+      **APPROVE.** An implementation that keeps failing review over a rotating
+      cast of minor observations is a review failure, not an implementation
+      failure.
+      {% endif %}
+
+      ## Your Decision
+
+      **`decision` is "APPROVE" when you have no blocking findings, and
+      "REQUEST_CHANGES" when you do. Nothing else.** **Routing follows the
+      issue arrays, not the string** — leaving
+      `architecture_issues`, `code_issues`, `documentation_issues` and
+      `test_gaps` all empty ends the workflow no matter what you put in
+      `decision`, so never park a real defect in `suggestions` expecting
+      "REQUEST_CHANGES" to hold it back. Do not withhold approval because the
+      implementation could hypothetically be better — a defect-free
+      implementation with a long `suggestions` list is an APPROVE.
 
       The `decision` output field MUST be a single plain string — either the
       literal string "APPROVE" or the literal string "REQUEST_CHANGES". Do
@@ -695,36 +1152,127 @@ agents:
       field.
 
       If REQUEST_CHANGES, provide specific issues that need to be fixed.
+
+      {% if workflow.input.allow_human_escalation %}
+      {% if context.history and context.history[-1] == 'plan_reviewer_questions' %}
+      ## Human Escalation Follow-up
+
+      You escalated your unresolved questions to a human.
+
+      {% if plan_reviewer_questions.output.answered_any %}
+      Their answers, question by question:
+
+      {{ plan_reviewer_questions.output.transcript }}
+
+      Use these answers to finalize your review now. Any question you asked
+      that is missing above was skipped — settle it with your own best
+      judgment and say what you assumed.
+      {% else %}
+      The human chose to skip answering. Finalize your review using your best
+      judgment given the available information.
+      {% endif %}
+      Give your decision for this round now. You may escalate again later if a
+      genuinely new ambiguity appears, but do not re-ask something the human
+      has already answered or deliberately skipped — a skipped question is an
+      answer: it means "use your own judgment."
+      {% else %}
+      ## Escalating to a Human
+
+      A human is available to answer questions during this review.
+
+      If your verdict turns on something you cannot settle by reading the code,
+      the commits, or the plan — an unstated requirement, a product decision the
+      plan does not record, a deliberate trade-off only the owner can confirm —
+      **ask rather than assume.** Set `needs_human_escalation` to `true` and put
+      the specific questions in `escalation_questions`.
+
+      Ask only when the answer would change your decision. Do not ask about
+      anything you can verify yourself, and do not ask for an opinion on a
+      finding you have already made.
+
+      Return each entry as an object — `{"question": "...", "choices": ["...",
+      "..."]}` — self-contained, since the reader sees it alone with no other
+      context, and answerable in a sentence or two. Give `choices` whenever the
+      answer is a decision between readings you can name. Put the reading you
+      would assume by default first and mark it by ending its text with
+      ` (Recommended)`, so the reader can see your recommendation without
+      reading your reasoning — at most one choice per question carries that
+      suffix, and you leave it off entirely when you genuinely have no
+      preference. A human picking a listed option is far cheaper than typing
+      prose, and they can still write their own answer instead. Omit `choices`
+      only when you cannot name the alternatives.
+
+      Still give your best-effort decision, feedback, and issue lists alongside
+      the questions, in case the human skips answering.
+      {% endif %}
+      {% endif %}
     output:
       decision:
         type: string
         description: |
           Review decision — a single plain string with one of two exact values:
-          "APPROVE" or "REQUEST_CHANGES". Do NOT return an object or nested
+          "APPROVE" or "REQUEST_CHANGES". Must be "APPROVE" exactly when you
+          have no blocking findings. Do NOT return an object or nested
           fields — just one string.
       feedback:
         type: string
         description: Detailed holistic feedback on the implementation
       architecture_issues:
         type: array
-        description: List of architecture or design issues
+        description: Blocking architecture or design defects. Preferences and alternative structures belong in suggestions.
       code_issues:
         type: array
-        description: List of code quality or consistency issues
+        description: Blocking code quality or consistency defects. Polish belongs in suggestions.
       documentation_issues:
         type: array
-        description: List of documentation issues
+        description: Blocking documentation defects — missing or incorrect docs, not docs you would have written differently.
       test_gaps:
         type: array
-        description: List of test coverage gaps
+        description: Blocking test coverage gaps — untested behavior the plan requires, not extra cases you would have liked.
+      suggestions:
+        type: array
+        description: Non-blocking improvements across the implementation. Recorded for the author but never gate approval, and never promoted to blocking on a later round.
       strengths:
         type: array
         description: List of things done well across the implementation
+      needs_human_escalation:
+        type: boolean
+        description: Whether you need a human to answer something before you can finalize your verdict. False unless a human's answer would actually change your decision.
+      escalation_questions:
+        type: array
+        description: 'Questions for the human, populated only when needs_human_escalation is true. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted only when the alternatives cannot be named. The default choice comes first and ends with " (Recommended)".'
     routes:
+      - to: plan_reviewer_questions
+        when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and (output.escalation_questions | length) > 0 }}"
       - to: $end
-        when: "{{ output.decision == 'APPROVE' }}"
+        when: "{{ (output.architecture_issues | length) + (output.code_issues | length) + (output.documentation_issues | length) + (output.test_gaps | length) == 0 }}"
       - to: fixer
-        when: "{{ output.decision == 'REQUEST_CHANGES' }}"
+
+  - name: plan_reviewer_questions
+    type: questions
+    description: Puts the plan reviewer's unresolved questions to the human inside a single step, so answers can be revised with Back and the whole set costs one iteration
+    source: plan_reviewer.output.escalation_questions
+    prompt: |
+      ## Final implementation review
+
+      The plan reviewer flagged
+      {{ plan_reviewer.output.escalation_questions | length }}
+      question{{ 's' if (plan_reviewer.output.escalation_questions | length) != 1 else '' }}
+      it cannot resolve from the code, the commits, or the plan. Every epic has
+      been implemented and committed.
+
+      **Its current best-effort verdict:** {{ plan_reviewer.output.decision }}
+
+      Answer what you can — anything left unanswered is settled by the
+      reviewer's own judgment. You can go back and revise an earlier answer at
+      any point before finishing.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: $end
+    routes:
+      - to: plan_reviewer
 
   - name: fixer
     description: Fixes issues identified by the plan reviewer
@@ -779,6 +1327,15 @@ agents:
       - {{ gap }}
       {% endfor %}
 
+      {% if plan_reviewer.output.suggestions %}
+      **Non-blocking suggestions** — these did NOT block approval. Adopt one
+      only if it is trivially safe and clearly correct; skipping all of them is
+      the right default. Do not let them expand the diff.
+      {% for suggestion in plan_reviewer.output.suggestions %}
+      - {{ suggestion }}
+      {% endfor %}
+      {% endif %}
+
       ## FIX TASKS
 
       1. **Address Architecture Issues**
@@ -831,8 +1388,6 @@ agents:
         description: Whether all issues have been resolved
     routes:
       - to: plan_reviewer
-        when: "{{ output.all_issues_resolved }}"
-      - to: plan_reviewer
 
 output:
   plan: "{{ workflow.input.plan }}"
@@ -842,5 +1397,9 @@ output:
   all_complete: "{{ committer.output.all_complete if committer is defined else false }}"
   last_commit: "{{ committer.output.commit_message if committer is defined else '' }}"
   epic_review_decision: "{{ epic_reviewer.output.decision if epic_reviewer is defined else '' }}"
+  epic_review_rounds: "{{ epic_reviewer.output.review_round if epic_reviewer is defined else 0 }}"
+  force_approved_epic: "{{ mark_force_approved.output.force_approved_epic if mark_force_approved is defined else '' }}"
   plan_review_decision: "{{ plan_reviewer.output.decision if plan_reviewer is defined else '' }}"
+  plan_review_suggestions: "{{ plan_reviewer.output.suggestions | json if plan_reviewer is defined else '[]' }}"
+  human_questions_answered: "{{ (epic_reviewer_questions is defined and epic_reviewer_questions.output.answered_any) or (plan_reviewer_questions is defined and plan_reviewer_questions.output.answered_any) }}"
   iterations: "{{ context.iteration }}"
