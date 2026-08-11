@@ -49,12 +49,28 @@
 #   repository root, mirroring the manual step of leaving the worktree before
 #   deleting it.
 #
-# Skills
-#   Skills are picked up from installed plugins via `runtime.skill_discovery`
-#   rather than hard-coded paths, because `skills:` entries cannot be
-#   templated and a bare name must be a Conductor built-in. This makes the run
-#   depend on what is installed on the machine. Expected plugin skills:
-#   `worktree`, `git-workflow`, `gh-cli`, `code-review`, `merge-pr`.
+# Plugins
+#   Each step declares the plugin whose skill it drives, rather than the
+#   workflow enabling skill discovery and excluding everything it does not
+#   want. An allowlist cannot leak: installing a new plugin later has no
+#   effect on this run, where a blocklist silently grew.
+#
+#   Declaring the plugin also loads what the skill depends on. `code-review`
+#   dispatches to the seven specialist subagents `prs` ships in `agents/`;
+#   discovering the skill alone left it calling agents that were not there.
+#
+#     issue_resolver, ship_draft, publish   git@jason-tools    gh-cli, git-workflow
+#     worktree_setup                        issues@jason-tools worktree
+#     coder                                 dev@jason-tools    code-comments
+#     review, merge                         prs@jason-tools    code-review, merge-pr
+#
+#   Entries are `plugin@marketplace`, so they resolve against the installed
+#   `jason-tools` marketplace. To run this against a different marketplace,
+#   rewrite the suffixes, or declare `runtime.plugin_sources` to fetch one by
+#   git URL and make the workflow self-installing.
+#
+#   Nothing else is loaded. `ship` in particular is absent, so an agent cannot
+#   recursively re-invoke this workflow.
 #
 # Usage:
 #   Run it from the repository you want to work in. The issue must already
@@ -73,7 +89,7 @@
 # Requires:
 #   - git and gh (GitHub CLI) on PATH, with `gh auth status` passing
 #   - python3 on PATH (used by the bootstrap and worktree_verify steps)
-#   - The plugin skills listed above installed for the Copilot CLI
+#   - The plugins listed above installed from the `jason-tools` marketplace
 
 workflow:
   name: ship
@@ -88,23 +104,6 @@ workflow:
     checkpoint:
       every_agent: true   # long, human-gated run — keep it resumable after an
       keep_last: 5        # external interruption
-    skill_discovery:
-      sources: [plugins]
-      exclude:
-        # Trimmed to the six skills this pipeline actually drives — worktree,
-        # git-workflow, gh-cli, code-review, merge-pr and code-comments.
-        # `ship` is excluded so an agent cannot recursively re-invoke this
-        # workflow, and `conductor` because it is ~117KB of workflow-authoring
-        # reference with nothing to say about shipping a change.
-        - ship
-        - conductor
-        - conductor-release
-        - fusion
-        - teams-cache
-        - triage
-        - concept-review
-        - web-research
-        - humanizer
 
   input:
     issue:
@@ -195,6 +194,8 @@ agents:
     model: claude-sonnet-5
     reasoning:
       effort: medium
+    plugins:
+      - git@jason-tools       # gh-cli — account switching on a 404 or 403
     input:
       - workflow.input.issue
       - bootstrap.output.name_with_owner
@@ -267,6 +268,8 @@ agents:
   - name: worktree_setup
     description: Claims the issue and creates an isolated worktree and branch for it, using the worktree skill
     model: claude-sonnet-5
+    plugins:
+      - issues@jason-tools    # worktree
     input:
       - issue_resolver.output.issue_number
     system_prompt: |
@@ -594,6 +597,8 @@ agents:
     model: claude-sonnet-5
     reasoning:
       effort: high
+    plugins:
+      - dev@jason-tools       # code-comments
     working_dir: "{{ worktree_verify.output.worktree_path }}"
     input:
       - planner.output.plan
@@ -747,6 +752,8 @@ agents:
   - name: ship_draft
     description: Stages, commits, pushes and opens a draft pull request, using the git-workflow skill
     model: claude-sonnet-5
+    plugins:
+      - git@jason-tools       # git-workflow, gh-cli
     working_dir: "{{ worktree_verify.output.worktree_path }}"
     input:
       - worktree_verify.output.worktree_path
@@ -784,6 +791,14 @@ agents:
     model: claude-sonnet-5
     reasoning:
       effort: high
+    plugins:
+      # `code-review` dispatches to the seven specialist subagents the plugin
+      # ships in `agents/` (code-reviewer, pr-test-analyzer, silent-failure-
+      # hunter, type-design-analyzer, comment-analyzer, code-simplifier,
+      # dead-code-finder). Loading the plugin brings the skill AND those
+      # subagents; loading the skill alone left it dispatching to agents that
+      # did not exist.
+      - prs@jason-tools       # code-review
     working_dir: "{{ worktree_verify.output.worktree_path }}"
     input:
       - ship_draft.output.pr_number
@@ -827,6 +842,8 @@ agents:
   - name: publish
     description: Takes the pull request out of draft and reports its CI status, using the gh-cli skill
     model: claude-sonnet-5
+    plugins:
+      - git@jason-tools       # gh-cli
     working_dir: "{{ worktree_verify.output.worktree_path }}"
     input:
       - ship_draft.output.pr_number
@@ -922,6 +939,8 @@ agents:
   - name: merge
     description: Merges the pull request and cleans up the branch and worktree, using the merge-pr skill
     model: claude-sonnet-5
+    plugins:
+      - prs@jason-tools       # merge-pr
     # Pinned to the repository root, NOT the worktree — this step deletes that
     # worktree, and an agent cannot remove the directory it is standing in.
     working_dir: "{{ bootstrap.output.repo_root }}"
