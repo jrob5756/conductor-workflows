@@ -1,7 +1,7 @@
 {
   "name": "workflows",
-  "description": "Invoke Conductor workflows from the conductor-workflows registry as skills. Ships the fusion skill, which runs multi-model deliberation: a panel of models from different labs answers a question in parallel, an analyst compares their answers, and a synthesiser writes the final answer.",
-  "version": "0.1.0",
+  "description": "Invoke Conductor workflows from the conductor-workflows registry as skills. Ships `fusion`, which runs multi-model deliberation over a hard question, and `ship`, which takes a GitHub issue to a merged pull request in the background.",
+  "version": "0.2.0",
   "author": {
     "name": "jrob5756"
   },
@@ -13,6 +13,8 @@
     "workflow",
     "multi-agent",
     "deliberation",
-    "fusion"
+    "fusion",
+    "ship",
+    "pull-request"
   ]
 }

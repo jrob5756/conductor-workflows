@@ -43,11 +43,13 @@ Then invoke a workflow directly:
 
 ```text
 /workflows:fusion Compare ridge, lasso, and elastic-net regression. Where does each shine?
+/workflows:ship 123
 ```
 
 | Plugin | Skill | Runs |
 |--------|-------|------|
 | `workflows` | `fusion` | The `fusion` multi-model deliberation workflow |
+| `workflows` | `ship` | The `ship` workflow, in the background — returns a dashboard URL to track it |
 
 The skills resolve workflows through the Conductor registry rather than
 bundling copies, so a skill and its workflow cannot drift apart. See
