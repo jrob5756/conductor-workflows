@@ -376,6 +376,7 @@ agents:
   - name: planner
     description: Studies the codebase and produces an implementation plan for the issue, raising the questions it genuinely cannot answer from the code
     model: claude-opus-5
+    context_tier: long_context
     reasoning:
       effort: xhigh
     working_dir: "{{ worktree_verify.output.worktree_path }}"
@@ -595,6 +596,7 @@ agents:
   - name: coder
     description: Implements the approved plan on autopilot and verifies it with the repository's own build, lint and test commands
     model: claude-sonnet-5
+    context_tier: long_context
     reasoning:
       effort: high
     plugins:
@@ -789,6 +791,7 @@ agents:
   - name: review
     description: Reviews the pull request and applies the resulting fixes, using the code-review skill
     model: claude-sonnet-5
+    context_tier: long_context
     reasoning:
       effort: high
     plugins:
