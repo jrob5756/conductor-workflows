@@ -95,6 +95,8 @@
 #
 #     issue_resolver, ship_draft, publish   git@jason-tools    gh-cli, git-workflow
 #     worktree_setup                        issues@jason-tools worktree
+#     planner                               ado@jason-tools    ado agent (ADO MCP)
+#     planner                          ms-internal@jason-tools ms-internal agent (Learn, EngHub)
 #     coder                                 dev@jason-tools    code-comments
 #     review, merge                         prs@jason-tools    code-review, merge-pr
 #     review_fixer, conflict_resolver       git@jason-tools    git-workflow, gh-cli
@@ -431,6 +433,9 @@ agents:
     context_tier: long_context
     reasoning:
       effort: xhigh
+    plugins:
+      - ado@jason-tools       # ado agent — ADO work items, repos, wikis
+      - ms-internal@jason-tools  # ms-internal agent — MS Learn, EngHub
     working_dir: "{{ worktree_verify.output.worktree_path }}"
     input:
       - issue_resolver.output.issue_number
