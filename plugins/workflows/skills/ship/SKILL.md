@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Take an existing GitHub issue to a merged pull request by launching the ship Conductor workflow in the background and handing back its dashboard URL. The workflow cuts a worktree, plans behind a question gate, implements, opens a draft PR, runs a code review, then publishes and merges behind a human gate. Use when the user invokes /workflows:ship, or asks to ship, implement, take on, or work an existing issue end to end — "ship #123", "implement issue 45", "take issue 7 to a PR". Do not use for creating issues, or for changes that have no issue.
+description: Take an existing GitHub issue to a merged pull request by launching the ship Conductor workflow in the background and handing back its dashboard URL. The workflow cuts a worktree, plans behind a question gate, implements, opens a draft PR, runs a code review, then publishes and merges behind a human gate, pausing again if the merge hits conflicts. Supports an autopilot mode that bypasses every gate. Use when the user invokes /workflows:ship, or asks to ship, implement, take on, or work an existing issue end to end — "ship #123", "implement issue 45", "take issue 7 to a PR". Do not use for creating issues, or for changes that have no issue.
 argument-hint: issue number, URL, or owner/repo#123
 ---
 
@@ -94,6 +94,18 @@ planner's question gate. Leave it on by default: those questions are asked
 before any code is written, and skipping them turns open questions into silent
 assumptions.
 
+Pass `--input autopilot=true` only when the user explicitly asks for an
+unattended run — "don't ask me", "just ship it", "no gates". It removes **every**
+human gate, including the merge approval, so the pull request lands on the
+default branch with nobody having read it. Never turn it on to save the user a
+step, and never infer it from impatience. If they ask for it, say plainly in
+your reply that nothing will pause for them.
+
+Autopilot still ends a run by itself in two cases, because neither is a human
+approval: a code review reporting unresolved blocking findings or
+`do_not_merge`, and merge conflicts it could not resolve. Both leave the pull
+request open and fail the run rather than merging.
+
 ### 5. Return the dashboard URL
 
 Parse the launch output:
@@ -120,7 +132,9 @@ Report, briefly:
 - the dashboard URL, on its own line so it is clickable
 - the issue being shipped
 - that the run is in the background and survives this session
-- **that it will stop and wait for them** — this is the part users miss
+- **that it will stop and wait for them** — this is the part users miss, and
+  the reverse under `autopilot=true`: say clearly that it will *not* stop, and
+  will merge on its own
 
 ```
 Shipping issue #123 — https://github.com/owner/repo/issues/123
@@ -128,9 +142,9 @@ Shipping issue #123 — https://github.com/owner/repo/issues/123
 Dashboard: http://127.0.0.1:34229
 
 Running in the background; it will outlive this session. It pauses for you
-three times: the planner's questions, plan approval, then the merge gate.
-Nothing is pushed before you approve the plan, and nothing is merged before
-you approve the merge.
+three times: the planner's questions, plan approval, then the merge gate —
+plus once more if the merge hits conflicts. Nothing is pushed before you
+approve the plan, and nothing is merged before you approve the merge.
 ```
 
 Then stop. Do not poll the dashboard, tail the log, or narrate the run.
@@ -161,8 +175,15 @@ surprise:
 | `publish` | Marks the PR ready for review |
 | `merge_gate` | **Human gate** — merge or leave it open |
 | `merge` | Squash merges, deletes the branch, removes the worktree |
+| `merge_conflicts` | **Human gate**, only when the branch conflicts with the base — resolve them and retry, or stop |
+| `conflict_resolver` | Merges the base branch in, resolves the conflicts, re-runs the checks, pushes, and goes back to `merge` |
 
 Declining the merge leaves the PR open and ends the run.
+
+Under `autopilot=true` none of the gates appear: the questions and plan
+approval are skipped, a stalled coder is retried `max_autopilot_rounds` times
+(default 2) and then ships what exists, conflicts are resolved without asking,
+and the merge happens unprompted.
 
 ## Troubleshooting
 

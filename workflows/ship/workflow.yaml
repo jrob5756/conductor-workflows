@@ -28,18 +28,41 @@
 #     ↓
 #   merge_gate                merge / don't merge (human gate)
 #     ↓
-#   merge                     [merge-pr skill] squash, delete branch, remove
-#     ↓                       the worktree — runs in the repo root, NOT in the
-#   $end                      worktree it is deleting
+#   merge ─────────────→ merge_conflicts   the branch conflicts with the base:
+#     ↓                       ↓            resolve them / stop (human gate)
+#     ↓                  conflict_resolver merge the base branch in, resolve,
+#     ↓                       ↓            re-verify, push, then merge again
+#     ↓ ←────────────────────┘
+#   $end                      [merge-pr skill] squash, delete branch, remove
+#                             the worktree — runs in the repo root, NOT in the
+#                             worktree it is deleting
 #
 # Loops
-#   One, and a human drives it: the coder runs once, and if it does not
-#   finish, `implementation_stalled` asks whether to run it again. Everything
-#   after that is a straight line. Nothing retries itself on a round counter —
-#   the review skill already re-runs its own checks after applying fixes, so
-#   an outer retry loop would just re-review code that was already reconciled.
-#   Declining the merge leaves the PR open and ends the run; pick it up by
-#   hand or start a fresh one.
+#   Two, and a human drives both. The coder runs once, and if it does not
+#   finish, `implementation_stalled` asks whether to run it again. If the merge
+#   is blocked by conflicts, `merge_conflicts` asks whether to resolve them and
+#   retry. Everything else is a straight line — the review skill already
+#   re-runs its own checks after applying fixes, so an outer retry loop would
+#   just re-review code that was already reconciled. Declining the merge leaves
+#   the PR open and ends the run; pick it up by hand or start a fresh one.
+#
+# Autopilot
+#   `--input autopilot=true` bypasses every human gate, for a run you do not
+#   intend to sit with. The workflow then takes the obvious choice at each one:
+#   it skips the planner's questions and plan approval, retries a stalled coder
+#   up to `max_autopilot_rounds` times before shipping what exists, and
+#   resolves merge conflicts itself rather than asking.
+#
+#   Because no human is left to break a cycle, both loops are bounded by
+#   `max_autopilot_rounds` under autopilot, and exhausting the conflict budget
+#   fails the run rather than merging something unverified. Autopilot merges
+#   without asking, so a plan you would have corrected at the gate reaches the
+#   default branch — leave it off unless the issue is genuinely routine.
+#
+#   Two things still stop an autopilot run, because neither is a human
+#   approval: a code review that reports unresolved blocking findings or
+#   `do_not_merge`, and merge conflicts it could not resolve. Both leave the
+#   pull request open and fail the run rather than landing the change.
 #
 # Working directories
 #   Steps with no `working_dir` run in the directory you invoked
@@ -86,6 +109,10 @@
 #     conductor run workflows/ship/workflow.yaml --input issue=123 \
 #       --input ask_questions=false
 #
+#   Fully unattended — no gates at all, merges without asking:
+#     conductor run workflows/ship/workflow.yaml --input issue=123 \
+#       --input autopilot=true
+#
 # Requires:
 #   - git and gh (GitHub CLI) on PATH, with `gh auth status` passing
 #   - python3 on PATH (used by the bootstrap and worktree_verify steps)
@@ -93,8 +120,8 @@
 
 workflow:
   name: ship
-  description: Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a one-question-at-a-time human gate, implements on autopilot, opens a draft PR, runs a code review and reconciles the findings, then publishes and merges behind a human gate with full branch and worktree cleanup
-  version: "1.0.0"
+  description: Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a one-question-at-a-time human gate, implements unattended, opens a draft PR, runs a code review and reconciles the findings, then publishes and merges behind a human gate with full branch and worktree cleanup. Merge conflicts pause for a human, and `autopilot` bypasses every gate for a run you do not sit with
+  version: "1.1.0"
   entry_point: bootstrap
 
   runtime:
@@ -115,7 +142,18 @@ workflow:
       type: boolean
       required: false
       default: true
-      description: "Put the planner's open questions to you one at a time before implementation starts. Set false to go straight to plan approval."
+      description: "Put the planner's open questions to you one at a time before implementation starts. Set false to go straight to plan approval. Ignored when `autopilot` is true."
+
+    autopilot:
+      type: boolean
+      required: false
+      default: false
+      description: "Run with no human gates at all: skip the planner's questions and plan approval, retry a stalled implementation instead of asking, resolve merge conflicts instead of asking, and merge without a final confirmation. The pull request lands on the default branch with nobody having read it, so use it only for work you would have approved unseen."
+
+    max_autopilot_rounds:
+      type: number
+      default: 2
+      description: "How many times autopilot retries by itself before giving up — re-running a coder that did not finish, and re-attempting a merge whose conflicts were not resolved. Bounds the two loops a human would otherwise break. Ignored unless `autopilot` is true."
 
   context:
     mode: explicit
@@ -387,6 +425,7 @@ agents:
       - issue_resolver.output.issue_url
       - issue_resolver.output.notes?
       - workflow.input.ask_questions
+      - workflow.input.autopilot
       - worktree_verify.output.worktree_path
       - worktree_verify.output.branch
       - ask_questions.output?
@@ -470,7 +509,7 @@ agents:
          - **Risks** — what could break, and anything deliberately out of scope.
 
       4. **Raise your open questions.**
-         {% if workflow.input.ask_questions %}
+         {% if workflow.input.ask_questions and not workflow.input.autopilot %}
          Put a question in `open_questions` only when a human decision actually
          changes the plan and the codebase cannot settle it: a product choice,
          a behavioural trade-off, an ambiguity in the issue, an interaction
@@ -501,6 +540,15 @@ agents:
          The human has turned off the question gate, so return an empty
          `open_questions` list. Where you would have asked, state the
          assumption you are proceeding on in the plan's Risks section instead.
+         {% if workflow.input.autopilot %}
+
+         This run is on autopilot: nobody reviews this plan before it is
+         implemented, and nobody reviews the pull request before it merges.
+         Be correspondingly conservative — prefer the change the issue
+         literally asks for over the more ambitious one you would have
+         proposed for a human to weigh, and put anything you would have
+         escalated into Risks.
+         {% endif %}
          {% endif %}
     output:
       plan:
@@ -517,7 +565,9 @@ agents:
         description: The exact build, lint and test commands this repository uses, as confirmed from its own configuration
     routes:
       - to: ask_questions
-        when: "{{ workflow.input.ask_questions and (output.open_questions | length) > 0 and ask_questions is not defined }}"
+        when: "{{ workflow.input.ask_questions and not workflow.input.autopilot and (output.open_questions | length) > 0 and ask_questions is not defined }}"
+      - to: coder
+        when: "{{ workflow.input.autopilot }}"
       - to: plan_approval
 
   - name: ask_questions
@@ -610,11 +660,13 @@ agents:
       - issue_resolver.output.issue_title
       - worktree_verify.output.worktree_path
       - worktree_verify.output.branch
+      - workflow.input.autopilot
+      - workflow.input.max_autopilot_rounds
       - coder.output?
       - implementation_stalled.output?
     system_prompt: |
-      You implement an approved plan. The planning is done and the human has
-      signed off, so do not re-litigate the approach — build it.
+      You implement an approved plan. The planning is done and the plan is
+      settled, so do not re-litigate the approach — build it.
 
       You work only inside the worktree you are given. Do not commit, do not
       push, and do not open a pull request; a later step owns all of that.
@@ -649,6 +701,14 @@ agents:
       {% if implementation_stalled is defined and implementation_stalled.output.selected == 'continue' %}
 
       The human reviewed the stall and told you to keep going.
+      {% endif %}
+      {% if workflow.input.autopilot %}
+
+      This run is on autopilot, so nobody reviewed the stall — you were
+      restarted automatically, and you get at most
+      {{ workflow.input.max_autopilot_rounds }} round(s) in total. If this is
+      the last one, spend it on making what exists correct and verified rather
+      than on starting anything new: whatever you leave behind is what ships.
       {% endif %}
       {% endif %}
 
@@ -706,8 +766,12 @@ agents:
         type: array
         description: Specific reasons the work is not complete. Empty when complete is true.
     routes:
+      # Autopilot has no human to ask, so a stalled coder is retried on a round
+      # counter and then ships what exists rather than blocking forever.
+      - to: coder
+        when: "{{ not output.complete and workflow.input.autopilot and output.round < workflow.input.max_autopilot_rounds }}"
       - to: implementation_stalled
-        when: "{{ not output.complete }}"
+        when: "{{ not output.complete and not workflow.input.autopilot }}"
       - to: ship_draft
 
   - name: implementation_stalled
@@ -852,6 +916,7 @@ agents:
       - ship_draft.output.pr_number
       - ship_draft.output.pr_url
       - worktree_verify.output.worktree_path
+      - workflow.input.autopilot
     system_prompt: |
       You invoke the `gh-cli` skill to take a pull request out of draft and
       report its state. You do not merge it and you do not change any code.
@@ -879,7 +944,30 @@ agents:
         type: string
         description: What went wrong, empty on success
     routes:
+      # Autopilot has no gate to show the review at, so the review's own verdict
+      # becomes the stop condition. This is not a human approval being bypassed
+      # — it is the one check that would have made a human decline the merge.
+      - to: review_rejected
+        when: "{{ workflow.input.autopilot and review is defined and (not review.output.all_resolved or review.output.merge_readiness == 'do_not_merge') }}"
+      - to: merge
+        when: "{{ workflow.input.autopilot }}"
       - to: merge_gate
+
+  - name: review_rejected
+    type: terminate
+    status: failed
+    input:
+      - review.output?
+      - publish.output.pr_url?
+    reason: >-
+      Autopilot stopped before merging: the code review did not clear the pull
+      request
+      {%- if review is defined %} ({{ review.output.merge_readiness }}
+      {%- if not review.output.all_resolved %}, {{ review.output.blocking_found }} blocking finding(s) with
+      {{ review.output.unresolved | length }} left unresolved: {{ review.output.unresolved | join('; ') }}
+      {%- endif %})
+      {%- endif %}. The pull request is left open for a human to finish
+      {%- if publish is defined %} — {{ publish.output.pr_url }}{% endif %}.
 
   - name: merge_gate
     type: human_gate
@@ -950,21 +1038,67 @@ agents:
     input:
       - ship_draft.output.pr_number
       - bootstrap.output.repo_root
+      - bootstrap.output.default_branch
+      - worktree_verify.output.branch
     system_prompt: |
       You invoke the `merge-pr` skill and report what it did. The skill owns the
       merge strategy and the cleanup, including which branches and worktrees are
       yours to remove. Follow it as written.
 
-      A human already approved this merge at a gate, so do not ask again — but
-      do stop if the repository's own state makes merging unsafe.
+      A human already approved this merge at a gate, or the run is on autopilot
+      and there is no gate to ask at — either way, do not ask again. But do stop
+      if the repository's own state makes merging unsafe.
+
+      You never resolve merge conflicts. Conflicts mean the branch needs real
+      work that a later step owns, and forcing past them here would either
+      clobber the base branch or land a resolution nobody verified. Report them
+      and stop.
     prompt: |
+      Merge pull request #{{ ship_draft.output.pr_number }}, which merges
+      `{{ worktree_verify.output.branch }}` into
+      `{{ bootstrap.output.default_branch }}`.
+
+      ## First, check that it can merge
+
+      ```
+      gh pr view {{ ship_draft.output.pr_number }} --json mergeable,mergeStateStatus
+      ```
+
+      If `mergeable` is `CONFLICTING` — or the merge itself fails because the
+      branch conflicts with the base — **stop immediately**:
+
+      - Set `blocked_by_conflicts: true` and `merged: false`.
+      - Name the conflicting files in `conflict_summary`, along with what the
+        base branch changed underneath this one if you can tell. Get the file
+        list from `gh pr view --json files` plus
+        `git -C {{ bootstrap.output.repo_root }} fetch origin` and
+        `git -C {{ bootstrap.output.repo_root }} merge-tree`, or from the failed
+        merge's own error output.
+      - Do **not** check out the branch, do not resolve anything, do not force
+        the merge, and do not delete the branch or the worktree. A later step
+        resolves conflicts and sends the PR back here; it needs both intact.
+
+      A `mergeable` of `UNKNOWN` means GitHub is still computing it — wait a few
+      seconds and re-read it before deciding.
+
+      ## Otherwise, merge it
+
       /merge-pr #{{ ship_draft.output.pr_number }}
 
-      Then report what was merged and what was cleaned up.
+      Then report what was merged and what was cleaned up. Set
+      `blocked_by_conflicts: false` for any outcome that is not a conflict, and
+      put the reason in `cleanup_notes` if the merge failed for some other
+      cause.
     output:
       merged:
         type: boolean
         description: True when the pull request was squash-merged
+      blocked_by_conflicts:
+        type: boolean
+        description: True only when the merge did not happen because the branch conflicts with the base. False for a successful merge and for every other kind of failure.
+      conflict_summary:
+        type: string
+        description: Which files conflict and what changed underneath the branch, when blocked_by_conflicts is true. Empty otherwise.
       merge_commit:
         type: string
         description: SHA of the squash-merge commit on the default branch
@@ -981,18 +1115,245 @@ agents:
         type: string
         description: Anything left behind or needing manual attention. Empty when cleanup was complete.
     routes:
+      - to: merge_conflicts
+        when: "{{ not output.merged and output.blocked_by_conflicts and not workflow.input.autopilot }}"
+      # Autopilot resolves conflicts itself, bounded by the same round counter
+      # that bounds the coder — without it, a resolver that keeps reporting
+      # success would loop against a merge that keeps failing.
+      - to: conflict_resolver
+        when: "{{ not output.merged and output.blocked_by_conflicts and (conflict_resolver is not defined or conflict_resolver.output.round < workflow.input.max_autopilot_rounds) }}"
+      - to: merge_blocked
+        when: "{{ not output.merged and output.blocked_by_conflicts }}"
       - to: $end
+
+  - name: merge_conflicts
+    type: human_gate
+    description: Reached when the branch conflicts with the base, so the human decides whether to have the conflicts resolved and the merge retried, or to stop and deal with the pull request by hand
+    prompt: |
+      ## Merge blocked by conflicts — issue #{{ issue_resolver.output.issue_number }}
+
+      **{{ issue_resolver.output.issue_title }}**
+
+      {{ ship_draft.output.pr_url }}
+
+      `{{ worktree_verify.output.branch }}` conflicts with
+      `{{ bootstrap.output.default_branch }}`, so nothing was merged.
+
+      {% if merge.output.conflict_summary %}
+      **Conflicts:**
+
+      {{ merge.output.conflict_summary }}
+      {% endif %}
+      {% if conflict_resolver is defined %}
+
+      ---
+
+      A resolution was already attempted (round {{ conflict_resolver.output.round }}):
+
+      {{ conflict_resolver.output.summary }}
+
+      {% if (conflict_resolver.output.unresolved | length) > 0 %}
+      **Still unresolved:**
+      {% for item in conflict_resolver.output.unresolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% endif %}
+
+      ---
+
+      Resolving merges `{{ bootstrap.output.default_branch }}` into the branch
+      in the worktree at `{{ worktree_verify.output.worktree_path }}`, keeps
+      both sides' intent, re-runs the repository's checks, pushes, and comes
+      back here to merge. It does not force-push and it does not rewrite the
+      pull request's history.
+
+      Stopping leaves the pull request open with the conflicts intact, and
+      leaves the worktree and branch in place for you to finish by hand.
+    options:
+      - label: Resolve the conflicts & retry the merge
+        value: resolve
+        route: conflict_resolver
+      - label: Stop here (leave the PR open)
+        value: stop
+        route: stopped
+
+  - name: conflict_resolver
+    description: Merges the base branch into the pull request branch and resolves the conflicts, re-running the repository's own checks before pushing
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: high
+    plugins:
+      - git@jason-tools       # git-workflow, gh-cli
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - planner.output.plan
+      - planner.output.verification_commands
+      - issue_resolver.output.issue_number
+      - issue_resolver.output.issue_title
+      - ship_draft.output.pr_number
+      - merge.output.conflict_summary
+      - bootstrap.output.default_branch
+      - worktree_verify.output.worktree_path
+      - worktree_verify.output.branch
+      - conflict_resolver.output?
+    system_prompt: |
+      You resolve merge conflicts between a pull request branch and the branch
+      it targets. You work only inside the worktree you are given.
+
+      A conflict is two intents meeting, and resolving it means keeping both.
+      Deleting the other side's work to make the file parse is the failure mode
+      here — it compiles, it merges, and it silently reverts somebody's change.
+      When you genuinely cannot tell what the other side intended, say so and
+      leave it unresolved rather than guessing.
+
+      Merge the base branch into this branch. Never rebase and never
+      force-push: the pull request is already open and under review, and
+      rewriting its history detaches the review comments people have left on it.
+
+      Resolving conflicts is not a licence to change behaviour. Do not
+      implement anything new, do not refactor what you touch, and do not
+      "improve" either side while you are in there.
+    prompt: |
+      The merge of PR #{{ ship_draft.output.pr_number }} was blocked: branch
+      `{{ worktree_verify.output.branch }}` conflicts with
+      `{{ bootstrap.output.default_branch }}`.
+
+      {% if merge.output.conflict_summary %}
+      **Reported conflicts:**
+
+      {{ merge.output.conflict_summary }}
+      {% endif %}
+
+      {% if conflict_resolver is defined and conflict_resolver.output %}
+      ## This is attempt {{ conflict_resolver.output.round + 1 }}
+
+      Your last attempt reported:
+
+      {{ conflict_resolver.output.summary }}
+
+      {% if (conflict_resolver.output.unresolved | length) > 0 %}
+      It left these unresolved:
+      {% for item in conflict_resolver.output.unresolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      The merge still failed, so something you concluded last time was wrong.
+      Re-read the actual conflict state rather than trusting that summary.
+      {% endif %}
+
+      ## What to do
+
+      1. **Get the current state.** You are in
+         `{{ worktree_verify.output.worktree_path }}`.
+
+         ```
+         git status --short
+         git fetch origin {{ bootstrap.output.default_branch }}
+         ```
+
+      2. **Merge the base branch in.**
+
+         ```
+         git merge origin/{{ bootstrap.output.default_branch }}
+         ```
+
+         If a previous attempt left a merge in progress, finish or abort that
+         first — do not start a second one on top of it.
+
+      3. **Resolve every conflict.** For each conflicted file, read both sides
+         and work out what each was trying to do. Keep both intents. If the
+         base branch renamed, moved or changed the signature of something this
+         branch uses, follow that change rather than reinstating the old form.
+
+         The plan this branch implements, for reference on what its side was
+         trying to achieve:
+
+         {{ planner.output.plan }}
+
+      4. **Verify.** Conflict resolutions are exactly the kind of change that
+         compiles and is still wrong, so run the repository's own checks:
+         {% if planner.output.verification_commands | length > 0 %}
+         {% for cmd in planner.output.verification_commands %}
+         - `{{ cmd }}`
+         {% endfor %}
+         {% else %}
+         Find them in the package manifest, the CI workflows, or the
+         contributor guide, and run them.
+         {% endif %}
+
+      5. **Commit and push.** Commit the merge and push it to the existing
+         branch with a plain `git push` — no force, no lease, no rebase.
+
+      ## Reporting
+
+      Set `resolved: true` only when every conflict is resolved, the checks
+      pass, and the merge commit is pushed. If you could not resolve something,
+      or a check fails and you cannot see why, set `resolved: false`, list the
+      specifics in `unresolved`, and leave the working tree in a state a human
+      can pick up. A false green here merges an unverified resolution into the
+      default branch.
+
+      Set `round` to {% if conflict_resolver is defined and conflict_resolver.output %}{{ conflict_resolver.output.round + 1 }}{% else %}1{% endif %}.
+    output:
+      resolved:
+        type: boolean
+        description: True only when every conflict was resolved, the verification commands passed, and the merge commit was pushed
+      round:
+        type: number
+        description: Which resolution attempt this was, starting at 1
+      summary:
+        type: string
+        description: What conflicted, and how each conflict was resolved
+      files_resolved:
+        type: array
+        description: Paths of the files that had conflicts, relative to the worktree root
+      verification:
+        type: string
+        description: Which verification commands were run after the resolution and what they reported
+      unresolved:
+        type: array
+        description: Conflicts that could not be resolved, each with the reason. Empty when resolved is true.
+      pushed:
+        type: boolean
+        description: True when the merge commit was pushed to the pull request branch
+    routes:
+      - to: merge
+        when: "{{ output.resolved }}"
+      - to: merge_conflicts
+        when: "{{ not workflow.input.autopilot }}"
+      - to: merge_blocked
+
+  - name: merge_blocked
+    type: terminate
+    status: failed
+    input:
+      - merge.output.conflict_summary?
+      - conflict_resolver.output?
+      - ship_draft.output.pr_url?
+    reason: >-
+      Merge conflicts between the pull request branch and the base could not be
+      resolved automatically
+      {%- if conflict_resolver is defined %} after {{ conflict_resolver.output.round }} attempt(s):
+      {{ conflict_resolver.output.unresolved | join('; ') if (conflict_resolver.output.unresolved | length) > 0 else conflict_resolver.output.summary }}
+      {%- else %}: {{ merge.output.conflict_summary }}
+      {%- endif %}. The pull request is left open with its worktree and branch
+      intact{% if ship_draft is defined %} — {{ ship_draft.output.pr_url }}{% endif %}.
 
   - name: stopped
     type: terminate
     status: success
     input:
+      - merge_conflicts.output?
       - merge_gate.output?
       - implementation_stalled.output?
       - plan_approval.output?
     reason: >-
       Stopped at your request during
-      {%- if merge_gate is defined and merge_gate.output.selected == 'stop' %} the merge gate — the pull request is left open
+      {%- if merge_conflicts is defined and merge_conflicts.output.selected == 'stop' %} the merge-conflict gate — the pull request is left open with its conflicts, worktree and branch intact
+      {%- elif merge_gate is defined and merge_gate.output.selected == 'stop' %} the merge gate — the pull request is left open
       {%- elif implementation_stalled is defined and implementation_stalled.output.selected == 'stop' %} the implementation checkpoint — changes are uncommitted in the worktree
       {%- elif plan_approval is defined and plan_approval.output.selected == 'stop' %} plan approval — nothing was written to the repository
       {%- else %} the open questions — nothing was written to the repository
@@ -1001,6 +1362,7 @@ agents:
 output:
   issue_number: "{{ issue_resolver.output.issue_number if issue_resolver is defined else 0 }}"
   issue_url: "{{ issue_resolver.output.issue_url if issue_resolver is defined else '' }}"
+  autopilot: "{{ workflow.input.autopilot }}"
   worktree_path: "{{ worktree_verify.output.worktree_path if worktree_verify is defined else '' }}"
   branch: "{{ worktree_verify.output.branch if worktree_verify is defined else '' }}"
   plan: "{{ planner.output.plan if planner is defined else '' }}"
@@ -1019,6 +1381,10 @@ output:
   unresolved_findings: "{{ review.output.unresolved if review is defined else [] }}"
   merged: "{{ merge.output.merged if merge is defined else false }}"
   merge_commit: "{{ merge.output.merge_commit if merge is defined else '' }}"
+  merge_blocked_by_conflicts: "{{ merge.output.blocked_by_conflicts if merge is defined else false }}"
+  conflicts_resolved: "{{ conflict_resolver.output.resolved if conflict_resolver is defined else false }}"
+  conflict_resolution_rounds: "{{ conflict_resolver.output.round if conflict_resolver is defined else 0 }}"
+  unresolved_conflicts: "{{ conflict_resolver.output.unresolved if conflict_resolver is defined else [] }}"
   worktree_removed: "{{ merge.output.worktree_removed if merge is defined else false }}"
   cleanup_notes: "{{ merge.output.cleanup_notes if merge is defined else '' }}"
   iterations: "{{ context.iteration }}"
