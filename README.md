@@ -14,7 +14,7 @@ Sample workflow registry for [Conductor](https://github.com/microsoft/conductor)
 | `sdd-design` | Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan) |
 | `sdd-plan` | Solution design + implementation plan with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge. Optional `design` input switches it to plan-only mode, consuming an existing design document (e.g. one produced by `sdd-design`) |
 | `sdd-implement` | Implement a plan epic-by-epic with epic-level and plan-level review |
-| `ship` | Take an existing GitHub issue to a merged pull request: cuts a worktree, plans behind a human question gate, implements unattended, opens a draft PR, runs a code review and reconciles the findings, then publishes and merges behind a human gate with full branch and worktree cleanup. A merge blocked by conflicts pauses to ask whether to resolve them, and `autopilot=true` bypasses every human gate |
+| `ship` | Take an existing GitHub issue to a merged pull request: cuts a worktree, plans behind a human question gate, implements unattended, opens a draft PR, reviews it and applies the findings in a separate step, then publishes and merges behind a human gate with full branch and worktree cleanup. A merge blocked by conflicts pauses to ask whether to resolve them, and `autopilot=true` bypasses every human gate |
 
 ## Usage
 

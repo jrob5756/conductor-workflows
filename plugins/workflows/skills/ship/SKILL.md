@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Take an existing GitHub issue to a merged pull request by launching the ship Conductor workflow in the background and handing back its dashboard URL. The workflow cuts a worktree, plans behind a question gate, implements, opens a draft PR, runs a code review, then publishes and merges behind a human gate, pausing again if the merge hits conflicts. Supports an autopilot mode that bypasses every gate. Use when the user invokes /workflows:ship, or asks to ship, implement, take on, or work an existing issue end to end — "ship #123", "implement issue 45", "take issue 7 to a PR". Do not use for creating issues, or for changes that have no issue.
+description: Take an existing GitHub issue to a merged pull request by launching the ship Conductor workflow in the background and handing back its dashboard URL. The workflow cuts a worktree, plans behind a question gate, implements, opens a draft PR, reviews it and applies the findings, then publishes and merges behind a human gate, pausing again if the merge hits conflicts. Supports an autopilot mode that bypasses every gate. Use when the user invokes /workflows:ship, or asks to ship, implement, take on, or work an existing issue end to end — "ship #123", "implement issue 45", "take issue 7 to a PR". Do not use for creating issues, or for changes that have no issue.
 argument-hint: issue number, URL, or owner/repo#123
 ---
 
@@ -171,7 +171,8 @@ surprise:
 | `plan_approval` | **Human gate** — approve, revise, or stop |
 | `coder` | Implements, then runs the repository's own build, lint and tests |
 | `ship_draft` | Stages, commits, pushes, opens a **draft** PR |
-| `review` | Code review, applies the fixes, pushes again |
+| `review` | Code review — gathers the blocking and recommended changes, changes nothing |
+| `review_fixer` | Applies those findings, re-runs the checks, pushes (skipped when the review found nothing) |
 | `publish` | Marks the PR ready for review |
 | `merge_gate` | **Human gate** — merge or leave it open |
 | `merge` | Squash merges, deletes the branch, removes the worktree |

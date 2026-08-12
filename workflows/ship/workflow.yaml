@@ -22,8 +22,10 @@
 #     ↓                       build, lint and tests
 #   ship_draft                [git-workflow skill] stage, commit, push, draft PR
 #     ↓
-#   review                    [code-review skill] review AND apply the fixes,
-#     ↓                       then commit and push
+#   review                    [code-review skill] review only — gather the
+#     ↓                       blocking and recommended changes, change nothing
+#   review_fixer              apply those findings, re-verify, commit and push
+#     ↓                       (skipped when the review found nothing)
 #   publish                   [git-workflow skill] mark ready for review
 #     ↓
 #   merge_gate                merge / don't merge (human gate)
@@ -41,10 +43,19 @@
 #   Two, and a human drives both. The coder runs once, and if it does not
 #   finish, `implementation_stalled` asks whether to run it again. If the merge
 #   is blocked by conflicts, `merge_conflicts` asks whether to resolve them and
-#   retry. Everything else is a straight line — the review skill already
-#   re-runs its own checks after applying fixes, so an outer retry loop would
-#   just re-review code that was already reconciled. Declining the merge leaves
-#   the PR open and ends the run; pick it up by hand or start a fresh one.
+#   retry. Everything else is a straight line — `review_fixer` re-runs the
+#   repository's checks after applying the findings, so an outer review loop
+#   would just re-review code that was already reconciled. Declining the merge
+#   leaves the PR open and ends the run; pick it up by hand or start a fresh
+#   one.
+#
+# Review
+#   The review reports and the fixer changes, and neither does the other's job.
+#   An agent that reviews and patches in one pass grades its own work: it stops
+#   writing findings down once it has fixed them, so whatever it got wrong is
+#   invisible by the time anyone reads the summary. Splitting them forces every
+#   finding through a written, self-contained handoff, which is also what makes
+#   the merge gate's "not all were resolved" line trustworthy.
 #
 # Autopilot
 #   `--input autopilot=true` bypasses every human gate, for a run you do not
@@ -86,6 +97,8 @@
 #     worktree_setup                        issues@jason-tools worktree
 #     coder                                 dev@jason-tools    code-comments
 #     review, merge                         prs@jason-tools    code-review, merge-pr
+#     review_fixer, conflict_resolver       git@jason-tools    git-workflow, gh-cli
+#     review_fixer                          dev@jason-tools    code-comments
 #
 #   Entries are `plugin@marketplace`, so they resolve against the installed
 #   `jason-tools` marketplace. To run this against a different marketplace,
@@ -120,7 +133,7 @@
 
 workflow:
   name: ship
-  description: Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a one-question-at-a-time human gate, implements unattended, opens a draft PR, runs a code review and reconciles the findings, then publishes and merges behind a human gate with full branch and worktree cleanup. Merge conflicts pause for a human, and `autopilot` bypasses every gate for a run you do not sit with
+  description: Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a one-question-at-a-time human gate, implements unattended, opens a draft PR, reviews it and applies the findings in a separate step, then publishes and merges behind a human gate with full branch and worktree cleanup. Merge conflicts pause for a human, and `autopilot` bypasses every gate for a run you do not sit with
   version: "1.1.0"
   entry_point: bootstrap
 
@@ -152,6 +165,7 @@ workflow:
 
     max_autopilot_rounds:
       type: number
+      required: false
       default: 2
       description: "How many times autopilot retries by itself before giving up — re-running a coder that did not finish, and re-attempting a merge whose conflicts were not resolved. Bounds the two loops a human would otherwise break. Ignored unless `autopilot` is true."
 
@@ -853,8 +867,8 @@ agents:
       - to: review
 
   - name: review
-    description: Reviews the pull request and applies the resulting fixes, using the code-review skill
-    model: claude-sonnet-5
+    description: Reviews the pull request and reports what needs changing, without touching the code — a separate step applies the findings
+    model: claude-opus-5
     context_tier: long_context
     reasoning:
       effort: high
@@ -870,34 +884,175 @@ agents:
     input:
       - ship_draft.output.pr_number
       - worktree_verify.output.worktree_path
+      - worktree_verify.output.branch
     system_prompt: |
-      You invoke the `code-review` skill and report what it did. The skill owns
-      which reviews run, how findings are ranked, and what happens next — the
-      pull request is the user's own, so its own path is to apply the fixes.
-      Follow it as written.
+      You invoke the `code-review` skill and report its findings. The skill
+      owns which reviews run and how findings are ranked — follow it as written
+      for everything up to and including the aggregated summary.
+
+      You are a reviewer, not an implementer. You do not edit files, do not
+      commit, and do not push. A separate step applies your findings, and it
+      can only apply what you actually wrote down — a finding you fixed
+      yourself, or described too vaguely to act on, is a finding that step will
+      get wrong.
     prompt: |
       /code-review #{{ ship_draft.output.pr_number }}
+      
+      Do not apply the fixes, just report the findings.
+    output:
+      blocking:
+        type: array
+        description: Findings that must be fixed before this can merge. Each entry names the file and line, what is wrong, and what the fix should be, in enough detail to act on without re-reviewing. Empty when nothing blocks.
+      recommendations:
+        type: array
+        description: Findings worth fixing that do not block the merge, in the same self-contained form as blocking entries. Nits are excluded.
+      strengths:
+        type: array
+        description: What the implementation does well, from the review's summary
+      summary:
+        type: string
+        description: The review's overall assessment of the pull request
+      merge_readiness:
+        type: string
+        description: One of ready, needs_work, do_not_merge. Reserve do_not_merge for an objection that fixing the listed findings would not resolve — it stops an autopilot run outright.
+    routes:
+      - to: review_fixer
+        when: "{{ (output.blocking | length) > 0 or (output.recommendations | length) > 0 }}"
+      - to: publish
 
-      Then report what was found and what was changed.
+  - name: review_fixer
+    description: Applies the review's findings and pushes them, so the review itself never has to double as an implementer
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: medium
+    plugins:
+      - git@jason-tools       # git-workflow, gh-cli
+      - dev@jason-tools       # code-comments
+    working_dir: "{{ worktree_verify.output.worktree_path }}"
+    input:
+      - review.output.blocking
+      - review.output.recommendations
+      - review.output.summary
+      - planner.output.plan
+      - planner.output.verification_commands
+      - issue_resolver.output.issue_number
+      - ship_draft.output.pr_number
+      - worktree_verify.output.worktree_path
+      - worktree_verify.output.branch
+    system_prompt: |
+      You apply the findings of a code review that has already happened. The
+      reviewing is done — do not re-review the pull request, do not go looking
+      for problems nobody raised, and do not re-litigate a finding you disagree
+      with by quietly ignoring it.
+
+      Every line you change must trace to a finding you were given. Unrequested
+      refactors, extra hardening and adjacent cleanups are what turn a small
+      review pass into a diff that needs its own review.
+
+      A finding you cannot fix correctly is worth more reported than guessed
+      at. Say so and move on.
+    prompt: |
+      The code review of PR #{{ ship_draft.output.pr_number }} is complete.
+      Apply its findings in the worktree at
+      `{{ worktree_verify.output.worktree_path }}` (branch
+      `{{ worktree_verify.output.branch }}`).
+
+      **The reviewer's assessment:** {{ review.output.summary }}
+
+      {% if (review.output.blocking | length) > 0 %}
+      ## Blocking — fix all of these
+
+      {% for item in review.output.blocking %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% else %}
+      ## Blocking
+
+      None.
+      {% endif %}
+
+      {% if (review.output.recommendations | length) > 0 %}
+      ## Recommendations — apply the ones that are clearly worth it
+
+      These did not block the merge. Apply the ones that are safe, small and
+      clearly correct. Skip any that would grow the diff out of proportion to
+      what they buy, or that you cannot make confidently — and say which you
+      skipped and why. Skipping all of them is a legitimate outcome.
+
+      {% for item in review.output.recommendations %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ## How to work
+
+      1. **Read the actual diff first.** The findings describe it, but the code
+         is the truth:
+
+         ```
+         git status --short
+         git diff origin/{{ worktree_verify.output.branch }}...HEAD
+         ```
+
+      2. **Fix the blocking findings, smallest correct change each.** Work
+         through them in order. If a finding is already fixed, or you believe
+         it is not a real defect, do not silently skip it — record it in
+         `unresolved` with your reasoning.
+
+      3. **Then consider the recommendations**, on the terms above.
+
+      4. **Re-run the repository's own checks**, so a fix that breaks something
+         does not reach the merge gate:
+         {% if planner.output.verification_commands | length > 0 %}
+         {% for cmd in planner.output.verification_commands %}
+         - `{{ cmd }}`
+         {% endfor %}
+         {% else %}
+         Find them in the package manifest, the CI workflows, or the
+         contributor guide, and run them.
+         {% endif %}
+
+      5. **Commit and push** to the existing branch. Use the `git-workflow`
+         skill's `acp` — stage, commit, push. Never force-push and never
+         rebase: the pull request is open, and rewriting its history detaches
+         the review comments on it.
+
+      ## Reporting
+
+      Set `all_resolved: true` only when every blocking finding is genuinely
+      resolved, the checks pass, and the work is pushed. Anything you left —
+      including a finding you disagreed with — belongs in `unresolved` with the
+      reason. A false green here is what lets an autopilot run merge the exact
+      defect the review caught.
     output:
       all_resolved:
         type: boolean
-        description: True when no blocking findings remain outstanding
-      blocking_found:
+        description: True only when every blocking finding was resolved, the verification commands passed, and the work was pushed
+      blocking_resolved:
         type: number
-        description: How many blocking findings the review turned up
-      summary:
-        type: string
-        description: What the review found and what was changed in response
+        description: How many of the blocking findings were actually fixed
+      recommendations_applied:
+        type: array
+        description: The recommendations that were adopted. Empty when none were.
+      recommendations_skipped:
+        type: array
+        description: The recommendations that were deliberately not adopted, each with the reason
       unresolved:
         type: array
-        description: Findings not acted on, each with the reason. Empty when nothing is outstanding.
+        description: Blocking findings not fixed, each with the reason — including any you judged not to be real defects. Empty when all_resolved is true.
+      files_changed:
+        type: array
+        description: Paths of files modified while applying the findings, relative to the worktree root
+      verification:
+        type: string
+        description: Which verification commands were run after the fixes and what they reported
+      summary:
+        type: string
+        description: What was changed in response to the review
       pushed:
         type: boolean
-        description: True when fixes were committed and pushed to the branch
-      merge_readiness:
-        type: string
-        description: One of ready, needs_work, do_not_merge
+        description: True when the fixes were committed and pushed to the branch
     routes:
       - to: publish
 
@@ -947,8 +1102,11 @@ agents:
       # Autopilot has no gate to show the review at, so the review's own verdict
       # becomes the stop condition. This is not a human approval being bypassed
       # — it is the one check that would have made a human decline the merge.
+      # `do_not_merge` is a hard stop because it is reserved for objections the
+      # fix step cannot clear; everything else is judged on what that step
+      # actually resolved.
       - to: review_rejected
-        when: "{{ workflow.input.autopilot and review is defined and (not review.output.all_resolved or review.output.merge_readiness == 'do_not_merge') }}"
+        when: "{{ workflow.input.autopilot and review is defined and (review.output.merge_readiness == 'do_not_merge' or (review_fixer is defined and not review_fixer.output.all_resolved)) }}"
       - to: merge
         when: "{{ workflow.input.autopilot }}"
       - to: merge_gate
@@ -958,14 +1116,16 @@ agents:
     status: failed
     input:
       - review.output?
+      - review_fixer.output?
       - publish.output.pr_url?
     reason: >-
       Autopilot stopped before merging: the code review did not clear the pull
       request
-      {%- if review is defined %} ({{ review.output.merge_readiness }}
-      {%- if not review.output.all_resolved %}, {{ review.output.blocking_found }} blocking finding(s) with
-      {{ review.output.unresolved | length }} left unresolved: {{ review.output.unresolved | join('; ') }}
-      {%- endif %})
+      {%- if review is defined %} ({{ review.output.merge_readiness }}, {{ review.output.blocking | length }} blocking finding(s))
+      {%- endif %}
+      {%- if review_fixer is defined and not review_fixer.output.all_resolved %}
+      and the fix step left {{ review_fixer.output.unresolved | length }} of them outstanding:
+      {{ review_fixer.output.unresolved | join('; ') }}
       {%- endif %}. The pull request is left open for a human to finish
       {%- if publish is defined %} — {{ publish.output.pr_url }}{% endif %}.
 
@@ -994,22 +1154,38 @@ agents:
       {% if review is defined %}
       **Review:** {{ review.output.summary }}
 
-      {% if review.output.blocking_found > 0 %}
-      {{ review.output.blocking_found }} blocking finding(s) were raised and
-      {% if review.output.all_resolved %}all were resolved.{% else %}**not all were resolved.**{% endif %}
+      {% if (review.output.blocking | length) > 0 %}
+      {{ review.output.blocking | length }} blocking finding(s) were raised and
+      {% if review_fixer is defined and review_fixer.output.all_resolved %}all were resolved.{% else %}**not all were resolved.**{% endif %}
       {% else %}
       No blocking findings.
       {% endif %}
 
-      {% if review.output.pushed %}
+      {% if review_fixer is defined %}
+
+      **Fixes applied:** {{ review_fixer.output.summary }}
+
+      {% if review_fixer.output.verification %}
+      **Verified with:** {{ review_fixer.output.verification }}
+      {% endif %}
+
+      {% if review_fixer.output.pushed %}
       Fixes were committed and pushed to `{{ worktree_verify.output.branch }}`.
       {% endif %}
 
-      {% if (review.output.unresolved | length) > 0 %}
-      **Deliberately not addressed:**
-      {% for item in review.output.unresolved %}
+      {% if (review_fixer.output.unresolved | length) > 0 %}
+      **Blocking findings left outstanding:**
+      {% for item in review_fixer.output.unresolved %}
       - {{ item }}
       {% endfor %}
+      {% endif %}
+
+      {% if (review_fixer.output.recommendations_skipped | length) > 0 %}
+      **Recommendations deliberately not taken:**
+      {% for item in review_fixer.output.recommendations_skipped %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
       {% endif %}
       {% endif %}
 
@@ -1376,9 +1552,13 @@ output:
   files_changed: "{{ coder.output.files_changed if coder is defined else [] }}"
   pr_url: "{{ ship_draft.output.pr_url if ship_draft is defined else '' }}"
   pr_number: "{{ ship_draft.output.pr_number if ship_draft is defined else 0 }}"
-  review_blocking_found: "{{ review.output.blocking_found if review is defined else 0 }}"
+  review_blocking_found: "{{ review.output.blocking | length if review is defined else 0 }}"
+  review_recommendations_found: "{{ review.output.recommendations | length if review is defined else 0 }}"
   review_summary: "{{ review.output.summary if review is defined else '' }}"
-  unresolved_findings: "{{ review.output.unresolved if review is defined else [] }}"
+  review_merge_readiness: "{{ review.output.merge_readiness if review is defined else '' }}"
+  review_fixes_applied: "{{ review_fixer.output.summary if review_fixer is defined else '' }}"
+  review_all_resolved: "{{ review_fixer.output.all_resolved if review_fixer is defined else true }}"
+  unresolved_findings: "{{ review_fixer.output.unresolved if review_fixer is defined else [] }}"
   merged: "{{ merge.output.merged if merge is defined else false }}"
   merge_commit: "{{ merge.output.merge_commit if merge is defined else '' }}"
   merge_blocked_by_conflicts: "{{ merge.output.blocked_by_conflicts if merge is defined else false }}"
