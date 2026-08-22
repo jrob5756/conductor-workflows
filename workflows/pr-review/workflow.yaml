@@ -1,742 +1,1045 @@
 # PR Review Workflow
 #
-# Multi-agent PR review combining specialist depth with structured deliberation.
-# Composed of five sub-workflows for separation of concerns:
+# Reviews someone else's pull request and posts the findings you approve,
+# orchestrating the skills you already run by hand rather than reimplementing
+# their logic:
 #
-#   pr_fetcher (gh CLI script — self-contained)
+#   bootstrap (script)       resolve repo root / gh identity / worktrees dir
 #     ↓
-#   dispatcher (validates inputs, prepares nonce-wrapped diff, loads context)
+#   pr_resolver              read the pull request from GitHub, and report the
+#     ↓                      repository and gh login it actually resolved
+#   author_gate ────────────→ only when the PR is yours: review anyway / stop
 #     ↓
-#   triage (sub-workflow: subworkflows/triage.yaml)
-#     Heuristic file-pattern classifier + cheap LLM pass + resolver. Decides
-#     which specialists are actually needed for THIS PR. Skipped specialists
-#     short-circuit via Jinja early-exit (no model load, ~50 tokens).
+#   pr_worktree (script)     fetch pull/N/head, cut a throwaway worktree
 #     ↓
-#   specialists (sub-workflow: subworkflows/specialists.yaml)
-#     6 deep-domain specialists run in parallel (each with early-exit if not
-#     in triage's recommended list) → gate → consolidator
+#   concept_review           [concept-review skill] is this a sound change at
+#     ↓                      all, before anything expensive runs
+#   concept_gate ───────────→ only when it found blocking gaps:
+#     ↓                        proceed / post the concept findings and stop /
+#     ↓                        stop without posting
+#   code_review              [code-review skill] report only, change nothing
 #     ↓
-#   deliberate (sub-workflow: subworkflows/deliberate.yaml)
-#     2 cross-cutting lens reviewers run in parallel over the consolidated set,
-#     then sequential deliberation rounds with arbitration until consensus or
-#     max_rounds is exhausted
+#   build_questions (script) findings → strictly shaped question objects
 #     ↓
-#   polish (sub-workflow: subworkflows/polish.yaml)
-#     2 advisory polish agents (code-simplifier, dead-code-finder) in parallel
+#   triage (questions)       per finding: post as-is / reword / drop
 #     ↓
-#   render (sub-workflow: subworkflows/render.yaml)
-#     report_writer + inline_comments_writer + output_writer
+#   apply_triage (script)    drop what you dropped, before a model sees it
 #     ↓
-#   [optional] poster (gh CLI script — gated on auto_post=true)
+#   comment_writer           [humanizer skill] final wording, inline anchors
+#     ↓
+#   post_review (script)     one review, event=COMMENT, inline where it can
+#     ↓
+#   cleanup (script)         remove the worktree and its branch
 #     ↓
 #   $end
 #
-# The five sub-workflows can also be invoked directly for debugging — each
-# accepts the parent dispatcher's outputs as workflow inputs.
+# Targeting
+#   The reference may name a repository — `owner/repo#123`, or a full URL —
+#   but the worktree and the posted review both target the repository you are
+#   standing in. `pr_resolver` therefore reports the repository it actually
+#   read, and the run stops when the two disagree. Without that check, passing
+#   a reference from elsewhere reviews one pull request and comments on
+#   another that happens to share its number.
 #
-# Each sub-workflow persists its raw outputs to <pr_data_dir>/*.json so
-# downstream stages and the render sub-workflow can read them via MCP
-# filesystem instead of carrying everything through input_mapping.
+#   For the same reason `pr_resolver` reports the `gh` login it ended up
+#   authenticated as rather than the one captured at startup: it is allowed to
+#   switch accounts to read a private pull request, and the own-PR gate is
+#   worthless if it compares the author against a login that is no longer in
+#   effect.
+#
+# Order
+#   The concept review runs first because it is the cheap question. Deciding a
+#   change should not exist at all after seven code specialists have picked
+#   over its error handling wastes the specialists and, worse, anchors the
+#   conversation on line-level detail that was never the point.
+#
+# Review and posting are separate
+#   `code_review` reports and never edits, `comment_writer` words and never
+#   judges, `post_review` publishes and never writes. An agent that reviews and
+#   publishes in one pass grades its own work: it stops writing findings down
+#   once it has phrased them, so whatever it dropped is invisible by the time
+#   anyone reads the review. Splitting them forces every finding through a
+#   written handoff, which is also what makes the triage list trustworthy.
+#
+#   `apply_triage` sits between the decision and the wording for the same
+#   reason. A model handed every finding and told which to ignore can still
+#   leak a dropped one into a summary line, and the person whose pull request
+#   it is cannot tell that happened. Removing them first makes it impossible
+#   rather than discouraged.
+#
+# Triage
+#   Every finding is put to you individually, prefixed BLOCKING or RECOMMENDED.
+#   Three outcomes come from two choices plus the write-your-own path, because
+#   a third choice reading "reword it" would record that label and no wording —
+#   choices carry no follow-up prompt. Skipping a question posts it as-is, so
+#   "skip all remaining" means "post the rest verbatim", which is the fast path
+#   once you have read the first few. Aborting posts nothing.
+#
+#   Nits never reach you. `code-review` ranks them separately and they are not
+#   worth a decision each.
+#
+# Inline comments
+#   GitHub rejects an entire review with a 422 if one comment names a line
+#   outside the diff, so a single bad anchor loses every comment. `post_review`
+#   parses the diff from the worktree the review actually ran against, keeps
+#   the comments it can anchor, and folds the rest into the review body. If the
+#   POST is refused outright it retries once with everything in the body: a
+#   review that reads slightly worse beats a review that was never posted. It
+#   never retries a failure that might have been accepted, such as a timeout,
+#   because that would post a second review to a real person's pull request.
+#
+# Working directories
+#   Steps with no `working_dir` run in the directory you invoked
+#   `conductor run` from, so the workflow targets whatever repository you are
+#   standing in. The two review agents pin `working_dir` to the worktree, which
+#   is the only reason it exists. `cleanup` deliberately does not, mirroring
+#   the manual step of leaving a worktree before deleting it.
+#
+#   The scripts resolve through `{{ workflow.dir }}`, so they are found whether
+#   the workflow is run by path or through a registry, from any repository.
+#
+# Loops
+#   None. Every gate either continues or ends the run, and no step re-runs
+#   another. Revisiting a triage answer happens inside the questions node,
+#   which is one engine step, so Back costs no iterations and cannot loop.
+#
+# Plugins
+#   Each step declares the plugin whose skill it drives, rather than the
+#   workflow enabling skill discovery and excluding everything it does not
+#   want. An allowlist cannot leak: installing a new plugin later has no effect
+#   on this run, where a blocklist silently grew.
+#
+#   Declaring the plugin also loads what the skill depends on. `code-review`
+#   dispatches to the seven specialist subagents `prs` ships in `agents/`;
+#   discovering the skill alone leaves it calling agents that are not there.
+#
+#     pr_resolver                     git@jason-tools      gh-cli
+#     concept_review                  prs@jason-tools      concept-review
+#     code_review                     prs@jason-tools      code-review
+#     comment_writer                  writing@jason-tools  humanizer
+#
+#   Entries are `plugin@marketplace`, so they resolve against the installed
+#   `jason-tools` marketplace. To run this against a different marketplace,
+#   rewrite the suffixes, or declare `runtime.plugin_sources` to fetch one by
+#   git URL and make the workflow self-installing.
+#
+#   Nothing else is loaded. `merge-pr` in particular is absent, so a review
+#   agent cannot merge the thing it is reviewing.
 #
 # Usage:
-#   conductor run workflows/pr-review/workflow.yaml \
-#     --input pr_url="https://github.com/owner/repo/pull/123"
+#   Run it from the repository the pull request belongs to.
 #
-#   With focus and re-review delta mode:
-#   conductor run workflows/pr-review/workflow.yaml \
-#     --input pr_url="https://github.com/owner/repo/pull/123" \
-#     --input focus="security and error handling" \
-#     --input previous_review_path="reviews/pr-123-review-report.md" \
-#     --input review_number=2
+#     conductor run workflows/pr-review/workflow.yaml --input pr=123
 #
-#   Auto-post the review back to the PR:
-#   conductor run workflows/pr-review/workflow.yaml \
-#     --input pr_url="https://github.com/owner/repo/pull/123" \
-#     --input auto_post=true
+#   The reference can also be a URL or an `owner/repo#123` reference:
+#     conductor run workflows/pr-review/workflow.yaml \
+#       --input pr="https://github.com/owner/repo/pull/123"
 #
 # Requires:
-#   - gh (GitHub CLI) on PATH and authenticated (`gh auth status`)
-#   - python3 on PATH (used by the fetcher / poster / persist helpers)
-#   - Node.js 18+ (used by the @modelcontextprotocol/server-filesystem MCP server)
+#   - git and gh (GitHub CLI) on PATH, with `gh auth status` passing
+#   - python3 on PATH (used by every script step)
+#   - The plugins listed above installed from the `jason-tools` marketplace
 
 workflow:
   name: pr-review
-  description: Multi-agent PR review combining specialist depth (code, security, tests, errors, types, comments) with cross-lens deliberation, consensus arbitration, smart per-PR triage, and a non-blocking polish stage. Composed of five sub-workflows.
-  version: "1.2.0"
-  entry_point: pr_fetcher
+  description: Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows
+  version: "1.0.0"
+  entry_point: bootstrap
 
   runtime:
     provider: copilot
     default_model: claude-sonnet-5
-    max_session_seconds: 1800
-    mcp_servers:
-      filesystem:
-        command: npx
-        args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
-        tools: ["read_file", "write_file", "create_directory", "list_directory"]
+    max_session_seconds: 3600
+    checkpoint:
+      every_agent: true   # human-gated run — keep it resumable after an
+      keep_last: 5        # external interruption
 
   input:
-    pr_url:
+    pr:
       type: string
       required: true
-      description: "GitHub PR URL (e.g. https://github.com/owner/repo/pull/123). Only github.com URLs are supported in v1; ADO support is on the roadmap."
-
-    focus:
-      type: string
-      required: false
-      default: ""
-      description: "Free-text guidance to direct reviewer attention (e.g., 'Focus on security and error handling around the auth changes')."
-
-    exclude:
-      type: array
-      required: false
-      default: []
-      description: "Aspects to de-prioritise. Valid values: correctness, security, error_handling, performance, testing, completeness."
-
-    enabled_specialists:
-      type: array
-      required: false
-      default: ["code", "security", "tests", "errors", "types", "comments"]
-      description: "User-facing whitelist of specialists. Triage intersects its recommendation with this list. Use to permanently exclude a specialist from all PRs."
-
-    triage_mode:
-      type: string
-      required: false
-      default: "auto"
-      description: "How to choose which specialists run. 'auto' = run heuristic + LLM triage and skip non-applicable specialists (recommended). 'all' = bypass triage and run every specialist in enabled_specialists (safest, most expensive)."
-
-    force_specialists:
-      type: array
-      required: false
-      default: []
-      description: "Specialists that must always run, bypassing triage's skip decision (but still subject to enabled_specialists)."
-
-    triage_model:
-      type: string
-      required: false
-      default: "claude-haiku-4.5"
-      description: "Cheap model for the triage_llm step that refines the heuristic's specialist recommendation. Only ~3K tokens of context, ~200 tokens out — keep it cheap."
-
-    include_polish:
-      type: boolean
-      required: false
-      default: true
-      description: "Run the polish sub-workflow (code-simplifier + dead-code-finder) after deliberation. Their findings are advisory and never block merge_readiness."
-
-    polish_as_inline:
-      type: boolean
-      required: false
-      default: false
-      description: "Promote polish findings to inline PR comments. Default false: polish findings appear in the report only."
-
-    strictness:
-      type: number
-      required: false
-      default: 2
-      description: "Review strictness (1-3). 1 = critical only. 2 = standard. 3 = thorough."
-
-    max_rounds:
-      type: number
-      required: false
-      default: 2
-      description: "Maximum deliberation rounds (clamped 1-10)."
-
-    custom_rules_dir:
-      type: string
-      required: false
-      default: ""
-      description: "Path to a .pr-review/ directory containing scoped custom rules."
-
-    guidelines_path:
-      type: string
-      required: false
-      default: ""
-      description: "Path to a single team guidelines markdown file."
-
-    codebase_context_path:
-      type: string
-      required: false
-      default: ""
-      description: "Path to a precomputed codebase-context markdown."
-
-    previous_review_path:
-      type: string
-      required: false
-      default: ""
-      description: "Path to a prior pr-<N>-review-report.md from an earlier run. When provided, render produces a delta report."
-
-    prior_feedback_path:
-      type: string
-      required: false
-      default: ""
-      description: "JSON file with PR-author / maintainer replies to the most recent prior bot review."
-
-    review_number:
-      type: number
-      required: false
-      default: 1
-      description: "Sequential review number (1-based) for archive filenames + delta header."
-
-    output_dir:
-      type: string
-      required: false
-      default: ""
-      description: "Where to write final artifacts. Empty = workflow temp dir."
-
-    diff_boundary_nonce:
-      type: string
-      required: false
-      default: ""
-      description: "Pre-generated 8-char hex nonce for diff boundary markers. Empty → dispatcher generates one."
-
-    auto_post:
-      type: boolean
-      required: false
-      default: false
-      description: "Post the rendered comment + inline comments back to the PR via gh CLI when complete."
-
-    lens_skeptic_model:
-      type: string
-      required: false
-      default: "claude-opus-5"
-      description: "Model for the Skeptic lens."
-
-    lens_completeness_model:
-      type: string
-      required: false
-      default: "gpt-5.5"
-      description: "Model for the Completeness lens (cross-family)."
-
-    specialist_code_model:
-      type: string
-      required: false
-      default: "claude-opus-5"
-    specialist_security_model:
-      type: string
-      required: false
-      default: "claude-opus-5"
-      description: "Model for specialist_security (CVSS-style vulnerability review). Defaults to opus because security balancing of true-positives vs false-positives benefits from strong reasoning."
-    specialist_tests_model:
-      type: string
-      required: false
-      default: "claude-sonnet-5"
-    specialist_errors_model:
-      type: string
-      required: false
-      default: "claude-opus-5"
-    specialist_types_model:
-      type: string
-      required: false
-      default: "claude-sonnet-5"
-    specialist_comments_model:
-      type: string
-      required: false
-      default: "claude-sonnet-5"
-    polish_simplifier_model:
-      type: string
-      required: false
-      default: "claude-sonnet-5"
-    polish_dead_code_model:
-      type: string
-      required: false
-      default: "claude-sonnet-5"
+      description: "Pull request to review — a number (`123`), a full URL, or `owner/repo#123`. It must already exist; this workflow never opens one."
 
   context:
     mode: explicit
 
   limits:
-    # Slim parent: pr_fetcher + dispatcher + 5 sub-workflow calls + poster = 8
-    # Sub-workflows have their own iteration budgets internally.
-    max_iterations: 30
+    max_iterations: 80
 
-  cost:
-    show_summary: true
-    show_per_agent: true
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AGENTS
-# ─────────────────────────────────────────────────────────────────────────────
 agents:
+  # ---------------------------------------------------------------------------
+  # Setup
+  # ---------------------------------------------------------------------------
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # PR_FETCHER — Script step. Uses gh CLI to fetch PR data from GitHub.
-  # Writes metadata.json, diff.patch, changed-files.json into a temp dir.
-  # Emits a JSON object on stdout that conductor auto-merges into output.*
-  # so downstream agents can reference pr_fetcher.output.pr_data_dir etc.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: pr_fetcher
-    description: Fetches PR metadata, diff, and changed files from GitHub using the gh CLI
+  - name: bootstrap
+    description: Resolves the target repository and your GitHub identity from the directory the workflow was invoked in
     type: script
     command: python3
     timeout: 120
     args:
-      - "workflows/pr-review/scripts/fetch_pr.py"
-      - "{{ workflow.input.pr_url }}"
-      - "{{ workflow.input.output_dir }}"
+      - "{{ workflow.dir }}/scripts/bootstrap.py"
     routes:
-      - to: $end
-        when: "{{ output.exit_code != 0 }}"
-      - to: dispatcher
+      - to: bootstrap_failed
+        when: "{{ not output.ok }}"
+      - to: pr_resolver
 
-  - name: dispatcher
-    description: Validates inputs, wraps the diff in nonce-based boundary markers, and loads optional reviewer context (custom rules, codebase context, work items, prior author feedback, team guidelines)
+  - name: bootstrap_failed
+    type: terminate
+    status: failed
+    input:
+      - bootstrap.output.error
+    reason: "{{ bootstrap.output.error }}"
+
+  - name: pr_resolver
+    description: Loads the pull request under review from GitHub
     model: claude-sonnet-5
+    reasoning:
+      effort: medium
+    plugins:
+      - git@jason-tools       # gh-cli — account switching on a 404 or 403
     input:
-      - pr_fetcher.output.pr_data_dir
-      - pr_fetcher.output.pr_url
-      - pr_fetcher.output.pr_number
-      - pr_fetcher.output.platform
-      - workflow.input.guidelines_path?
-      - workflow.input.focus
-      - workflow.input.exclude
-      - workflow.input.output_dir
-      - workflow.input.max_rounds
-      - workflow.input.strictness
-      - workflow.input.codebase_context_path?
-      - workflow.input.custom_rules_dir?
-      - workflow.input.previous_review_path?
-      - workflow.input.prior_feedback_path?
-      - workflow.input.diff_boundary_nonce?
+      - workflow.input.pr
+      - bootstrap.output.name_with_owner
+      - bootstrap.output.gh_user
+      - bootstrap.output.default_branch
     system_prompt: |
-      You are a PR review dispatcher. Your job is to validate inputs, prepare
-      the diff for downstream specialists with nonce-based boundary markers,
-      and load optional context files (custom rules, codebase context, linked
-      work items, prior author feedback, team guidelines).
+      You resolve the unit of work for a review pipeline: you read an existing
+      pull request and report it. You never create, edit, close, approve or
+      merge a pull request, you never comment on one, and you never touch git
+      branches or working trees.
 
-      You are a setup agent — do NOT review or analyse the code. Validate
-      inputs, prepare files, output paths and metadata.
-
-      ## Path Validation (defense in depth)
-
-      The MCP filesystem server is scoped to "." (the working directory) — that
-      is the hard security boundary. The validation below is defense in depth
-      to fail fast with clear error messages.
-
-      Normalise each path (resolve URL-encoded sequences, collapse separators,
-      convert backslashes to forward slashes), then verify it does NOT contain
-      `../` or `..\\`. Validate every path-typed input that is non-empty:
-      pr_data_dir, output_dir, guidelines_path, codebase_context_path,
-      custom_rules_dir, previous_review_path,
-      prior_feedback_path. If traversal is detected anywhere, set the
-      offending path to an empty string and record the error in metadata.
-
-      ## Strictness / Max Rounds Validation
-
-      - `strictness` must be 1, 2, or 3. Out-of-range values default to 2 and
-        are recorded in metadata.
-      - `max_rounds` is clamped to [1, 10]. Record any clamping in metadata.
-
-      ## Exclude Field Hygiene
-
-      For each value in `exclude`: trim whitespace, drop empty strings, dedupe,
-      lowercase. Valid values: correctness, security, error_handling,
-      performance, testing, completeness.
-
-      ## Diff Preparation (mandatory)
-
-      1. Read `<pr_data_dir>/diff.patch` using the `read_file` tool.
-      2. Choose a nonce: if `diff_boundary_nonce` workflow input is non-empty,
-         use it as-is. Otherwise generate an 8-char hex string (e.g. `a3f8b2c1`).
-      3. Use `write_file` to write `<pr_data_dir>/prepared-diff.txt` with the
-         exact content `<diff-NONCE>\n<raw diff content>\n</diff-NONCE>` where
-         `NONCE` is the chosen hex string.
-      4. Output the nonce as `diff_boundary_nonce` so specialists know the marker.
-
-      ## Optional Context Files
-
-      For each of the following inputs that is non-empty, use `read_file` to
-      load the file content. If a file is missing or unreadable, set the
-      corresponding output to an empty string and note it in metadata — none of
-      these are fatal.
-
-      - `guidelines_path` → `guidelines_content`
-      - `codebase_context_path` → `codebase_context`
-      - `prior_feedback_path` → `prior_feedback_content`
-
-      ### Custom Rules
-
-      If `custom_rules_dir` is non-empty, attempt to read these files inside it:
-      - `config.json` — structured rules with glob scopes
-      - `rules.md` — free-form prose rules
-      - `files.json` — reference file paths
-
-      Combine into a single `custom_rules` string with clear section headers
-      so reviewers know which rules apply where. Missing files are not errors.
-
+      Use the `gh` CLI for every GitHub operation. If a `gh` call fails with a
+      404 or a permission error, run `gh auth status`, try `gh auth switch`,
+      and retry once before reporting failure.
     prompt: |
-      Read the PR metadata and prepare files for review.
+      Repository: `{{ bootstrap.output.name_with_owner }}`
+      Default branch: `{{ bootstrap.output.default_branch }}`
 
-      **PR data directory:** {{ pr_fetcher.output.pr_data_dir }}
-      **PR URL:** {{ pr_fetcher.output.pr_url }}
+      ## Load pull request `{{ workflow.input.pr }}`
 
-      {% if workflow.input.guidelines_path %}
-      **Guidelines path:** {{ workflow.input.guidelines_path }}
-      {% endif %}
+      The reference may be a bare number, a full URL, or `owner/repo#123`.
+      Normalise it, then read the pull request:
 
-      **Focus areas:** {{ workflow.input.focus }}
-      **Exclude areas:** {{ workflow.input.exclude | tojson }}
-      **Output directory:** {{ workflow.input.output_dir }}
-      **Max rounds:** {{ workflow.input.max_rounds }}
+      ```
+      gh pr view <number> -R <owner>/<repo> \
+        --json number,title,author,baseRefName,state,isDraft,isCrossRepository,url
+      ```
 
-      Steps:
+      Report the repository you actually read in `name_with_owner`, as
+      `owner/repo`. If the reference named one, that is the one you report,
+      even when it is not the repository above — a later step compares the two
+      and stops rather than reviewing the wrong pull request.
 
-      1. **Validate paths** — check `../` and `..\\` in every non-empty path
-         input. Reject any traversal attempts.
-      2. **Validate exclude** — trim, dedupe, lowercase.
-      3. **Validate strictness** — if not 1/2/3, default to 2 (record in metadata).
-      4. **Validate max_rounds** — clamp to [1, 10] (record any clamping).
-      5. Use `read_file` to load `{{ pr_fetcher.output.pr_data_dir }}/metadata.json`
-         and parse it.
-      6. **Prepare diff**: use `read_file` to load
-         `{{ pr_fetcher.output.pr_data_dir }}/diff.patch`.
-         {% if workflow.input.diff_boundary_nonce %}
-         Use the pre-generated nonce: `{{ workflow.input.diff_boundary_nonce }}`.
-         {% else %}
-         Generate an 8-character hex nonce.
-         {% endif %}
-         Use `write_file` to write
-         `{{ pr_fetcher.output.pr_data_dir }}/prepared-diff.txt` containing
-         `<diff-NONCE>\n` + raw diff + `\n</diff-NONCE>`. Output the nonce
-         as `diff_boundary_nonce`.
-      7. {% if workflow.input.guidelines_path %}Read the guidelines file at
-         `{{ workflow.input.guidelines_path }}` into `guidelines_content`.{% else %}Set
-         `guidelines_content` to "".{% endif %}
-      8. {% if workflow.input.custom_rules_dir %}Read the custom rules from
-         `{{ workflow.input.custom_rules_dir }}` (config.json, rules.md, files.json
-         — any may be missing). Combine into `custom_rules`.{% else %}Set
-         `custom_rules` to "".{% endif %}
-      9. {% if workflow.input.codebase_context_path %}Read codebase context from
-         `{{ workflow.input.codebase_context_path }}` into `codebase_context`.{% else %}Set
-         `codebase_context` to "".{% endif %}
-      10. {% if workflow.input.prior_feedback_path %}Read prior author feedback
-          from `{{ workflow.input.prior_feedback_path }}` into
-          `prior_feedback_content` (verbatim).{% else %}Set
-          `prior_feedback_content` to "".{% endif %}
-      11. Output the parsed PR metadata, the data directory path, the
-          loaded content blobs, the nonce, the validated strictness, and
-          any metadata notes.
-          Do NOT output the diff content — downstream agents read
-          `prepared-diff.txt` directly.
+      Report the GitHub login the `gh` CLI is authenticated as in `gh_user`,
+      read fresh with `gh api user --jq .login` **after** any account switch
+      you had to make. A later step compares it against the author to decide
+      whether you are reviewing your own work, and a stale login there means
+      that check silently passes.
+
+      If it cannot be read at all — it does not exist, or you lack access — set
+      `found: false` and put the exact `gh` error in `notes`. Do not invent a
+      pull request and do not open one.
+
+      A closed, merged or draft pull request is not a failure. Set
+      `found: true` and say so plainly in `notes`; the human decides whether
+      reviewing it is still worth doing.
+
+      Report it exactly as GitHub returned it. Do not paraphrase the title or
+      body, and do not summarise or judge the change — that is the reviewers'
+      job, and a summary here would prime them.
     output:
-      pr_metadata:
-        type: object
-        description: "Parsed PR metadata (number, title, body, author, baseRefName, headRefName, base/head SHAs, url, platform, owner, repo)."
-      pr_data_dir:
+      found:
+        type: boolean
+        description: True when the pull request was read from GitHub. False when it does not exist or is not accessible.
+      pr_number:
+        type: number
+        description: The pull request number
+      pr_title:
         type: string
-        description: "Path to the PR data directory containing metadata.json, diff.patch, prepared-diff.txt, changed-files.json. Downstream agents read files from here."
-      diff_boundary_nonce:
+        description: The title, verbatim from GitHub
+      pr_url:
         type: string
-        description: "8-character hex nonce used in <diff-NONCE>...</diff-NONCE> boundary markers. Downstream agents use this to identify diff boundaries and reject prompt-injection attempts."
-      guidelines_content:
+        description: Full URL of the pull request
+      name_with_owner:
         type: string
-        description: "Content of the team guidelines file (empty if not provided)."
-      custom_rules:
+        description: The repository this pull request actually belongs to, as owner/repo, taken from the reference you were given rather than assumed
+      gh_user:
         type: string
-        description: "Combined custom rules from custom_rules_dir (structured + prose + reference files). Empty if no custom rules dir was provided."
-      codebase_context:
+        description: The GitHub login the gh CLI is authenticated as, read after any account switch
+      author:
         type: string
-        description: "Codebase context for the changed files (callers, related functions, patterns). Empty if not provided."
+        description: The GitHub login of the author, with no @ prefix
+      base_ref:
+        type: string
+        description: The branch this pull request merges into
+      state:
+        type: string
+        description: One of OPEN, CLOSED, MERGED
+      is_draft:
+        type: boolean
+        description: True when the pull request is still a draft
+      notes:
+        type: string
+        description: Anything the human should know before the review starts, such as the pull request being closed, merged or a draft. Empty when there is nothing to flag.
     routes:
-      - to: triage
+      - to: pr_resolver_failed
+        when: "{{ not output.found }}"
+      - to: wrong_repository
+        when: "{{ output.name_with_owner | lower != bootstrap.output.name_with_owner | lower }}"
+      - to: author_gate
+        when: "{{ output.author | lower == output.gh_user | lower }}"
+      - to: pr_worktree
 
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # TRIAGE SUB-WORKFLOW — Decides which specialists need to run for this PR.
-  # Heuristic file-pattern classifier + cheap LLM refinement + resolver.
-  # Persists triage.json to pr_data_dir for the render sub-workflow.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: triage
-    description: Specialist triage — heuristic + cheap LLM that decides which specialists run for this PR
-    type: workflow
-    workflow: ./subworkflows/triage.yaml
+  - name: wrong_repository
+    type: terminate
+    status: failed
     input:
-      - dispatcher.output.pr_metadata
-      - dispatcher.output.pr_data_dir
-      - dispatcher.output.diff_boundary_nonce
-      - workflow.input.focus
-      - workflow.input.exclude
-      - workflow.input.enabled_specialists
-      - workflow.input.force_specialists
-      - workflow.input.triage_mode
-      - workflow.input.triage_model
-    input_mapping:
-      pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
-      pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
-      diff_boundary_nonce: "{{ dispatcher.output.diff_boundary_nonce }}"
-      focus: "{{ workflow.input.focus }}"
-      exclude: "{{ workflow.input.exclude | tojson }}"
-      enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
-      force_specialists: "{{ workflow.input.force_specialists | tojson }}"
-      triage_mode: "{{ workflow.input.triage_mode }}"
-      triage_model: "{{ workflow.input.triage_model }}"
-    routes:
-      - to: specialists
+      - workflow.input.pr
+      - pr_resolver.output.name_with_owner
+      - bootstrap.output.name_with_owner
+    reason: "'{{ workflow.input.pr }}' belongs to {{ pr_resolver.output.name_with_owner }}, but this run started in {{ bootstrap.output.name_with_owner }}. The worktree and the posted review both target the repository you are standing in, so continuing would review one pull request and comment on another. Run this from {{ pr_resolver.output.name_with_owner }} instead."
 
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # SPECIALISTS SUB-WORKFLOW — 6 specialists in parallel + gate + consolidator.
-  # Each specialist short-circuits via Jinja early-exit if not in
-  # triage.output.recommended_specialists.
-  # Persists raw outputs to pr_data_dir for the render sub-workflow to read.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: specialists
-    description: Specialist review phase — runs 6 deep-domain specialists in parallel (gated by triage), validates them, normalises and dedupes findings
-    type: workflow
-    workflow: ./subworkflows/specialists.yaml
+  - name: pr_resolver_failed
+    type: terminate
+    status: failed
     input:
-      - dispatcher.output.pr_metadata
-      - dispatcher.output.pr_data_dir
-      - dispatcher.output.diff_boundary_nonce
-      - dispatcher.output.guidelines_content
-      - dispatcher.output.custom_rules
-      - dispatcher.output.codebase_context
-      - dispatcher.output.prior_feedback_content
-      - dispatcher.output.strictness
-      - workflow.input.focus
-      - workflow.input.exclude
-      - workflow.input.enabled_specialists
-      - triage.output.recommended_specialists
-      - triage.output.skipped_specialists
-      - workflow.input.specialist_code_model
-      - workflow.input.specialist_security_model
-      - workflow.input.specialist_tests_model
-      - workflow.input.specialist_errors_model
-      - workflow.input.specialist_types_model
-      - workflow.input.specialist_comments_model
-    input_mapping:
-      pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
-      pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
-      diff_boundary_nonce: "{{ dispatcher.output.diff_boundary_nonce }}"
-      guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
-      custom_rules: "{{ dispatcher.output.custom_rules | default('') }}"
-      codebase_context: "{{ dispatcher.output.codebase_context | default('') }}"
-      prior_feedback_content: "{{ dispatcher.output.prior_feedback_content | default('') }}"
-      strictness: "{{ dispatcher.output.strictness }}"
-      focus: "{{ workflow.input.focus }}"
-      exclude: "{{ workflow.input.exclude | tojson }}"
-      enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
-      recommended_specialists: "{{ triage.output.recommended_specialists }}"
-      skipped_specialists: "{{ triage.output.skipped_specialists }}"
-      specialist_code_model: "{{ workflow.input.specialist_code_model }}"
-      specialist_security_model: "{{ workflow.input.specialist_security_model }}"
-      specialist_tests_model: "{{ workflow.input.specialist_tests_model }}"
-      specialist_errors_model: "{{ workflow.input.specialist_errors_model }}"
-      specialist_types_model: "{{ workflow.input.specialist_types_model }}"
-      specialist_comments_model: "{{ workflow.input.specialist_comments_model }}"
-    routes:
-      - to: deliberate
-        when: "{{ specialists.output.valid_count >= 1 }}"
-      - to: $end
+      - workflow.input.pr
+      - pr_resolver.output.notes
+    reason: "Pull request '{{ workflow.input.pr }}' could not be read from GitHub. {{ pr_resolver.output.notes }}"
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # DELIBERATE SUB-WORKFLOW — Lens reviewers + deliberation rounds + arbitrator.
-  # Persists raw outputs to pr_data_dir for the render sub-workflow.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: deliberate
-    description: Deliberation phase — cross-lens review, sequential deliberation rounds, arbitration to consensus
-    type: workflow
-    workflow: ./subworkflows/deliberate.yaml
+  - name: author_gate
+    type: human_gate
+    description: Warns that you are about to review your own pull request, which posts comments rather than fixing anything
     input:
-      - dispatcher.output.pr_metadata
-      - dispatcher.output.pr_data_dir
-      - dispatcher.output.diff_boundary_nonce
-      - dispatcher.output.guidelines_content
-      - dispatcher.output.custom_rules
-      - dispatcher.output.codebase_context
-      - dispatcher.output.prior_feedback_content
-      - dispatcher.output.strictness
-      - dispatcher.output.max_rounds
-      - specialists.output.consolidated_findings
-      - specialists.output.specialist_contributions
-      - workflow.input.focus
-      - workflow.input.exclude
-      - workflow.input.lens_skeptic_model
-      - workflow.input.lens_completeness_model
-    input_mapping:
-      pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
-      pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
-      diff_boundary_nonce: "{{ dispatcher.output.diff_boundary_nonce }}"
-      guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
-      custom_rules: "{{ dispatcher.output.custom_rules | default('') }}"
-      codebase_context: "{{ dispatcher.output.codebase_context | default('') }}"
-      prior_feedback_content: "{{ dispatcher.output.prior_feedback_content | default('') }}"
-      strictness: "{{ dispatcher.output.strictness }}"
-      max_rounds: "{{ dispatcher.output.max_rounds }}"
-      focus: "{{ workflow.input.focus }}"
-      exclude: "{{ workflow.input.exclude | tojson }}"
-      consolidated_findings: "{{ specialists.output.consolidated_findings }}"
-      specialist_contributions: "{{ specialists.output.specialist_contributions }}"
-      lens_skeptic_model: "{{ workflow.input.lens_skeptic_model }}"
-      lens_completeness_model: "{{ workflow.input.lens_completeness_model }}"
-    routes:
-      - to: polish
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.author
+      - pr_resolver.output.gh_user
+    prompt: |
+      ## You are the author of #{{ pr_resolver.output.pr_number }}
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # POLISH SUB-WORKFLOW — Advisory-only code-simplifier + dead-code-finder.
-  # Always runs (cheap when include_polish=false; agents skip themselves).
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: polish
-    description: Polish phase — advisory-only code-simplifier and dead-code-finder
-    type: workflow
-    workflow: ./subworkflows/polish.yaml
-    input:
-      - dispatcher.output.pr_metadata
-      - dispatcher.output.pr_data_dir
-      - dispatcher.output.diff_boundary_nonce
-      - dispatcher.output.guidelines_content
-      - workflow.input.include_polish
-      - workflow.input.polish_simplifier_model
-      - workflow.input.polish_dead_code_model
-    input_mapping:
-      pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
-      pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
-      diff_boundary_nonce: "{{ dispatcher.output.diff_boundary_nonce }}"
-      guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
-      include_polish: "{{ workflow.input.include_polish }}"
-      polish_simplifier_model: "{{ workflow.input.polish_simplifier_model }}"
-      polish_dead_code_model: "{{ workflow.input.polish_dead_code_model }}"
-    routes:
-      - to: render
+      **{{ pr_resolver.output.pr_title }}**
+      {{ pr_resolver.output.pr_url }}
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # RENDER SUB-WORKFLOW — report_writer + inline_comments_writer + output_writer.
-  # Receives all upstream rich data via input_mapping (with tojson) so the
-  # report agents can reference workflow.input.* without disk reads.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: render
-    description: Render phase — composes the review markdown, builds inline comments, writes versioned artifacts to disk
-    type: workflow
-    workflow: ./subworkflows/render.yaml
-    input:
-      - dispatcher.output.pr_metadata
-      - dispatcher.output.pr_data_dir
-      - dispatcher.output.guidelines_content
-      - dispatcher.output.prior_feedback_content
-      - triage.output
-      - specialists.output
-      - deliberate.output
-      - polish.output
-      - workflow.input.focus
-      - workflow.input.exclude
-      - workflow.input.max_rounds
-      - workflow.input.strictness
-      - workflow.input.lens_skeptic_model
-      - workflow.input.lens_completeness_model
-      - workflow.input.review_number
-      - workflow.input.include_polish
-      - workflow.input.enabled_specialists
-      - workflow.input.triage_mode
-      - workflow.input.polish_as_inline
-      - workflow.input.output_dir
-      - workflow.input.previous_review_path
-      - workflow.input.prior_feedback_path
-    input_mapping:
-      pr_metadata: "{{ dispatcher.output.pr_metadata | tojson }}"
-      pr_data_dir: "{{ dispatcher.output.pr_data_dir }}"
-      guidelines_content: "{{ dispatcher.output.guidelines_content | default('') }}"
-      prior_feedback_content: "{{ dispatcher.output.prior_feedback_content | default('') }}"
+      The author is `{{ pr_resolver.output.author }}` and `gh` is
+      authenticated as `{{ pr_resolver.output.gh_user }}`.
 
-      # triage.output.* — what ran vs what was skipped, and why.
-      has_triage: "true"
-      triage_mode: "{{ triage.output.triage_mode }}"
-      recommended_specialists: "{{ triage.output.recommended_specialists }}"
-      skipped_specialists: "{{ triage.output.skipped_specialists }}"
-      triage_rationale: "{{ triage.output.rationale | default('') }}"
-      triage_persisted_path: "{{ triage.output.triage_persisted_path | default('') }}"
+      This workflow reviews and comments. It does not apply fixes, so on your
+      own pull request it will post a review to yourself rather than change
+      anything.
 
-      # specialists.output.* — read from sub-workflow output (already JSON-typed)
-      specialist_outputs: "{{ specialists.output.specialist_outputs_path }}"
-      valid_count: "{{ specialists.output.valid_count }}"
-      valid_specialists: "{{ specialists.output.valid_specialists }}"
-      invalid_specialists: "{{ specialists.output.invalid_specialists }}"
-      degraded: "{{ specialists.output.degraded }}"
-      consolidated_findings: "{{ specialists.output.consolidated_findings }}"
-      specialist_contributions: "{{ specialists.output.specialist_contributions }}"
-      dedupe_summary: "{{ specialists.output.dedupe_summary | default('') }}"
-      has_consolidator: "true"
+      That is still useful as a written record of what needs doing. If you
+      wanted the findings applied instead, stop here and run the `code-review`
+      skill directly.
+    options:
+      - label: Review it anyway and post the comments
+        value: continue
+        route: pr_worktree
+      - label: Stop here
+        value: stop
+        route: stopped
 
-      # deliberate.output.* — when deliberate ran (specialists had ≥1 valid), pass through.
-      has_deliberation: "true"
-      has_lens_review: "true"
-      lens_outputs: "{{ deliberate.output.lens_outputs_path | default('') }}"
-      agreed_findings: "{{ deliberate.output.agreed_findings | default('[]') }}"
-      open_disagreements: "{{ deliberate.output.open_disagreements | default('[]') }}"
-      consensus_reached: "{{ deliberate.output.consensus_reached | default(false) }}"
-      round_number: "{{ deliberate.output.round_number | default(0) }}"
-      round_summary: "{{ deliberate.output.round_summary | default('') }}"
-      confidence_score: "{{ deliberate.output.confidence_score | default(0) }}"
-
-      # polish.output.* — always passed; agents skip when include_polish=false.
-      has_polish_outputs: "{{ workflow.input.include_polish }}"
-      polish_simplifier_output: '{{ {"skipped": polish.output.simplifier_skipped, "findings_count": polish.output.simplifier_finding_count, "path": polish.output.polish_outputs_path} | tojson }}'
-      polish_dead_code_output: '{{ {"skipped": polish.output.dead_code_skipped, "findings_count": polish.output.dead_code_finding_count, "path": polish.output.polish_outputs_path} | tojson }}'
-
-      # Workflow inputs forwarded
-      focus: "{{ workflow.input.focus }}"
-      exclude: "{{ workflow.input.exclude | tojson }}"
-      max_rounds: "{{ workflow.input.max_rounds }}"
-      strictness: "{{ workflow.input.strictness }}"
-      lens_skeptic_model: "{{ workflow.input.lens_skeptic_model }}"
-      lens_completeness_model: "{{ workflow.input.lens_completeness_model }}"
-      review_number: "{{ workflow.input.review_number }}"
-      include_polish: "{{ workflow.input.include_polish }}"
-      enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
-      polish_as_inline: "{{ workflow.input.polish_as_inline }}"
-      output_dir: "{{ workflow.input.output_dir | default('') }}"
-      previous_review_path: "{{ workflow.input.previous_review_path | default('') }}"
-      prior_feedback_path: "{{ workflow.input.prior_feedback_path | default('') }}"
-    routes:
-      - to: poster
-        when: "{{ workflow.input.auto_post }}"
-      - to: $end
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # POSTER — Optional script step. Posts the rendered comment + inline
-  # comments back to the PR via gh CLI. Gated on workflow.input.auto_post.
-  # ───────────────────────────────────────────────────────────────────────────
-  - name: poster
-    description: Posts the rendered review comment and inline comments back to the PR via the gh CLI
+  - name: pr_worktree
+    description: Fetches the pull request head and checks it out into a throwaway worktree, so the review reads the code rather than a diff in a prompt
     type: script
     command: python3
-    timeout: 180
+    timeout: 300
+    input:
+      - bootstrap.output.repo_root
+      - bootstrap.output.worktrees_dir
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.base_ref
     args:
-      - "workflows/pr-review/scripts/post_review.py"
-      - "{{ pr_fetcher.output.owner }}"
-      - "{{ pr_fetcher.output.repo }}"
-      - "{{ pr_fetcher.output.pr_number }}"
-      - "{{ render.output.review_path }}"
-      - "{{ render.output.inline_comments_path }}"
+      - "{{ workflow.dir }}/scripts/pr_worktree.py"
+      - "{{ bootstrap.output.repo_root }}"
+      - "{{ bootstrap.output.worktrees_dir }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.base_ref }}"
     routes:
-      - to: $end
+      - to: worktree_failed
+        when: "{{ not output.ok }}"
+      - to: concept_review
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WORKFLOW OUTPUT
-# ─────────────────────────────────────────────────────────────────────────────
-output:
-  pr_url: "{{ pr_fetcher.output.pr_url if pr_fetcher is defined and pr_fetcher.output is defined else '' }}"
-  pr_number: "{{ pr_fetcher.output.pr_number if pr_fetcher is defined and pr_fetcher.output is defined else 0 }}"
-  pr_data_dir: "{{ pr_fetcher.output.pr_data_dir if pr_fetcher is defined and pr_fetcher.output is defined else '' }}"
-  review_number: "{{ workflow.input.review_number }}"
-  review_path: "{{ render.output.review_path if render is defined and render.output is defined else '' }}"
-  review_report_path: "{{ render.output.review_report_path if render is defined and render.output is defined else '' }}"
-  review_archive_path: "{{ render.output.review_archive_path if render is defined and render.output is defined else '' }}"
-  review_report_archive_path: "{{ render.output.review_report_archive_path if render is defined and render.output is defined else '' }}"
-  inline_comments_path: "{{ render.output.inline_comments_path if render is defined and render.output is defined else '' }}"
-  consensus_reached: "{{ deliberate.output.consensus_reached if deliberate is defined and deliberate.output is defined else false }}"
-  rounds_completed: "{{ deliberate.output.round_number if deliberate is defined and deliberate.output is defined else 0 }}"
-  max_rounds: "{{ workflow.input.max_rounds }}"
-  merge_readiness: "{{ render.output.merge_readiness if render is defined and render.output is defined else 'unknown' }}"
-  confidence_score: "{{ deliberate.output.confidence_score if deliberate is defined and deliberate.output is defined else (render.output.confidence_score if render is defined and render.output is defined else 0) }}"
-  is_delta: "{{ render.output.is_delta if render is defined and render.output is defined else false }}"
-  findings_dropped_via_feedback: "{{ render.output.findings_dropped_via_feedback if render is defined and render.output is defined else 0 }}"
-  findings_downgraded_via_feedback: "{{ render.output.findings_downgraded_via_feedback if render is defined and render.output is defined else 0 }}"
-  findings_reraised_with_acknowledgement: "{{ render.output.findings_reraised_with_acknowledgement if render is defined and render.output is defined else 0 }}"
-  polish_findings_count: "{{ polish.output.total_polish_findings if polish is defined and polish.output is defined else 0 }}"
-  strictness: "{{ workflow.input.strictness }}"
-  enabled_specialists: "{{ workflow.input.enabled_specialists | tojson }}"
-  triage_mode: "{{ workflow.input.triage_mode }}"
-  recommended_specialists: "{{ triage.output.recommended_specialists if triage is defined and triage.output is defined else '[]' }}"
-  skipped_specialists: "{{ triage.output.skipped_specialists if triage is defined and triage.output is defined else '[]' }}"
-  include_polish: "{{ workflow.input.include_polish }}"
-  posted_comment_url: "{{ poster.output.posted_comment_url if poster is defined and poster.output is defined else '' }}"
-  status: "{{ render.output.status if render is defined and render.output is defined else 'failure' }}"
+  - name: worktree_failed
+    type: terminate
+    status: failed
+    input:
+      - pr_worktree.output.error
+    reason: "{{ pr_worktree.output.error }}"
+
+  # ---------------------------------------------------------------------------
+  # Concept review — the cheap question, asked first
+  # ---------------------------------------------------------------------------
+
+  - name: concept_review
+    description: Judges whether the change is coherent, complete and worth making at all, before any line-level review runs
+    model: claude-opus-5
+    context_tier: long_context
+    reasoning:
+      effort: high
+    plugins:
+      - prs@jason-tools       # concept-review
+    working_dir: "{{ pr_worktree.output.worktree_path }}"
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.base_ref
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.branch
+      - pr_worktree.output.remote
+    system_prompt: |
+      You invoke the `concept-review` skill and report what it concluded. The
+      skill owns the analysis — what to read, how to model the change, and how
+      to rank findings. Follow it as written.
+
+      You are a reviewer, not an implementer and not a publisher. Do not edit
+      files, do not commit, do not push, and do not comment on GitHub. A later
+      step publishes what a human approves, and it can only publish what you
+      actually wrote down.
+
+      This is the conceptual pass. Style, naming, local implementation quality
+      and test detail belong to a separate code review that runs after you.
+      Raising them here spends the human's decision on the wrong question.
+    prompt: |
+      Review pull request #{{ pr_resolver.output.pr_number }} as a proposed
+      change to this project.
+
+      **{{ pr_resolver.output.pr_title }}**
+      {{ pr_resolver.output.pr_url }}
+
+      /concept-review #{{ pr_resolver.output.pr_number }}
+
+      ## Where the code is
+
+      It is already checked out for you at
+      `{{ pr_worktree.output.worktree_path }}`, on branch
+      `{{ pr_worktree.output.branch }}`, and that is your working directory.
+      **Do not create another worktree** and do not check the branch out again.
+      The diff against the base branch is:
+
+      ```
+      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      ```
+
+      ## What to report
+
+      Report only material findings, as the skill defines them. A gap counts
+      only when it conflicts with the change's stated goal, an established
+      convention in this repository, or a workflow the change has to complete
+      to be usable. Do not invent requirements because the change could have
+      been broader.
+
+      If there are no material gaps, say so and return empty lists. Do not
+      manufacture findings to look thorough — a clean concept review is a
+      real result, and it is the one that lets the code review start.
+    output:
+      verdict:
+        type: string
+        description: Exactly one of good_addition, good_addition_with_changes, needs_rethinking, not_a_good_fit
+      summary:
+        type: string
+        description: The core change in a few sentences — the problem, the audience, the approach and the expected value
+      how_surfaced:
+        type: string
+        description: The end-to-end path by which someone discovers and uses the change
+      project_fit:
+        type: string
+        description: How the change aligns with the repository's scope, conventions and maintenance expectations
+      blocking:
+        type: array
+        description: Conceptual gaps that stop the change fulfilling its purpose or conflict with the project. Each entry is self-contained — the finding, the evidence, the consequence and the recommendation. Empty when nothing blocks.
+      important:
+        type: array
+        description: Gaps that leave a meaningful workflow or integration hole while the concept itself is sound, in the same self-contained form. Empty when there are none.
+      open_questions:
+        type: array
+        description: Missing intent or product context that prevents a confident assessment. Empty when there are none.
+      strengths:
+        type: array
+        description: What is coherent, valuable or well aligned with the project
+    routes:
+      - to: concept_gate
+        when: "{{ (output.blocking | length) > 0 or output.verdict in ['needs_rethinking', 'not_a_good_fit'] }}"
+      - to: code_review
+
+  - name: concept_gate
+    type: human_gate
+    description: The stop-or-continue checkpoint — the concept review found something that questions whether the change should proceed at all
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.state
+      - pr_resolver.output.is_draft
+      - pr_resolver.output.notes
+      - concept_review.output.verdict
+      - concept_review.output.summary
+      - concept_review.output.how_surfaced
+      - concept_review.output.project_fit
+      - concept_review.output.strengths
+      - concept_review.output.blocking
+      - concept_review.output.important
+      - concept_review.output.open_questions
+    prompt: |
+      ## Concept review — #{{ pr_resolver.output.pr_number }}
+
+      **{{ pr_resolver.output.pr_title }}**
+      {{ pr_resolver.output.pr_url }}
+      {% if pr_resolver.output.state != 'OPEN' or pr_resolver.output.is_draft %}
+
+      > This pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}. A review still posts to it.
+      {% endif %}
+      {% if pr_resolver.output.notes %}
+
+      > {{ pr_resolver.output.notes }}
+      {% endif %}
+
+      **Verdict:** `{{ concept_review.output.verdict }}`
+
+      {{ concept_review.output.summary }}
+
+      {% if (concept_review.output.blocking | length) > 0 %}
+      ### Blocking
+
+      {% for item in concept_review.output.blocking %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% if (concept_review.output.important | length) > 0 %}
+      ### Important
+
+      {% for item in concept_review.output.important %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% if (concept_review.output.open_questions | length) > 0 %}
+      ### Open questions
+
+      {% for item in concept_review.output.open_questions %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ### Project fit
+
+      {{ concept_review.output.project_fit }}
+
+      ### How it reaches people
+
+      {{ concept_review.output.how_surfaced }}
+      {% if (concept_review.output.strengths | length) > 0 %}
+
+      ### What works
+
+      {% for item in concept_review.output.strengths %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ---
+
+      Continuing runs the full code review and puts every finding to you
+      individually before anything is posted.
+
+      Posting publishes everything above as a review comment and stops,
+      without the code review ever running. That is the right call when the
+      change needs rethinking: line-level comments on code that may not
+      survive the conversation waste everyone's time.
+    options:
+      - label: Continue to the code review
+        value: continue
+        route: code_review
+      - label: Post these concept findings and stop
+        value: post_concept
+        route: comment_writer
+      - label: Stop without posting anything
+        value: stop
+        route: cleanup
+
+  # ---------------------------------------------------------------------------
+  # Code review
+  # ---------------------------------------------------------------------------
+
+  - name: code_review
+    description: Runs the specialist code review and reports what it found, without touching the code or GitHub
+    model: claude-opus-5
+    context_tier: long_context
+    reasoning:
+      effort: high
+    plugins:
+      # `code-review` dispatches to the seven specialist subagents the plugin
+      # ships in `agents/` (code-reviewer, pr-test-analyzer, silent-failure-
+      # hunter, type-design-analyzer, comment-analyzer, code-simplifier,
+      # dead-code-finder). Loading the plugin brings the skill AND those
+      # subagents; loading the skill alone leaves it dispatching to agents that
+      # do not exist.
+      - prs@jason-tools       # code-review
+    working_dir: "{{ pr_worktree.output.worktree_path }}"
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.base_ref
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.branch
+      - pr_worktree.output.remote
+    system_prompt: |
+      You invoke the `code-review` skill and report its findings. The skill
+      owns which specialists run and how findings are ranked — follow it as
+      written for everything up to and including the aggregated summary.
+
+      You are a reviewer, not an implementer and not a publisher. Do not edit
+      files, do not commit, do not push, and do not create a GitHub review or
+      comment. The skill's post-review section does not apply here: a later
+      step publishes exactly what a human approves.
+
+      A finding you phrase vaguely is one the human cannot judge and the
+      writer cannot word. Every finding must stand on its own — someone
+      reading only that entry should know what is wrong, where, and what to
+      do about it.
+    prompt: |
+      Review pull request #{{ pr_resolver.output.pr_number }} —
+      **{{ pr_resolver.output.pr_title }}**.
+
+      /code-review #{{ pr_resolver.output.pr_number }}
+
+      Report the findings. Do not apply any fixes and do not post anything.
+
+      ## Where the code is
+
+      It is already checked out for you at
+      `{{ pr_worktree.output.worktree_path }}`, on branch
+      `{{ pr_worktree.output.branch }}`, and that is your working directory.
+      **Do not create another worktree** and do not check the branch out
+      again. The diff under review is:
+
+      ```
+      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      ```
+
+      ## How to report findings
+
+      Return one entry per finding in `findings`. Each entry is an object:
+
+      ```json
+      {
+        "severity": "BLOCKING",
+        "path": "src/thing.ts",
+        "line": 42,
+        "title": "Token expiry is never checked",
+        "body": "What is wrong and why it matters, in enough detail to act on without re-reviewing.",
+        "suggestion": "The concrete change, as code when a short snippet says it best."
+      }
+      ```
+
+      - `severity` is `BLOCKING` or `RECOMMENDED`. Nothing else. **Leave nits
+        out entirely** — they are not worth a human decision each.
+      - `path` is repository-relative, exactly as it appears in the diff.
+      - `line` is the line **in the new version of the file**, and it must be
+        a line this pull request actually adds or touches. A comment anchored
+        outside the diff cannot be attached inline, so a wrong line quietly
+        demotes the finding into the review body. Omit `line` rather than
+        guess.
+      - `body` is prose for the pull request author, not a note to yourself.
+        Do not reference the specialist that found it.
+
+      Findings with no single location — an architectural objection, a missing
+      test suite — belong in `findings` too, with `path` and `line` omitted.
+
+      Finding nothing is a legitimate result. Return an empty list rather than
+      padding it.
+    output:
+      findings:
+        type: array
+        description: 'One object per finding: {"severity": "BLOCKING"|"RECOMMENDED", "path": "...", "line": 42, "title": "...", "body": "...", "suggestion": "..."}. Nits excluded. `path` and `line` omitted when the finding has no single location. Empty when the review found nothing.'
+      summary:
+        type: string
+        description: The review's overall assessment of the pull request, for the top of the posted review
+      merge_readiness:
+        type: string
+        description: One of ready, needs_work, do_not_merge
+    routes:
+      - to: build_questions
+        when: "{{ (output.findings | length) > 0 }}"
+      - to: cleanup
+
+  - name: build_questions
+    description: Turns the findings into strictly shaped question objects, so a stray key from the reviewer cannot abort the triage node after the review has been paid for
+    type: script
+    command: python3
+    timeout: 60
+    input:
+      - code_review.output.findings
+    args:
+      - "{{ workflow.dir }}/scripts/build_questions.py"
+    stdin: "{{ code_review.output.findings | tojson }}"
+    routes:
+      - to: cleanup
+        when: "{{ not output.ok or output.question_count == 0 }}"
+      - to: triage
+
+  - name: triage
+    type: questions
+    description: Puts every finding to you individually inside a single step, so answers can be revised with Back and the whole set costs one iteration
+    source: build_questions.output.questions
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.state
+      - pr_resolver.output.is_draft
+      - pr_resolver.output.notes
+      - build_questions.output.question_count
+      - build_questions.output.blocking_count
+      - build_questions.output.recommended_count
+    prompt: |
+      ## Findings on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+      {% if pr_resolver.output.state != 'OPEN' or pr_resolver.output.is_draft %}
+
+      > This pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}. Anything you approve still posts to it.
+      {% endif %}
+      {% if pr_resolver.output.notes %}
+
+      > {{ pr_resolver.output.notes }}
+      {% endif %}
+
+      The code review found {{ build_questions.output.blocking_count }} blocking
+      and {{ build_questions.output.recommended_count }} recommended
+      finding{{ 's' if build_questions.output.question_count != 1 else '' }}.
+      Nothing has been posted to the pull request yet.
+
+      Decide each one. There are three ways to answer:
+
+      - **Post as-is** keeps the reviewer's wording.
+      - **Do not post** drops the finding entirely.
+      - **Write your own** posts the finding with your note applied, so use it
+        to soften the tone, add context the reviewer lacked, or narrow the ask.
+
+      Skipping a question posts it as-is, which makes "skip all remaining" a
+      quick way to accept the rest once you have read the first few. Aborting
+      posts nothing at all.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: cleanup
+    routes:
+      - to: apply_triage
+
+  - name: apply_triage
+    description: Applies your decisions to the findings before any model sees them, so a finding you dropped cannot leak into the review
+    type: script
+    command: python3
+    timeout: 60
+    input:
+      - build_questions.output.findings
+      - triage.output.items
+    args:
+      - "{{ workflow.dir }}/scripts/apply_triage.py"
+    stdin: '{"findings": {{ build_questions.output.findings | tojson }}, "items": {{ triage.output.items | tojson }}}'
+    routes:
+      - to: cleanup
+        when: "{{ not output.ok or output.approved_count == 0 }}"
+      - to: comment_writer
+
+  # ---------------------------------------------------------------------------
+  # Wording and posting
+  # ---------------------------------------------------------------------------
+
+  - name: comment_writer
+    description: Words the approved findings for the author and maps them to inline anchors, running every comment through the humanizer
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: medium
+    plugins:
+      - writing@jason-tools   # humanizer
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - concept_gate.output.selected?
+      - concept_review.output.summary?
+      - concept_review.output.verdict?
+      - concept_review.output.how_surfaced?
+      - concept_review.output.project_fit?
+      - concept_review.output.strengths?
+      - concept_review.output.blocking?
+      - concept_review.output.important?
+      - concept_review.output.open_questions?
+      - apply_triage.output.approved?
+      - apply_triage.output.approved_count?
+      - apply_triage.output.blocking_count?
+      - apply_triage.output.recommended_count?
+    system_prompt: |
+      You write the review that gets posted to a pull request. You are the
+      last step before it is public, and you are writing to its author.
+
+      You decide nothing. Which findings are posted was settled by a human,
+      one at a time, and everything they dropped was removed before you were
+      called — what you are given is exactly what goes out. Do not add a
+      finding nobody raised, do not merge two into one, and do not soften a
+      blocking finding into a suggestion. Your job is wording and placement.
+
+      Every comment goes through the `humanizer` skill before you return it.
+      Apply it properly — draft, audit what still reads as machine-generated,
+      then revise. Do not just delete em dashes and call it done.
+
+      Write like a competent colleague who read the code: direct about what is
+      wrong, specific about where, and free of ceremony. No preamble, no
+      "great work overall", no emoji, no praise sandwich. The author is a peer
+      and their time is worth more than the padding.
+    prompt: |
+      {% if concept_gate is defined and concept_gate.output.selected == 'post_concept' %}
+      Write a review of pull request #{{ pr_resolver.output.pr_number }} —
+      **{{ pr_resolver.output.pr_title }}** — from a concept review. The human
+      chose to publish these findings and stop, so no code review ran and there
+      are no line-level findings to place. Return an empty `inline_comments`.
+
+      The review body is the whole artefact. Lead with what the change is and
+      the verdict, then the findings.
+
+      **Verdict:** `{{ concept_review.output.verdict }}`
+
+      **The change:** {{ concept_review.output.summary }}
+
+      **How it reaches people:** {{ concept_review.output.how_surfaced }}
+
+      **Project fit:** {{ concept_review.output.project_fit }}
+      {% if (concept_review.output.strengths | length) > 0 %}
+
+      ## What works
+
+      Open with these. On a change that may need rethinking, what to keep is
+      as useful to the author as what to fix, and it is the difference between
+      a review they can act on and one they argue with.
+
+      {% for item in concept_review.output.strengths %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% if (concept_review.output.blocking | length) > 0 %}
+      ## Blocking
+
+      {% for item in concept_review.output.blocking %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% if (concept_review.output.important | length) > 0 %}
+      ## Important
+
+      {% for item in concept_review.output.important %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+      {% if (concept_review.output.open_questions | length) > 0 %}
+      ## Open questions
+
+      Put these to the author as questions, not as findings. They are things
+      the review could not determine, not things the author got wrong.
+
+      {% for item in concept_review.output.open_questions %}
+      {{ loop.index }}. {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      Set `has_content: true`. The verdict, the assessment and the project-fit
+      judgement are always worth posting, so this path always produces a
+      review even when the finding lists happen to be short.
+      {% else %}
+      Write a review of pull request #{{ pr_resolver.output.pr_number }} —
+      **{{ pr_resolver.output.pr_title }}**.
+
+      ## The findings
+
+      These are the {{ apply_triage.output.approved_count }} finding{{ 's' if apply_triage.output.approved_count != 1 else '' }}
+      a human approved for posting: {{ apply_triage.output.blocking_count }}
+      blocking and {{ apply_triage.output.recommended_count }} recommended.
+      Findings they dropped are already gone and you never see them, so
+      everything below is posted and nothing else is.
+
+      {% for finding in apply_triage.output.approved %}
+      ---
+
+      ### `{{ finding.id }}` — {{ finding.severity }}: {{ finding.title }}
+
+      {% if finding.path %}**Location:** `{{ finding.path }}{% if finding.line %}:{{ finding.line }}{% endif %}`{% else %}**Location:** none — this finding has no single line{% endif %}
+
+      {{ finding.body }}
+      {% if finding.suggestion %}
+      **Suggested fix:** {{ finding.suggestion }}
+      {% endif %}
+      {% if finding.guidance %}
+      **The human's instruction for this one:** {{ finding.guidance }}
+
+      That is how they want it posted. Apply it — soften the tone, add the
+      context, or narrow the ask as they described. Their wording wins over
+      the reviewer's.
+      {% endif %}
+      {% endfor %}
+
+      ---
+
+      ## How to lay it out
+
+      **`inline_comments`** carries every finding above that has a `path` and
+      a `line`. One object per finding:
+
+      ```json
+      {"path": "src/thing.ts", "line": 42, "body": "The comment, in markdown."}
+      ```
+
+      Copy `path` and `line` from the finding exactly. Do not adjust, round or
+      guess a line — a comment that does not land on the diff gets folded into
+      the body automatically, which is a worse result than a correct anchor.
+
+      Include a ```suggestion``` block in the body wherever the fix is a short,
+      concrete edit to those exact lines. Getting the indentation right matters:
+      the author applies it with one click.
+
+      Prefix each inline comment with **BLOCKING** or **RECOMMENDED** so its
+      weight is obvious without opening the summary.
+
+      **`review_body`** is the top-level comment. It holds:
+
+      - Two or three sentences on the state of the change, drawn from the
+        findings above and nothing else. If none of them are blocking, do not
+        imply the change cannot merge; if some are, say so plainly.
+      - A short list of the blocking findings by location, so the author can
+        see the shape of the work without reading every inline thread.
+      - Any finding above with no `path` or `line`, written out in full, since
+        it has nowhere else to go.
+
+      Do not repeat an inline comment's full text in the body. The author reads
+      both.
+
+      Every finding above must appear exactly once, either inline or in the
+      body. Set `has_content: true`.
+
+      Set `posted_count` to how many findings survived and appear in your
+      output, and `dropped_count` to how many you dropped. The two together
+      must equal the number of findings you were given, so a finding you
+      cannot place has to be counted somewhere rather than quietly vanishing.
+      {% endif %}
+    output:
+      review_body:
+        type: string
+        description: The top-level review comment in markdown. Empty only when has_content is false.
+      inline_comments:
+        type: array
+        description: 'One object per finding anchored to a line: {"path": "...", "line": 42, "body": "..."}. Empty when no surviving finding has a location.'
+      has_content:
+        type: boolean
+        description: False only when there is genuinely nothing to post. Both paths hand you content, so this is a safety net rather than a normal outcome.
+    routes:
+      - to: cleanup
+        when: "{{ not output.has_content }}"
+      - to: post_review
+
+  - name: post_review
+    description: Posts one review to the pull request, anchoring inline comments to the diff wherever it can and folding the rest into the body
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.base_ref
+      - pr_worktree.output.remote
+      - comment_writer.output.review_body
+      - comment_writer.output.inline_comments
+    args:
+      - "{{ workflow.dir }}/scripts/post_review.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+      - "{{ pr_worktree.output.worktree_path }}"
+      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.remote }}"
+      - "COMMENT"
+    stdin: '{"body": {{ comment_writer.output.review_body | tojson }}, "comments": {{ comment_writer.output.inline_comments | tojson }}}'
+    routes:
+      - to: cleanup
+
+  # ---------------------------------------------------------------------------
+  # Teardown
+  # ---------------------------------------------------------------------------
+
+  - name: cleanup
+    description: Removes the review worktree and its branch, from the repository root rather than the worktree it is deleting
+    type: script
+    command: python3
+    timeout: 120
+    input:
+      - bootstrap.output.repo_root
+      - pr_worktree.output.worktree_path?
+      - pr_worktree.output.branch?
+    args:
+      - "{{ workflow.dir }}/scripts/cleanup.py"
+      - "{{ bootstrap.output.repo_root }}"
+      - "{{ pr_worktree.output.worktree_path if pr_worktree is defined else '' }}"
+      - "{{ pr_worktree.output.branch if pr_worktree is defined else '' }}"
+    routes:
+      - to: findings_unreadable
+        when: "{{ build_questions is defined and not build_questions.output.ok }}"
+      - to: triage_failed
+        when: "{{ apply_triage is defined and not apply_triage.output.ok }}"
+      - to: review_failed
+        when: "{{ post_review is defined and not post_review.output.ok }}"
+      - to: review_posted
+        when: "{{ post_review is defined and post_review.output.ok }}"
+      - to: no_review
+
+  - name: findings_unreadable
+    type: terminate
+    status: failed
+    input:
+      - build_questions.output.error
+    reason: "The code review produced findings that could not be read, so none of them reached you and nothing was posted. The worktree has been removed. {{ build_questions.output.error }}"
+
+  - name: triage_failed
+    type: terminate
+    status: failed
+    input:
+      - apply_triage.output.error
+    reason: "Your triage decisions could not be applied, so nothing was posted. The worktree has been removed. {{ apply_triage.output.error }}"
+
+  - name: review_posted
+    type: terminate
+    status: success
+    input:
+      - pr_resolver.output.pr_number
+      - apply_triage.output.approved_count?
+      - apply_triage.output.dropped_count?
+      - post_review.output.review_url
+      - post_review.output.inline_posted
+      - post_review.output.inline_demoted
+      - post_review.output.error
+    reason: "Posted a review on #{{ pr_resolver.output.pr_number }}{% if apply_triage is defined %} with {{ apply_triage.output.approved_count }} finding{{ 's' if apply_triage.output.approved_count != 1 else '' }} ({{ apply_triage.output.dropped_count }} dropped at triage){% else %} from the concept review{% endif %}, {{ post_review.output.inline_posted }} anchored inline and {{ post_review.output.inline_demoted }} in the body. {{ post_review.output.review_url }}{% if post_review.output.error %} Note: {{ post_review.output.error }}{% endif %}"
+
+  - name: review_failed
+    type: terminate
+    status: failed
+    input:
+      - pr_resolver.output.pr_number
+      - post_review.output.error
+    reason: "The review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_review.output.error }}"
+
+  - name: no_review
+    type: terminate
+    status: success
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_url
+    reason: "Nothing was posted to #{{ pr_resolver.output.pr_number }}. Either the review found nothing, you dropped every finding, or you stopped at a gate. The worktree has been removed. {{ pr_resolver.output.pr_url }}"
+
+  - name: stopped
+    type: terminate
+    status: success
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_url
+    reason: "Stopped before the review started. Nothing was posted to #{{ pr_resolver.output.pr_number }} and no worktree was created. {{ pr_resolver.output.pr_url }}"

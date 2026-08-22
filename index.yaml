@@ -11,9 +11,9 @@ workflows:
   # fusion:
   #   description: "Multi-model deliberation modelled on OpenRouter's Fusion Router: a panel of models from different labs answers the question independently in parallel, an analyst compares (never merges) their answers into consensus, contradictions, coverage gaps, unique insights and blind spots, and a synthesiser writes the final answer. Includes a cheap gate so trivial questions skip the panel, and an optional targeted blind-spot round."
   #   path: workflows/fusion/workflow.yaml
-  # pr-review:
-  #   description: "Multi-agent PR review with smart per-PR specialist triage: heuristic + LLM picks which of 6 deep-domain specialists (code, security, tests, errors, types, comments) need to run, then cross-lens deliberation, consensus arbitration, and a non-blocking polish stage. Self-contained via the gh CLI; GitHub-only in v1."
-  #   path: workflows/pr-review/workflow.yaml
+  pr-review:
+    description: "Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows"
+    path: workflows/pr-review/workflow.yaml
   sdd-design:
     description: "Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan)"
     path: workflows/sdd/design.yaml
