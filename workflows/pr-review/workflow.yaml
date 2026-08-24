@@ -21,8 +21,8 @@
 #     ↓
 #   build_questions (script) findings → strictly shaped question objects
 #     ↓
-#   triage (questions)       per finding: post as-is / reword / drop
-#     ↓
+#   triage (questions)       per finding: post as-is / reseverity / reword /
+#     ↓                      drop
 #   apply_triage (script)    drop what you dropped, before a model sees it
 #     ↓
 #   comment_writer           [humanizer skill] final wording, inline anchors
@@ -69,9 +69,12 @@
 #
 # Triage
 #   Every finding is put to you individually, prefixed BLOCKING or RECOMMENDED.
-#   Three outcomes come from two choices plus the write-your-own path, because
-#   a third choice reading "reword it" would record that label and no wording —
-#   choices carry no follow-up prompt. Skipping a question posts it as-is, so
+#   Four outcomes come from three choices plus the write-your-own path, because
+#   a choice reading "reword it" would record that label and no wording —
+#   choices carry no follow-up prompt. The third choice is the severity the
+#   finding does not currently carry, so promoting or demoting one is a single
+#   tap and the counts the review is written from follow the decision rather
+#   than the reviewer's ranking. Skipping a question posts it as-is, so
 #   "skip all remaining" means "post the rest verbatim", which is the fast path
 #   once you have read the first few. Aborting posts nothing.
 #
@@ -142,7 +145,7 @@
 
 workflow:
   name: pr-review
-  description: Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows
+  description: Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, promote or demote, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows
   version: "1.0.0"
   entry_point: bootstrap
 
@@ -710,9 +713,13 @@ agents:
       finding{{ 's' if build_questions.output.question_count != 1 else '' }}.
       Nothing has been posted to the pull request yet.
 
-      Decide each one. There are three ways to answer:
+      Decide each one. There are four ways to answer:
 
-      - **Post as-is** keeps the reviewer's wording.
+      - **Post as-is** keeps the reviewer's wording and its severity.
+      - **Post as BLOCKING** / **Post as RECOMMENDED** posts the same wording
+        at the other severity, so you can promote something the reviewer
+        under-rated or demote something that should not hold up a merge. Only
+        the severity the finding does not already carry is offered.
       - **Do not post** drops the finding entirely.
       - **Write your own** posts the finding with your note applied, so use it
         to soften the tone, add context the reviewer lacked, or narrow the ask.
@@ -780,7 +787,14 @@ agents:
       one at a time, and everything they dropped was removed before you were
       called — what you are given is exactly what goes out. Do not add a
       finding nobody raised, do not merge two into one, and do not soften a
-      blocking finding into a suggestion. Your job is wording and placement.
+      blocking finding into a suggestion.
+
+      The severity on each finding is theirs too, not the reviewer's: they can
+      promote or demote one at triage, so a finding may read more or less
+      severely than its label. The label wins. Write it at the weight it
+      carries and let the wording follow.
+
+      Your job is wording and placement.
 
       Every comment goes through the `humanizer` skill before you return it.
       Apply it properly — draft, audit what still reads as machine-generated,
@@ -1014,11 +1028,12 @@ agents:
       - pr_resolver.output.pr_number
       - apply_triage.output.approved_count?
       - apply_triage.output.dropped_count?
+      - apply_triage.output.reclassified_count?
       - post_review.output.review_url
       - post_review.output.inline_posted
       - post_review.output.inline_demoted
       - post_review.output.error
-    reason: "Posted a review on #{{ pr_resolver.output.pr_number }}{% if apply_triage is defined %} with {{ apply_triage.output.approved_count }} finding{{ 's' if apply_triage.output.approved_count != 1 else '' }} ({{ apply_triage.output.dropped_count }} dropped at triage){% else %} from the concept review{% endif %}, {{ post_review.output.inline_posted }} anchored inline and {{ post_review.output.inline_demoted }} in the body. {{ post_review.output.review_url }}{% if post_review.output.error %} Note: {{ post_review.output.error }}{% endif %}"
+    reason: "Posted a review on #{{ pr_resolver.output.pr_number }}{% if apply_triage is defined %} with {{ apply_triage.output.approved_count }} finding{{ 's' if apply_triage.output.approved_count != 1 else '' }} ({{ apply_triage.output.dropped_count }} dropped{% if apply_triage.output.reclassified_count %} and {{ apply_triage.output.reclassified_count }} reclassified{% endif %} at triage){% else %} from the concept review{% endif %}, {{ post_review.output.inline_posted }} anchored inline and {{ post_review.output.inline_demoted }} in the body. {{ post_review.output.review_url }}{% if post_review.output.error %} Note: {{ post_review.output.error }}{% endif %}"
 
   - name: review_failed
     type: terminate

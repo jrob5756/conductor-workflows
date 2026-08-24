@@ -12,7 +12,7 @@ workflows:
   #   description: "Multi-model deliberation modelled on OpenRouter's Fusion Router: a panel of models from different labs answers the question independently in parallel, an analyst compares (never merges) their answers into consensus, contradictions, coverage gaps, unique insights and blind spots, and a synthesiser writes the final answer. Includes a cheap gate so trivial questions skip the panel, and an optional targeted blind-spot round."
   #   path: workflows/fusion/workflow.yaml
   pr-review:
-    description: "Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows"
+    description: "Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, promote or demote, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows"
     path: workflows/pr-review/workflow.yaml
   sdd-design:
     description: "Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan)"
