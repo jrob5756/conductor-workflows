@@ -13,7 +13,9 @@ normalized `findings` here rather than the reviewer's raw output.
 The triage outcomes come from three choices plus the free-text path: a choice
 reading "reword it" would record that label and no wording, since choices carry
 no follow-up prompt. The third choice is the severity the finding does *not*
-currently carry, so one tap moves it between blocking and recommended.
+currently carry, so one tap moves it between blocking and recommended. The
+choice strings themselves live in `triage_choices.py`, shared with the script
+that reads the answers back.
 
 Usage:
     build_questions.py            # findings JSON array on stdin
@@ -28,31 +30,17 @@ from __future__ import annotations
 import json
 import sys
 
-POST_AS_IS = "Post as-is"
-DO_NOT_POST = "Do not post"
-POST_AS_BLOCKING = "Post as BLOCKING"
-POST_AS_RECOMMENDED = "Post as RECOMMENDED"
-
-# `apply_triage.py` compares answers against these exact strings, and the
-# triage prompt explains them in the same words. Change one and change all
-# three, or a decision stops meaning what the human was told it meant.
-
-BLOCKING = "BLOCKING"
-RECOMMENDED = "RECOMMENDED"
-
-# Only the opposite severity is offered. A choice that restates the label the
-# finding already carries is a no-op the human has to read past on every
-# question, and it makes "did I change this one?" unanswerable from the answer.
-FLIP_CHOICE = {BLOCKING: POST_AS_RECOMMENDED, RECOMMENDED: POST_AS_BLOCKING}
-
-# A reviewer told to emit BLOCKING or RECOMMENDED still reaches for its own
-# vocabulary sometimes. Mapping the escalating words onto BLOCKING matters far
-# more than the reverse: silently filing a CRITICAL finding as a suggestion is
-# the one normalization error that loses real severity.
-ESCALATING = ("block", "critical", "severe", "major", "high", "must", "error", "bug")
-DISCARDED = ("nit", "trivial", "cosmetic", "style")
-
-TITLE_LIMIT = 160
+from triage_choices import (
+    BLOCKING,
+    DO_NOT_POST,
+    FLIP_CHOICE,
+    POST_AS_IS,
+    RECOMMENDED,
+    TITLE_LIMIT,
+    line_of,
+    severity_of,
+    text_of,
+)
 
 
 def answer_guidance(severity: str) -> str:
@@ -84,36 +72,6 @@ def fail(message: str) -> None:
             "nits_dropped": 0,
         }
     )
-
-
-def text_of(value: object) -> str:
-    """Coerce a field to trimmed text, tolerating a model's stray null or number."""
-    if value is None or isinstance(value, (dict, list)):
-        return ""
-    return str(value).strip()
-
-
-def line_of(value: object) -> int:
-    """Coerce a line number, returning 0 when there is no usable anchor."""
-    try:
-        line = int(str(value).strip())
-    except (TypeError, ValueError):
-        return 0
-    return line if line > 0 else 0
-
-
-def severity_of(value: object) -> str:
-    """Normalize a severity label.
-
-    Returns an empty string for a nit, which is dropped: `code-review` ranks
-    those separately and they are not worth a decision each.
-    """
-    label = text_of(value).lower()
-    if any(label.startswith(word) for word in DISCARDED):
-        return ""
-    if any(word in label for word in ESCALATING):
-        return BLOCKING
-    return RECOMMENDED
 
 
 def normalize(entry: object) -> tuple[dict[str, object] | None, str]:

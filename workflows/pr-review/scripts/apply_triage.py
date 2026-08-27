@@ -11,6 +11,8 @@ in a prompt.
 Answers join to findings on `id`. The outcomes are the three choices plus the
 free-text path, so anything that is not one of the three known choices is
 treated as the human's own wording instruction and travels with the finding.
+The choice strings come from `triage_choices.py`, so this and the two question
+builders cannot disagree about what an answer meant.
 
 The two severity choices change what a finding is filed as, not what it says.
 The wording the reviewer produced is posted unchanged at the other weight, and
@@ -19,6 +21,11 @@ the approved list is re-sorted so blocking findings still lead the review.
 An unanswered or unasked finding is kept, matching the question's declared
 default of "Post as-is" and the workflow's rule that skipping posts a finding
 rather than dropping it.
+
+Both triage nodes run this: the first-pass one over `build_questions` findings
+and the follow-up one over `build_followup_questions` findings. Keys the
+builders add beyond the ones read here — a follow-up item's `status`, say —
+are copied onto the approved entry untouched.
 
 Usage:
     apply_triage.py            # {"findings": [...], "items": [...]} on stdin
@@ -33,23 +40,12 @@ from __future__ import annotations
 import json
 import sys
 
-POST_AS_IS = "Post as-is"
-DO_NOT_POST = "Do not post"
-POST_AS_BLOCKING = "Post as BLOCKING"
-POST_AS_RECOMMENDED = "Post as RECOMMENDED"
-
-# These four must stay identical to the choices `build_questions.py` offers and
-# to the wording the triage prompt explains, since the answers arrive as the
-# choice text verbatim. Matching is case-insensitive so a human who typed the
-# words instead of selecting them still gets what they asked for.
-
-BLOCKING = "BLOCKING"
-RECOMMENDED = "RECOMMENDED"
-
-RESEVERITY = {
-    POST_AS_BLOCKING.casefold(): BLOCKING,
-    POST_AS_RECOMMENDED.casefold(): RECOMMENDED,
-}
+from triage_choices import (
+    BLOCKING,
+    DO_NOT_POST,
+    POST_AS_IS,
+    RESEVERITY,
+)
 
 
 def emit(payload: dict[str, object]) -> None:

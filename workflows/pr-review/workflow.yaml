@@ -12,6 +12,9 @@
 #     ↓
 #   pr_worktree (script)     fetch pull/N/head, cut a throwaway worktree
 #     ↓
+#   prior_review (script) ──→ have you already reviewed this one? if so the
+#     ↓                      run takes the follow-up path below instead
+#     ↓
 #   concept_review           [concept-review skill] is this a sound change at
 #     ↓                      all, before anything expensive runs
 #   concept_gate ───────────→ only when it found blocking gaps:
@@ -32,6 +35,75 @@
 #   cleanup (script)         remove the worktree and its branch
 #     ↓
 #   $end
+#
+# The follow-up path — taken when `prior_review` finds your earlier comments:
+#
+#   followup_review              did they do what you asked? one status per
+#     ↓                          point: addressed / partly / not / moot /
+#     ↓                          unclear, decided from the code
+#   build_followup_questions     the outstanding points → question objects
+#     ↓
+#   followup_triage (questions)  per point: raise it again as-is / reseverity
+#     ↓                          / reword / let it go
+#   apply_followup_triage        drop what you let go, before a model sees it
+#     ↓
+#   followup_gate ──────────────→ approve / post the outstanding points /
+#     ↓                           post nothing
+#   followup_comment_writer      [humanizer skill] wording, inline anchors
+#     ↓
+#   post_followup_review         one review, event=COMMENT
+#     ↓
+#   cleanup
+#
+#   followup_clear_gate replaces `followup_gate` when nothing is left to
+#   raise — because every point landed, or because you let the rest go at
+#   triage. It offers the approval, a note you write yourself, and the escape
+#   hatch back to a full first-pass review.
+#
+# The second visit
+#   A pull request you have already reviewed is not a pull request you have
+#   not. Running the concept and code passes again re-derives the points you
+#   made last time, phrases them differently, and posts them a second time
+#   under a fresh review — which reads to the author as if nobody opened the
+#   replies they wrote. The expensive part is wasted and the cheap part is
+#   insulting.
+#
+#   So `prior_review` asks GitHub, not a model, whether you have commented
+#   here before: a submitted review, an inline comment, or a conversation
+#   comment authored by any login `gh` is signed in as on this host. It is a
+#   script because the branch has to be decided by a fact rather than by a
+#   model recognising its own handiwork, and because the same call collects
+#   the replies your comments drew, which is what the follow-up reads.
+#
+#   Identity there is a set rather than a name, because one human routinely
+#   has more than one GitHub account and `gh` keeps them all, active one at a
+#   time. Matched against the active login alone, a review left under your
+#   other account is invisible, and the run takes the first-pass branch and
+#   posts a second opinion on top of your own. The follow-up still publishes
+#   as the active account, so the gates say so when the two differ.
+#
+#   `followup_review` then answers one question per point — did the code
+#   change in the respect you raised — and refuses to answer it from the
+#   conversation. "Fixed, thanks" is a claim; the file is the evidence. It
+#   raises nothing new, because a finding nobody made before does not belong
+#   in a follow-up: posted there it masquerades as something the author
+#   already ignored. If you want fresh findings, `followup_clear_gate` routes
+#   you into the full review.
+#
+#   `build_followup_questions` reconciles what came back against what went in.
+#   A point the analysis simply failed to mention would otherwise vanish, and
+#   the gate downstream would go on to tell you everything was settled — so
+#   any prior comment no entry cites is rebuilt from its own text and asked as
+#   `unclear`. Nothing reaches a terminal state without a human having seen it.
+#
+#   `followup_comment_writer` is handed no summary and no account of what
+#   changed, only the points that survived triage and the ones already
+#   settled. Both of those narratives are written before you decide anything,
+#   so either could name a point you went on to drop, and a dropped point
+#   reaching the author through a summary line is no better than one reaching
+#   them through a finding. The gates show you those narratives, because you
+#   are the one deciding; the model that writes the public text does not get
+#   them.
 #
 # Targeting
 #   The reference may name a repository — `owner/repo#123`, or a full URL —
@@ -81,6 +153,12 @@
 #   Nits never reach you. `code-review` ranks them separately and they are not
 #   worth a decision each.
 #
+#   The follow-up triage works identically and shares the same choices, one
+#   difference aside: it drops nothing on severity. A nit on a first pass is
+#   noise nobody has seen. A nit you already raised in public is a point the
+#   author read and did not act on, and withholding the second mention lets
+#   them read agreement into your silence — so it still gets a decision.
+#
 # Inline comments
 #   GitHub rejects an entire review with a 422 if one comment names a line
 #   outside the diff, so a single bad anchor loses every comment. `post_review`
@@ -106,6 +184,10 @@
 #   another. Revisiting a triage answer happens inside the questions node,
 #   which is one engine step, so Back costs no iterations and cannot loop.
 #
+#   `followup_clear_gate` routing into `concept_review` looks like a jump
+#   backwards and is not one: the follow-up path never runs again after it, so
+#   the run continues forwards down the first-pass path and terminates there.
+#
 # Plugins
 #   Each step declares the plugin whose skill it drives, rather than the
 #   workflow enabling skill discovery and excluding everything it does not
@@ -120,6 +202,12 @@
 #     concept_review                  prs@jason-tools      concept-review
 #     code_review                     prs@jason-tools      code-review
 #     comment_writer                  writing@jason-tools  humanizer
+#     followup_comment_writer         writing@jason-tools  humanizer
+#
+#   `followup_review` declares none. It reads files and runs git, both of
+#   which it has without a plugin, and every review skill it could reach would
+#   push it toward finding something new — which is the one thing a follow-up
+#   must not do.
 #
 #   Entries are `plugin@marketplace`, so they resolve against the installed
 #   `jason-tools` marketplace. To run this against a different marketplace,
@@ -138,6 +226,9 @@
 #     conductor run workflows/pr-review/workflow.yaml \
 #       --input pr="https://github.com/owner/repo/pull/123"
 #
+#   Run it a second time on the same pull request and it verifies the review
+#   it posted the first time instead of writing another one.
+#
 # Requires:
 #   - git and gh (GitHub CLI) on PATH, with `gh auth status` passing
 #   - python3 on PATH (used by every script step)
@@ -145,8 +236,8 @@
 
 workflow:
   name: pr-review
-  description: Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, promote or demote, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows
-  version: "1.0.0"
+  description: Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, promote or demote, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows. On a pull request you have already reviewed it checks what became of the points you made instead, and closes on a choice between approving, re-raising what is still open, or a note you write yourself
+  version: "1.2.0"
   entry_point: bootstrap
 
   runtime:
@@ -290,7 +381,7 @@ agents:
       - to: wrong_repository
         when: "{{ output.name_with_owner | lower != bootstrap.output.name_with_owner | lower }}"
       - to: author_gate
-        when: "{{ output.author | lower == output.gh_user | lower }}"
+        when: "{{ output.author | lower == output.gh_user | lower or output.author | lower in bootstrap.output.gh_logins | map('lower') | list }}"
       - to: pr_worktree
 
   - name: wrong_repository
@@ -319,6 +410,7 @@ agents:
       - pr_resolver.output.pr_url
       - pr_resolver.output.author
       - pr_resolver.output.gh_user
+      - bootstrap.output.gh_logins
     prompt: |
       ## You are the author of #{{ pr_resolver.output.pr_number }}
 
@@ -327,6 +419,12 @@ agents:
 
       The author is `{{ pr_resolver.output.author }}` and `gh` is
       authenticated as `{{ pr_resolver.output.gh_user }}`.
+      {% if pr_resolver.output.author | lower != pr_resolver.output.gh_user | lower %}
+
+      > Those are different logins, but both are accounts you are signed in
+      > as, so this is still your own pull request. Anything posted here goes
+      > up as `{{ pr_resolver.output.gh_user }}`.
+      {% endif %}
 
       This workflow reviews and comments. It does not apply fixes, so on your
       own pull request it will post a review to yourself rather than change
@@ -364,7 +462,7 @@ agents:
     routes:
       - to: worktree_failed
         when: "{{ not output.ok }}"
-      - to: concept_review
+      - to: prior_review
 
   - name: worktree_failed
     type: terminate
@@ -372,6 +470,29 @@ agents:
     input:
       - pr_worktree.output.error
     reason: "{{ pr_worktree.output.error }}"
+
+  - name: prior_review
+    description: Reads back everything you have already said on this pull request under any account you are signed in as, so a second visit checks your last review rather than writing another one
+    type: script
+    command: python3
+    timeout: 180
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.gh_user
+      - bootstrap.output.gh_logins
+    args:
+      - "{{ workflow.dir }}/scripts/prior_review.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_resolver.output.gh_user }}"
+      - "{{ bootstrap.output.gh_logins | join(',') }}"
+    routes:
+      - to: cleanup
+        when: "{{ not output.ok }}"
+      - to: followup_review
+        when: "{{ output.has_prior_review }}"
+      - to: concept_review
 
   # ---------------------------------------------------------------------------
   # Concept review — the cheap question, asked first
@@ -979,6 +1100,731 @@ agents:
       - to: cleanup
 
   # ---------------------------------------------------------------------------
+  # Follow-up review — the second visit, taken instead of everything above
+  # ---------------------------------------------------------------------------
+
+  - name: followup_review
+    description: Checks each point you raised last time against the code as it stands now, rather than reviewing the pull request from scratch
+    model: claude-opus-5
+    context_tier: long_context
+    reasoning:
+      effort: high
+    working_dir: "{{ pr_worktree.output.worktree_path }}"
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.base_ref
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.branch
+      - pr_worktree.output.remote
+      - prior_review.output.prior_items
+      - prior_review.output.context_comments
+      - prior_review.output.last_interaction_at
+      - prior_review.output.last_review_at
+      - prior_review.output.last_review_state
+      - prior_review.output.last_review_commit
+      - prior_review.output.items_dropped
+    system_prompt: |
+      You check a review you have already given against the code as it stands
+      now. A first pass already happened, the author has read it, and running
+      one again would re-derive points they have acted on and post them a
+      second time as though nobody read their replies.
+
+      Your unit of work is the point, not the comment. One comment that raised
+      three separate things is three entries. One thing you said twice is one.
+
+      Decide from the code, not from the conversation. "Fixed, thanks" is a
+      claim, and this step exists because claims and diffs disagree. Open the
+      file and look. Where the code cannot settle it, say `unclear` rather
+      than guessing in either direction — the human decides what to do with an
+      unclear point, and they cannot if you have already decided for them.
+
+      Raise nothing new. A finding you did not make before does not belong in
+      a follow-up: posted there it masquerades as something the author read
+      and ignored. If the change has grown new problems, that is a fresh
+      review, and the human has a route to one.
+
+      You are a reviewer, not an implementer and not a publisher. Do not edit
+      files, do not commit, do not push, and do not comment on GitHub. A later
+      step publishes what a human approves, and it can only publish what you
+      actually wrote down.
+    prompt: |
+      You have reviewed pull request #{{ pr_resolver.output.pr_number }}
+      before. Work out what became of each point you made.
+
+      **{{ pr_resolver.output.pr_title }}**
+      {{ pr_resolver.output.pr_url }}
+
+      ## What you said
+      {% if prior_review.output.last_review_state %}
+
+      Your last review was submitted {{ prior_review.output.last_review_at }}
+      as `{{ prior_review.output.last_review_state }}`.
+      {% else %}
+
+      Your last comment was {{ prior_review.output.last_interaction_at }}.
+      {% endif %}
+      {% for item in prior_review.output.prior_items %}
+
+      ---
+
+      ### `{{ item.id }}` — {{ item.kind }}{% if item.path %} on `{{ item.path }}{% if item.line %}:{{ item.line }}{% endif %}`{% endif %}
+
+      {{ item.body }}
+      {% if (item.replies | length) > 0 %}
+      **What came back:**
+      {% for reply in item.replies %}
+      - **{{ reply.author }}**: {{ reply.body }}
+      {% endfor %}
+      {% endif %}
+      {% endfor %}
+
+      ---
+      {% if prior_review.output.items_dropped %}
+
+      > {{ prior_review.output.items_dropped }} older comment{{ 's' if prior_review.output.items_dropped != 1 else '' }} of yours could not be shown here. Say so in `summary` — a human is told what is settled based on what you report, and they should know the account is partial.
+      {% endif %}
+      {% if (prior_review.output.context_comments | length) > 0 %}
+
+      ## Said on the pull request since
+
+      {% for comment in prior_review.output.context_comments %}
+      - **{{ comment.author }}**: {{ comment.body }}
+      {% endfor %}
+      {% endif %}
+
+      ## Where the code is
+
+      It is already checked out for you at
+      `{{ pr_worktree.output.worktree_path }}`, on branch
+      `{{ pr_worktree.output.branch }}`, and that is your working directory.
+      **Do not create another worktree** and do not check the branch out again.
+      {% if prior_review.output.last_review_commit %}
+
+      What has moved since you looked:
+
+      ```
+      git diff {{ prior_review.output.last_review_commit }}...HEAD
+      ```
+
+      If that commit is not in the worktree, the branch was force-pushed after
+      your review and its history no longer holds what you read. Fall back to
+      the whole diff and check every point against the current file:
+
+      ```
+      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      ```
+      {% else %}
+
+      No commit is recorded against your earlier comments, so check every point
+      against the current file. The whole diff is:
+
+      ```
+      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      ```
+      {% endif %}
+
+      A diff tells you what moved, never whether a point was addressed. A
+      change can touch the exact lines you commented on and still not do what
+      you asked, and a point can be settled by an edit somewhere else entirely.
+      Read the file.
+
+      ## What to report
+
+      One entry in `items` per point you made. Each entry is an object:
+
+      ```json
+      {
+        "source_id": "p3",
+        "status": "not_addressed",
+        "severity": "BLOCKING",
+        "path": "src/thing.ts",
+        "line": 42,
+        "title": "Token expiry is never checked",
+        "original": "What you asked for, narrowed to the ask itself.",
+        "evidence": "What the code does now, naming the file and line you read.",
+        "recommendation": "What is left to do. Empty when nothing is."
+      }
+      ```
+
+      - `source_id` is the `p...` id of the comment the point came from.
+        Several entries may share one.
+      - `status` is exactly one of:
+        - `addressed` — the code now does what you asked.
+        - `partially_addressed` — some of it landed and some did not. Say
+          which in `evidence`.
+        - `not_addressed` — the code is unchanged in the respect you raised.
+        - `obsolete` — the point no longer applies, because the code it
+          concerned is gone or the design moved past it. Keep this separate
+          from `addressed`: one means they did it, the other means nobody
+          needs to.
+        - `unclear` — the code did not settle it.
+      - `severity` is `BLOCKING` or `RECOMMENDED`, judged as the point stands
+        today rather than as you filed it last time. Nothing else.
+      - `path` is repository-relative, exactly as it appears in the diff.
+      - `line` is the line **in the current version of the file**, and it must
+        be a line this pull request adds or touches. An anchor outside the diff
+        cannot be attached inline, so a wrong line quietly demotes the point
+        into the review body. Omit `line` rather than guess, and omit both for
+        a point with no single location.
+      - `original` and `evidence` are prose for the author. Do not quote
+        comment ids at them and do not write them as notes to yourself.
+
+      Every point above appears exactly once. Something you said that was never
+      a finding — a question, a thank-you, an answer to someone else — is
+      `obsolete`.
+
+      Everything having been addressed is a real and common result. Report it
+      plainly rather than hunting for something still wrong to justify the pass.
+    output:
+      items:
+        type: array
+        description: 'One object per point you made previously: {"source_id": "p3", "status": "addressed"|"partially_addressed"|"not_addressed"|"obsolete"|"unclear", "severity": "BLOCKING"|"RECOMMENDED", "path": "...", "line": 42, "title": "...", "original": "...", "evidence": "...", "recommendation": "..."}. `path` and `line` omitted when the point has no single location.'
+      summary:
+        type: string
+        description: Where the pull request now stands against your earlier review, in a few sentences
+      changes_since:
+        type: string
+        description: What the author changed since your review, read from the diff rather than from their replies. Empty when nothing has changed.
+      verdict:
+        type: string
+        description: Exactly one of all_addressed, partially_addressed, not_addressed
+    routes:
+      - to: build_followup_questions
+
+  - name: build_followup_questions
+    description: Turns the outstanding points into strictly shaped question objects, reconciles them against the comments you actually made, and counts the settled ones so a clean result is something you can see rather than infer from an empty list
+    type: script
+    command: python3
+    timeout: 60
+    input:
+      - followup_review.output.items
+      - prior_review.output.prior_items
+    args:
+      - "{{ workflow.dir }}/scripts/build_followup_questions.py"
+    # The prior comments travel with the analysis so the script can check that
+    # every one of them was accounted for. An analysis that quietly omits a
+    # point would otherwise route straight to the clear gate, which then tells
+    # you everything was settled. Anything unaccounted for comes back as an
+    # unclear question rather than as silence.
+    stdin: '{"items": {{ followup_review.output.items | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}}'
+    routes:
+      - to: cleanup
+        when: "{{ not output.ok }}"
+      - to: followup_clear_gate
+        when: "{{ output.question_count == 0 }}"
+      - to: followup_triage
+
+  - name: followup_triage
+    type: questions
+    description: Puts every still-open point to you individually, so raising one a second time is a decision rather than a default
+    source: build_followup_questions.output.questions
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - prior_review.output.last_review_at
+      - prior_review.output.last_interaction_at
+      - followup_review.output.summary
+      - followup_review.output.changes_since
+      - build_followup_questions.output.question_count
+      - build_followup_questions.output.blocking_count
+      - build_followup_questions.output.recommended_count
+      - build_followup_questions.output.addressed_count
+      - build_followup_questions.output.obsolete_count
+    prompt: |
+      ## Your earlier review of #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+
+      {{ followup_review.output.summary }}
+      {% if followup_review.output.changes_since %}
+
+      **What changed since {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}:** {{ followup_review.output.changes_since }}
+      {% endif %}
+
+      {{ build_followup_questions.output.addressed_count }} of your points
+      {{ 'has' if build_followup_questions.output.addressed_count == 1 else 'have' }} been
+      addressed{% if build_followup_questions.output.obsolete_count %} and {{ build_followup_questions.output.obsolete_count }} no longer appl{{ 'ies' if build_followup_questions.output.obsolete_count == 1 else 'y' }}{% endif %}.
+      {{ build_followup_questions.output.question_count }} {{ 'is' if build_followup_questions.output.question_count == 1 else 'are' }} still open:
+      {{ build_followup_questions.output.blocking_count }} blocking and
+      {{ build_followup_questions.output.recommended_count }} recommended.
+      Nothing has been posted to the pull request yet.
+
+      Decide each one. There are four ways to answer:
+
+      - **Post as-is** raises it again at the severity it carries now.
+      - **Post as BLOCKING** / **Post as RECOMMENDED** raises the same wording
+        at the other severity, so a point the author has now sat on twice can
+        be promoted, or one you no longer want to hold up a merge demoted.
+        Only the severity it does not already carry is offered.
+      - **Do not post** lets it go. Nothing about it reaches the author.
+      - **Write your own** raises it with your note applied — the place to
+        acknowledge a partial fix, accept a reason you were given, or narrow
+        what is left.
+
+      Skipping a question raises it as-is, so "skip all remaining" means
+      "raise the rest verbatim". Aborting posts nothing at all.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: cleanup
+    routes:
+      - to: apply_followup_triage
+
+  - name: apply_followup_triage
+    description: Applies your decisions before any model sees them — the same script the first-pass triage uses, so a point you let go is gone by the same guarantee
+    type: script
+    command: python3
+    timeout: 60
+    input:
+      - build_followup_questions.output.findings
+      - followup_triage.output.items
+    args:
+      - "{{ workflow.dir }}/scripts/apply_triage.py"
+    stdin: '{"findings": {{ build_followup_questions.output.findings | tojson }}, "items": {{ followup_triage.output.items | tojson }}}'
+    routes:
+      - to: cleanup
+        when: "{{ not output.ok }}"
+      - to: followup_clear_gate
+        when: "{{ output.approved_count == 0 }}"
+      - to: followup_gate
+
+  - name: followup_gate
+    type: human_gate
+    description: The publish decision when points from your earlier review are still open
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.state
+      - pr_resolver.output.is_draft
+      - pr_resolver.output.author
+      - pr_resolver.output.gh_user
+      - prior_review.output.last_review_at
+      - prior_review.output.last_interaction_at
+      - prior_review.output.matched_logins
+      - prior_review.output.other_login_items
+      - followup_review.output.summary
+      - followup_review.output.changes_since
+      - build_followup_questions.output.addressed_count
+      - build_followup_questions.output.obsolete_count
+      - build_followup_questions.output.resolved
+      - apply_followup_triage.output.approved_count
+      - apply_followup_triage.output.blocking_count
+      - apply_followup_triage.output.recommended_count
+      - apply_followup_triage.output.dropped_count
+    prompt: |
+      ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+
+      {{ pr_resolver.output.pr_url }}
+      {% if pr_resolver.output.state != 'OPEN' or pr_resolver.output.is_draft %}
+
+      > This pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}. Anything you choose here still posts to it.
+      {% endif %}
+      {% if pr_resolver.output.author | lower == pr_resolver.output.gh_user | lower %}
+
+      > This is your own pull request. GitHub refuses an approval from the author, so that option will fail here.
+      {% endif %}
+      {% if prior_review.output.other_login_items %}
+
+      > The review being followed up on was posted as {{ prior_review.output.matched_logins | join(', ') }}, and `gh` is now active as `{{ pr_resolver.output.gh_user }}`. Anything you publish here goes up under `{{ pr_resolver.output.gh_user }}`, so the pull request will show one reviewer under two names. Run `gh auth switch` and start again if you would rather keep them together.
+      {% endif %}
+
+      {{ followup_review.output.summary }}
+      {% if followup_review.output.changes_since %}
+
+      **What changed since {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}:** {{ followup_review.output.changes_since }}
+      {% endif %}
+      {% if (build_followup_questions.output.resolved | length) > 0 %}
+
+      ### Settled
+
+      {% for item in build_followup_questions.output.resolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ### Still open
+
+      You kept {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} —
+      {{ apply_followup_triage.output.blocking_count }} blocking and
+      {{ apply_followup_triage.output.recommended_count }} recommended{% if apply_followup_triage.output.dropped_count %}, and let {{ apply_followup_triage.output.dropped_count }} go{% endif %}.
+
+      ---
+
+      Approving posts `LGTM, thanks for contributing!` and nothing else, which
+      on a pull request with open points says you have decided they can ship
+      without them.
+
+      Posting the findings raises exactly the points you kept, worded as a
+      follow-up rather than as a first review, with inline comments wherever
+      the diff allows.
+    options:
+      - label: 'Approve — "LGTM, thanks for contributing!"'
+        value: approve
+        route: post_approval
+      - label: Post the points you kept as a review
+        value: comment
+        route: followup_comment_writer
+      - label: Post nothing
+        value: stop
+        route: cleanup
+
+  - name: followup_clear_gate
+    type: human_gate
+    description: The publish decision when nothing from your earlier review is left to raise, whether because it all landed or because you let the rest go
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.state
+      - pr_resolver.output.is_draft
+      - pr_resolver.output.author
+      - pr_resolver.output.gh_user
+      - prior_review.output.last_review_at
+      - prior_review.output.last_interaction_at
+      - prior_review.output.items_dropped
+      - prior_review.output.matched_logins
+      - prior_review.output.other_login_items
+      - followup_review.output.summary
+      - followup_review.output.changes_since
+      - followup_review.output.verdict
+      - build_followup_questions.output.addressed_count
+      - build_followup_questions.output.obsolete_count
+      - build_followup_questions.output.resolved
+      - apply_followup_triage.output.dropped_count?
+    prompt: |
+      ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+
+      {{ pr_resolver.output.pr_url }}
+      {% if pr_resolver.output.state != 'OPEN' or pr_resolver.output.is_draft %}
+
+      > This pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}. Anything you choose here still posts to it.
+      {% endif %}
+      {% if pr_resolver.output.author | lower == pr_resolver.output.gh_user | lower %}
+
+      > This is your own pull request. GitHub refuses an approval from the author, so that option will fail here.
+      {% endif %}
+      {% if prior_review.output.items_dropped %}
+
+      > {{ prior_review.output.items_dropped }} of your older comment{{ 's' if prior_review.output.items_dropped != 1 else '' }} were too far back to be read, so "nothing left to raise" covers only what was.
+      {% endif %}
+      {% if prior_review.output.other_login_items %}
+
+      > The review being followed up on was posted as {{ prior_review.output.matched_logins | join(', ') }}, and `gh` is now active as `{{ pr_resolver.output.gh_user }}`. Anything you publish here goes up under `{{ pr_resolver.output.gh_user }}`, so the pull request will show one reviewer under two names. Run `gh auth switch` and start again if you would rather keep them together.
+      {% endif %}
+      {% if apply_followup_triage is defined %}
+
+      **Nothing is left to raise** — you let every open point go at triage
+      ({{ apply_followup_triage.output.dropped_count }} of them).
+      {% else %}
+
+      **Nothing is left to raise.** Every point from your review of
+      {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }} is addressed or no longer
+      applies.
+      {% endif %}
+
+      {{ followup_review.output.summary }}
+      {% if followup_review.output.changes_since %}
+
+      **What changed since:** {{ followup_review.output.changes_since }}
+      {% endif %}
+      {% if (build_followup_questions.output.resolved | length) > 0 %}
+
+      ### Settled
+
+      {% for item in build_followup_questions.output.resolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ---
+
+      Approving posts `LGTM, thanks for contributing!` and nothing else.
+
+      Writing your own note posts it verbatim as a review comment — nothing
+      rewrites it and nothing is appended.
+
+      Running the full review starts the first-pass path from the top: concept
+      review, code review, and a decision on every finding. That is the route
+      to fresh findings, which this pass deliberately does not produce. It
+      costs a full review and it posts a second, separate review to the pull
+      request.
+    options:
+      - label: 'Approve — "LGTM, thanks for contributing!"'
+        value: approve
+        route: post_approval
+      - label: Comment with a note I write
+        value: note
+        route: post_note
+        prompt_for: note
+        multiline: true
+      - label: Run the full review instead
+        value: full_review
+        route: concept_review
+      - label: Post nothing
+        value: stop
+        route: cleanup
+
+  - name: followup_comment_writer
+    description: Words the points you chose to raise again, framed as a second mention rather than a first
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: medium
+    plugins:
+      - writing@jason-tools   # humanizer
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - prior_review.output.last_review_at
+      - prior_review.output.last_interaction_at
+      - build_followup_questions.output.addressed_count
+      - build_followup_questions.output.obsolete_count
+      - build_followup_questions.output.resolved
+      - apply_followup_triage.output.approved
+      - apply_followup_triage.output.approved_count
+      - apply_followup_triage.output.blocking_count
+      - apply_followup_triage.output.recommended_count
+    system_prompt: |
+      You write the follow-up review that gets posted to a pull request. You
+      are the last step before it is public, and you are writing to its author
+      — who has already read your first review and answered parts of it.
+
+      You decide nothing. Which points are raised again was settled by a human,
+      one at a time, and everything they let go was removed before you were
+      called. What you are given is exactly what goes out. Do not add a point
+      nobody raised, do not merge two into one, and do not soften a blocking
+      point into a suggestion.
+
+      You are given no summary of the earlier review and no prose account of
+      what has changed, deliberately. Both are written before the human
+      decides anything, so either could name a point they went on to drop, and
+      a dropped point reaching the author through a summary line is no better
+      than one reaching them through a finding. Everything you have is either
+      a point they kept or a point that is settled.
+
+      The severity on each point is theirs, not the reviewer's. The label wins.
+      Write it at the weight it carries and let the wording follow.
+
+      Write it as a second mention, because that is what it is. Say what has
+      landed before what has not — it is true, it is short, and a follow-up
+      that opens on the same complaint reads as though the work in between did
+      not happen. Then be plain about what is still open. Do not re-argue a
+      point from scratch, do not apologise for raising it again, and do not
+      accuse anyone of ignoring it.
+
+      Every comment goes through the `humanizer` skill before you return it.
+      Apply it properly — draft, audit what still reads as machine-generated,
+      then revise. Do not just delete em dashes and call it done.
+
+      Write like a competent colleague who read the code: direct about what is
+      wrong, specific about where, and free of ceremony. No preamble, no
+      emoji, no praise sandwich.
+    prompt: |
+      Write a follow-up review of pull request
+      #{{ pr_resolver.output.pr_number }} —
+      **{{ pr_resolver.output.pr_title }}**.
+
+      You reviewed it on {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}. Since
+      then, {{ build_followup_questions.output.addressed_count }} of the points
+      you made {{ 'has' if build_followup_questions.output.addressed_count == 1 else 'have' }} been
+      addressed{% if build_followup_questions.output.obsolete_count %} and {{ build_followup_questions.output.obsolete_count }} no longer appl{{ 'ies' if build_followup_questions.output.obsolete_count == 1 else 'y' }}{% endif %}.
+      {% if (build_followup_questions.output.resolved | length) > 0 %}
+
+      ## What has landed
+
+      Open the review by crediting these. They are settled, so they are context
+      rather than findings — a sentence or two drawn from them, not a list
+      repeated back.
+
+      {% for item in build_followup_questions.output.resolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ## The points to raise again
+
+      These are the {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }}
+      a human kept: {{ apply_followup_triage.output.blocking_count }} blocking
+      and {{ apply_followup_triage.output.recommended_count }} recommended.
+      Points they let go are already gone and you never see them, so everything
+      below is posted and nothing else is.
+
+      {% for finding in apply_followup_triage.output.approved %}
+      ---
+
+      ### `{{ finding.id }}` — {{ finding.severity }}: {{ finding.title }}
+
+      {% if finding.path %}**Location:** `{{ finding.path }}{% if finding.line %}:{{ finding.line }}{% endif %}`{% else %}**Location:** none — this point has no single line{% endif %}
+
+      **Status:** `{{ finding.status }}`
+
+      {{ finding.body }}
+      {% if finding.suggestion %}
+      **What is still needed:** {{ finding.suggestion }}
+      {% endif %}
+      {% if finding.guidance %}
+      **The human's instruction for this one:** {{ finding.guidance }}
+
+      That is how they want it raised. Apply it — accept the partial fix,
+      acknowledge the reason they were given, or narrow the ask as described.
+      Their wording wins over the reviewer's.
+      {% endif %}
+      {% endfor %}
+
+      ---
+
+      ## How to lay it out
+
+      A `status` of `partially_addressed` is not the same comment as
+      `not_addressed`. Credit what landed and name only the remainder;
+      restating the whole original point tells the author their work did not
+      register. `unclear` is a question, not a finding — you could not tell
+      from the code, so ask.
+
+      **`inline_comments`** carries every point above that has a `path` and a
+      `line`. One object per point:
+
+      ```json
+      {"path": "src/thing.ts", "line": 42, "body": "The comment, in markdown."}
+      ```
+
+      Copy `path` and `line` from the point exactly. Do not adjust, round or
+      guess a line — a comment that does not land on the diff gets folded into
+      the body automatically, which is a worse result than a correct anchor.
+
+      Include a ```suggestion``` block in the body wherever what is left is a
+      short, concrete edit to those exact lines. Getting the indentation right
+      matters: the author applies it with one click.
+
+      Prefix each inline comment with **BLOCKING** or **RECOMMENDED** so its
+      weight is obvious without opening the summary.
+
+      **`review_body`** is the top-level comment. It holds:
+
+      - One or two sentences on what has landed since your last review, drawn
+        from the settled points above.
+      - Two or three on what is still open, and whether it blocks.
+      - A short list of the blocking points by location, so the author can see
+        the shape of the remaining work without opening every thread.
+      - Any point above with no `path` or `line`, written out in full, since it
+        has nowhere else to go.
+
+      Do not repeat an inline comment's full text in the body. The author reads
+      both.
+
+      Every point above must appear exactly once, either inline or in the body.
+      Set `has_content: true`.
+
+      Set `posted_count` to how many of the points you were given appear in
+      your output and `dropped_count` to how many you could not place. The two
+      together must equal {{ apply_followup_triage.output.approved_count }}. A
+      `posted_count` below that stops the run rather than posting a follow-up
+      the human approved more of than it contains.
+    output:
+      review_body:
+        type: string
+        description: The top-level review comment in markdown. Empty only when has_content is false.
+      inline_comments:
+        type: array
+        description: 'One object per point anchored to a line: {"path": "...", "line": 42, "body": "..."}. Empty when no surviving point has a location.'
+      posted_count:
+        type: number
+        description: How many of the points you were given appear in your output, inline or in the body
+      dropped_count:
+        type: number
+        description: How many of the points you were given you could not place. Should be zero.
+      has_content:
+        type: boolean
+        description: False only when there is genuinely nothing to post. This path always hands you points, so it is a safety net rather than a normal outcome.
+    routes:
+      - to: cleanup
+        when: "{{ not output.has_content or (output.posted_count | int) < (apply_followup_triage.output.approved_count | int) }}"
+      - to: post_followup_review
+
+  - name: post_followup_review
+    description: Posts the follow-up as one COMMENT review, anchoring inline comments to the diff wherever it can and folding the rest into the body
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.base_ref
+      - pr_worktree.output.remote
+      - followup_comment_writer.output.review_body
+      - followup_comment_writer.output.inline_comments
+    args:
+      - "{{ workflow.dir }}/scripts/post_review.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+      - "{{ pr_worktree.output.worktree_path }}"
+      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.remote }}"
+      - "COMMENT"
+    stdin: '{"body": {{ followup_comment_writer.output.review_body | tojson }}, "comments": {{ followup_comment_writer.output.inline_comments | tojson }}}'
+    routes:
+      - to: cleanup
+
+  - name: post_approval
+    description: Approves the pull request with the one line and nothing else — no summary, no findings, no model between the decision and the text
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.base_ref
+      - pr_worktree.output.remote
+    args:
+      - "{{ workflow.dir }}/scripts/post_review.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+      - "{{ pr_worktree.output.worktree_path }}"
+      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.remote }}"
+      - "APPROVE"
+    stdin: '{"body": "LGTM, thanks for contributing!", "comments": []}'
+    routes:
+      - to: cleanup
+
+  - name: post_note
+    description: Posts the note you wrote, verbatim, as a plain review comment
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+      - pr_worktree.output.worktree_path
+      - pr_worktree.output.base_ref
+      - pr_worktree.output.remote
+      - followup_clear_gate.output.additional_input
+    args:
+      - "{{ workflow.dir }}/scripts/post_review.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+      - "{{ pr_worktree.output.worktree_path }}"
+      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.remote }}"
+      - "COMMENT"
+    # No agent reads this. A note you wrote yourself is already the wording you
+    # want, and passing it through the writer would return something adjacent
+    # to it that you never approved.
+    stdin: '{"body": {{ followup_clear_gate.output.additional_input.note | default("") | tojson }}, "comments": []}'
+    routes:
+      - to: cleanup
+
+  # ---------------------------------------------------------------------------
   # Teardown
   # ---------------------------------------------------------------------------
 
@@ -997,29 +1843,47 @@ agents:
       - "{{ pr_worktree.output.worktree_path if pr_worktree is defined else '' }}"
       - "{{ pr_worktree.output.branch if pr_worktree is defined else '' }}"
     routes:
+      - to: prior_scan_failed
+        when: "{{ prior_review is defined and not prior_review.output.ok }}"
       - to: findings_unreadable
-        when: "{{ build_questions is defined and not build_questions.output.ok }}"
+        when: "{{ (build_questions is defined and not build_questions.output.ok) or (build_followup_questions is defined and not build_followup_questions.output.ok) }}"
       - to: triage_failed
-        when: "{{ apply_triage is defined and not apply_triage.output.ok }}"
+        when: "{{ (apply_triage is defined and not apply_triage.output.ok) or (apply_followup_triage is defined and not apply_followup_triage.output.ok) }}"
       - to: review_failed
         when: "{{ post_review is defined and not post_review.output.ok }}"
       - to: review_posted
         when: "{{ post_review is defined and post_review.output.ok }}"
+      - to: followup_failed
+        when: "{{ (post_followup_review is defined and not post_followup_review.output.ok) or (post_approval is defined and not post_approval.output.ok) or (post_note is defined and not post_note.output.ok) }}"
+      - to: followup_posted
+        when: "{{ (post_followup_review is defined and post_followup_review.output.ok) or (post_approval is defined and post_approval.output.ok) or (post_note is defined and post_note.output.ok) }}"
+      - to: followup_not_written
+        when: "{{ followup_comment_writer is defined and post_followup_review is not defined }}"
       - to: no_review
+
+  - name: prior_scan_failed
+    type: terminate
+    status: failed
+    input:
+      - pr_resolver.output.pr_number
+      - prior_review.output.error
+    reason: "Could not tell whether you have already reviewed #{{ pr_resolver.output.pr_number }}, so the run stopped rather than risk posting a second first-pass review over your own comments. The worktree has been removed. {{ prior_review.output.error }}"
 
   - name: findings_unreadable
     type: terminate
     status: failed
     input:
-      - build_questions.output.error
-    reason: "The code review produced findings that could not be read, so none of them reached you and nothing was posted. The worktree has been removed. {{ build_questions.output.error }}"
+      - build_questions.output.error?
+      - build_followup_questions.output.error?
+    reason: "The review produced findings that could not be read, so none of them reached you and nothing was posted. The worktree has been removed. {{ build_questions.output.error if build_questions is defined else build_followup_questions.output.error }}"
 
   - name: triage_failed
     type: terminate
     status: failed
     input:
-      - apply_triage.output.error
-    reason: "Your triage decisions could not be applied, so nothing was posted. The worktree has been removed. {{ apply_triage.output.error }}"
+      - apply_triage.output.error?
+      - apply_followup_triage.output.error?
+    reason: "Your triage decisions could not be applied, so nothing was posted. The worktree has been removed. {{ apply_triage.output.error if apply_triage is defined else apply_followup_triage.output.error }}"
 
   - name: review_posted
     type: terminate
@@ -1042,6 +1906,44 @@ agents:
       - pr_resolver.output.pr_number
       - post_review.output.error
     reason: "The review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_review.output.error }}"
+
+  - name: followup_posted
+    type: terminate
+    status: success
+    input:
+      - pr_resolver.output.pr_number
+      - build_followup_questions.output.addressed_count?
+      - apply_followup_triage.output.approved_count?
+      - apply_followup_triage.output.dropped_count?
+      - apply_followup_triage.output.reclassified_count?
+      - post_approval.output.review_url?
+      - post_note.output.review_url?
+      - post_followup_review.output.review_url?
+      - post_followup_review.output.inline_posted?
+      - post_followup_review.output.inline_demoted?
+      - post_followup_review.output.error?
+    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review unraised{% endif %}. {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; nothing from your earlier review was raised. {{ post_note.output.review_url }}{% else %}Raised {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review again on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} already addressed, {{ apply_followup_triage.output.dropped_count }} let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.inline_demoted }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}"
+
+  - name: followup_failed
+    type: terminate
+    status: failed
+    input:
+      - pr_resolver.output.pr_number
+      - post_approval.output.error?
+      - post_note.output.error?
+      - post_followup_review.output.error?
+    reason: "{% if post_approval is defined %}The approval of #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_approval.output.error }}{% elif post_note is defined %}Your note on #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_note.output.error }}{% else %}The follow-up review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_followup_review.output.error }}{% endif %} The worktree has been removed."
+
+  - name: followup_not_written
+    type: terminate
+    status: failed
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_url
+      - apply_followup_triage.output.approved_count
+      - followup_comment_writer.output.posted_count?
+      - followup_comment_writer.output.has_content?
+    reason: "You kept {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} to raise on #{{ pr_resolver.output.pr_number }}, but the review written from them {% if not followup_comment_writer.output.has_content %}came back empty{% else %}carried only {{ followup_comment_writer.output.posted_count }}{% endif %}. Nothing was posted: a follow-up missing points you approved is worse than none, because the ones it drops read as withdrawn. The worktree has been removed. {{ pr_resolver.output.pr_url }}"
 
   - name: no_review
     type: terminate

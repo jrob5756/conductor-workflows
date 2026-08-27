@@ -1,0 +1,4 @@
+# Python bytecode. The pr-review scripts import a shared module from their own
+# directory, so running them writes a cache next to the workflow.
+__pycache__/
+*.py[cod]
