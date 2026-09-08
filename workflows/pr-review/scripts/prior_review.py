@@ -41,7 +41,7 @@ approval with an empty body leaves nothing to verify, and routing that into a
 follow-up pass would produce an analysis of nothing.
 
 Usage:
-    prior_review.py <name_with_owner> <pr_number> <gh_user> [other_logins]
+    prior_review.py <name_with_owner> <pr_number> <gh_user> [other_logins] [head_sha] [worktree]
 
     `other_logins` is a comma-separated list of the remaining logins `gh` is
     authenticated as on this host. `gh_user` is the account that will post.
@@ -50,7 +50,7 @@ Output:
     ok, error, has_prior_review, prior_items, context_comments, review_count,
     inline_count, issue_comment_count, reply_count, items_dropped,
     matched_logins, other_login_items, last_interaction_at, last_review_at,
-    last_review_state, last_review_commit
+    last_review_state, last_review_commit, comparison_commit, change_status, change_summary
 """
 
 from __future__ import annotations
@@ -84,6 +84,9 @@ def fail(message: str) -> None:
             "ok": False,
             "error": message,
             "has_prior_review": False,
+            "change_status": "unknown",
+            "change_summary": message,
+            "comparison_commit": "",
             "prior_items": [],
             "context_comments": [],
             "review_count": 0,
@@ -175,6 +178,28 @@ def line_of(comment: dict[str, object]) -> int:
         if value > 0:
             return value
     return 0
+
+
+def changes_since_review(
+    previous_sha: str, head_sha: str, worktree: str, has_history: bool
+) -> tuple[str, str]:
+    """Compare reviewed content; unavailable history is unknown, not unchanged."""
+    if not has_history:
+        return "no_previous_review", ""
+    if not previous_sha or not head_sha:
+        return "unknown", "The earlier interaction has no comparable review commit."
+    if previous_sha == head_sha:
+        return "unchanged", f"The pull request is still at the reviewed commit {head_sha}."
+    if not worktree:
+        return "unknown", "No worktree was provided to compare the review commits."
+    rc, out, err = run(
+        ["git", "-C", worktree, "diff", "--quiet", previous_sha, head_sha, "--"]
+    )
+    if rc == 0:
+        return "unchanged", "The commit changed, but the file contents match the previous review."
+    if rc == 1:
+        return "changed", "The file contents changed since the previous review."
+    return "unknown", f"Could not compare the previous review commit: {err or out}"
 
 
 def replies_to(
@@ -328,6 +353,18 @@ def main(argv: list[str]) -> None:
     ]
     last_interaction_at = max(stamps) if stamps else ""
     latest_review = max(my_reviews, key=stamp_of) if my_reviews else None
+    previous_sha = str(latest_review.get("commit_id") or "") if latest_review else ""
+    if not latest_review and my_inline:
+        latest_inline = max(my_inline, key=stamp_of)
+        previous_sha = str(
+            latest_inline.get("original_commit_id") or latest_inline.get("commit_id") or ""
+        )
+    change_status, change_summary = changes_since_review(
+        previous_sha,
+        argv[4] if len(argv) > 4 else "",
+        argv[5] if len(argv) > 5 else "",
+        bool(my_reviews or my_inline or my_conversation),
+    )
 
     context = [
         {
@@ -351,6 +388,9 @@ def main(argv: list[str]) -> None:
             "ok": True,
             "error": "",
             "has_prior_review": bool(items),
+            "change_status": change_status,
+            "change_summary": change_summary,
+            "comparison_commit": previous_sha,
             "prior_items": items,
             "context_comments": context,
             "review_count": len(my_reviews),

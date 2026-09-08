@@ -38,6 +38,9 @@ jobs:
           pip install /tmp/conductor/*.whl pyyaml
           conductor --version
 
+      - name: Test PR review scripts and routing
+        run: python3 -m unittest discover -s workflows/pr-review/tests -v
+
       - name: Validate every workflow under workflows/
         run: |
           set -euo pipefail

@@ -12,15 +12,17 @@
 #     ↓
 #   pr_worktree (script)     fetch pull/N/head, cut a throwaway worktree
 #     ↓
-#   prior_review (script) ──→ have you already reviewed this one? if so the
-#     ↓                      run takes the follow-up path below instead
+#   prior_review (script) ──→ compare against your previous review before either path
+#   unchanged_gate          continue or exit when unchanged; unknown history also asks
+#   select_review           choose the follow-up path when earlier feedback exists
 #     ↓
-#   concept_review           [concept-review skill] is this a sound change at
-#     ↓                      all, before anything expensive runs
+#   concept_review           does the proposed intent belong in this repository?
 #   concept_gate ───────────→ only when it found blocking gaps:
 #     ↓                        proceed / post the concept findings and stop /
 #     ↓                        stop without posting
+#   ci_start (script)        start or approve Actions for the reviewed head
 #   code_review              [code-review skill] report only, change nothing
+#   ci_wait (script)         wait for CI; problems join the findings as BLOCKING
 #     ↓
 #   build_questions (script) findings → strictly shaped question objects
 #     ↓
@@ -35,6 +37,7 @@
 #   cleanup (script)         remove the worktree and its branch
 #     ↓
 #   $end
+#   review_clear_gate offers approval when no findings remain; LGTM leads to a separate merge gate.
 #
 # The follow-up path — taken when `prior_review` finds your earlier comments:
 #
@@ -89,6 +92,8 @@
 #   in a follow-up: posted there it masquerades as something the author
 #   already ignored. If you want fresh findings, `followup_clear_gate` routes
 #   you into the full review.
+#
+#   Approval and merging require separate decisions, with fresh readiness shown after approval.
 #
 #   `build_followup_questions` reconciles what came back against what went in.
 #   A point the analysis simply failed to mention would otherwise vanish, and
@@ -179,14 +184,7 @@
 #   The scripts resolve through `{{ workflow.dir }}`, so they are found whether
 #   the workflow is run by path or through a registry, from any repository.
 #
-# Loops
-#   None. Every gate either continues or ends the run, and no step re-runs
-#   another. Revisiting a triage answer happens inside the questions node,
-#   which is one engine step, so Back costs no iterations and cannot loop.
-#
-#   `followup_clear_gate` routing into `concept_review` looks like a jump
-#   backwards and is not one: the follow-up path never runs again after it, so
-#   the run continues forwards down the first-pass path and terminates there.
+# Only the merge-readiness recheck loops; reviews and CI are not repeated by that gate.
 #
 # Plugins
 #   Each step declares the plugin whose skill it drives, rather than the
@@ -199,7 +197,6 @@
 #   discovering the skill alone leaves it calling agents that are not there.
 #
 #     pr_resolver                     git@jason-tools      gh-cli
-#     concept_review                  prs@jason-tools      concept-review
 #     code_review                     prs@jason-tools      code-review
 #     comment_writer                  writing@jason-tools  humanizer
 #     followup_comment_writer         writing@jason-tools  humanizer
@@ -236,8 +233,8 @@
 
 workflow:
   name: pr-review
-  description: Reviews a pull request and posts the findings you approve — cuts a throwaway worktree, runs a concept review that gates the expensive work behind a human decision, runs a code review that reports without touching anything, puts every finding to you individually to post as-is, promote or demote, reword or drop, then publishes one COMMENT review with inline comments anchored wherever the diff allows. On a pull request you have already reviewed it checks what became of the points you made instead, and closes on a choice between approving, re-raising what is still open, or a note you write yourself
-  version: "1.2.0"
+  description: Reviews repository fit before implementation quality, asks before repeating an unchanged review, starts and waits for PR CI alongside the code review, and includes CI problems as blocking findings for triage. Posts only the feedback you approve. Follow-up runs check earlier feedback instead of repeating a full review. After posting LGTM, shows current merge blockers and asks separately whether to squash-merge.
+  version: "1.3.0"
   entry_point: bootstrap
 
   runtime:
@@ -481,17 +478,64 @@ agents:
       - pr_resolver.output.pr_number
       - pr_resolver.output.gh_user
       - bootstrap.output.gh_logins
+      - pr_worktree.output.head_sha
+      - pr_worktree.output.worktree_path
     args:
       - "{{ workflow.dir }}/scripts/prior_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_resolver.output.gh_user }}"
       - "{{ bootstrap.output.gh_logins | join(',') }}"
+      - "{{ pr_worktree.output.head_sha }}"
+      - "{{ pr_worktree.output.worktree_path }}"
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
+      - to: unchanged_gate
+        when: "{{ output.change_status in ['unchanged', 'unknown'] }}"
+      - to: select_review
+
+  - name: unchanged_gate
+    type: human_gate
+    description: Asks before reviewing unchanged content or content whose earlier baseline is unavailable
+    input:
+      - pr_resolver.output.pr_url
+      - prior_review.output.change_status
+      - prior_review.output.change_summary
+      - prior_review.output.comparison_commit
+      - pr_worktree.output.head_sha
+    prompt: |
+      {% if prior_review.output.change_status == 'unchanged' %}
+      ## No code changes since your previous review
+      {% else %}
+      ## Changes since your previous review could not be determined
+      {% endif %}
+
+      {{ pr_resolver.output.pr_url }}
+
+      {{ prior_review.output.change_summary }}
+
+      Previous review commit: `{{ prior_review.output.comparison_commit or 'unavailable' }}`
+      Current review commit: `{{ pr_worktree.output.head_sha }}`
+
+      Neither review nor CI has started. Continue anyway, or exit without posting?
+    options:
+      - label: Continue reviewing anyway
+        value: continue
+        route: select_review
+      - label: Exit without reviewing
+        value: stop
+        route: cleanup
+
+  - name: select_review
+    type: set
+    input:
+      - prior_review.output.has_prior_review
+    values:
+      followup: "{{ prior_review.output.has_prior_review }}"
+    routes:
       - to: followup_review
-        when: "{{ output.has_prior_review }}"
+        when: "{{ output.followup }}"
       - to: concept_review
 
   # ---------------------------------------------------------------------------
@@ -499,13 +543,12 @@ agents:
   # ---------------------------------------------------------------------------
 
   - name: concept_review
-    description: Judges whether the change is coherent, complete and worth making at all, before any line-level review runs
+    description: Judges whether the proposed goal belongs in the repository, assuming a correct implementation
     model: claude-opus-5
     context_tier: long_context
     reasoning:
       effort: high
-    plugins:
-      - prs@jason-tools       # concept-review
+    plugins: []
     working_dir: "{{ pr_worktree.output.worktree_path }}"
     input:
       - pr_resolver.output.pr_number
@@ -516,26 +559,35 @@ agents:
       - pr_worktree.output.branch
       - pr_worktree.output.remote
     system_prompt: |
-      You invoke the `concept-review` skill and report what it concluded. The
-      skill owns the analysis — what to read, how to model the change, and how
-      to rank findings. Follow it as written.
+      Assess whether the intent of this pull request logically belongs in this
+      repository. The question is: if this proposal were implemented perfectly,
+      would it be a sensible addition to this project?
+
+      Establish the repository's purpose, intended users, supported use cases,
+      explicit non-goals, and ownership boundaries from its README, contributor
+      guidance and design documentation. Read the PR description and linked
+      issue to understand the actual problem and intended outcome. Skim the
+      diff only to establish what capability or policy the PR proposes.
+
+      Do not invoke a broader review skill. This is a product-scope and
+      repository-fit assessment, not an implementation or integration audit.
 
       You are a reviewer, not an implementer and not a publisher. Do not edit
       files, do not commit, do not push, and do not comment on GitHub. A later
       step publishes what a human approves, and it can only publish what you
       actually wrote down.
 
-      This is the conceptual pass. Style, naming, local implementation quality
-      and test detail belong to a separate code review that runs after you.
-      Raising them here spends the human's decision on the wrong question.
+      Exclude code bugs, missing wiring, API correctness, edge cases, tests,
+      error handling, security defects, style, naming, documentation coverage
+      and refactoring suggestions. Those belong exclusively to code review.
+      A defect fixable without changing the proposed goal is not a conceptual
+      finding. Do not disguise an implementation defect as a "logical gap."
     prompt: |
       Review pull request #{{ pr_resolver.output.pr_number }} as a proposed
       change to this project.
 
       **{{ pr_resolver.output.pr_title }}**
       {{ pr_resolver.output.pr_url }}
-
-      /concept-review #{{ pr_resolver.output.pr_number }}
 
       ## Where the code is
 
@@ -551,11 +603,23 @@ agents:
 
       ## What to report
 
-      Report only material findings, as the skill defines them. A gap counts
-      only when it conflicts with the change's stated goal, an established
-      convention in this repository, or a workflow the change has to complete
-      to be usable. Do not invent requirements because the change could have
-      been broader.
+      Explain the problem the PR intends to solve, who needs it, and why that
+      responsibility belongs here rather than in another project, plugin or
+      layer. Assess whether the proposed behavior coheres with this project's
+      documented purpose and product model.
+
+      Examples of valid objections: an unrelated feature in a focused library,
+      a use case the project explicitly excludes, or moving responsibility
+      into a component whose documented role contradicts it. Cite concrete
+      repository evidence, not personal taste or hypothetical future costs.
+
+      Examples to exclude: a missing registration, an unhandled exception,
+      incomplete tests, or an implementation that fails its otherwise sound
+      goal. The code review owns all of those.
+
+      New functionality is not out of scope merely because it is new. Do not
+      invent requirements or infer a non-goal from the absence of a feature.
+      If intent is unclear, record a product question rather than a code finding.
 
       If there are no material gaps, say so and return empty lists. Do not
       manufacture findings to look thorough — a clean concept review is a
@@ -569,16 +633,16 @@ agents:
         description: The core change in a few sentences — the problem, the audience, the approach and the expected value
       how_surfaced:
         type: string
-        description: The end-to-end path by which someone discovers and uses the change
+        description: Intended audience and use case for the proposed capability, not an audit of UI or API wiring
       project_fit:
         type: string
-        description: How the change aligns with the repository's scope, conventions and maintenance expectations
+        description: How the proposed goal aligns with the repository's documented purpose, non-goals and responsibility boundaries
       blocking:
         type: array
-        description: Conceptual gaps that stop the change fulfilling its purpose or conflict with the project. Each entry is self-contained — the finding, the evidence, the consequence and the recommendation. Empty when nothing blocks.
+        description: Material conflicts between the proposed intent and repository scope or product model, with evidence and a recommendation about scope. Never code defects. Empty when nothing blocks.
       important:
         type: array
-        description: Gaps that leave a meaningful workflow or integration hole while the concept itself is sound, in the same self-contained form. Empty when there are none.
+        description: Nonblocking concerns about the proposed scope or product responsibility, supported by repository evidence. Never missing implementation or integration work.
       open_questions:
         type: array
         description: Missing intent or product context that prevents a confident assessment. Empty when there are none.
@@ -588,7 +652,7 @@ agents:
     routes:
       - to: concept_gate
         when: "{{ (output.blocking | length) > 0 or output.verdict in ['needs_rethinking', 'not_a_good_fit'] }}"
-      - to: code_review
+      - to: ci_start
 
   - name: concept_gate
     type: human_gate
@@ -676,7 +740,7 @@ agents:
     options:
       - label: Continue to the code review
         value: continue
-        route: code_review
+        route: ci_start
       - label: Post these concept findings and stop
         value: post_concept
         route: comment_writer
@@ -687,6 +751,24 @@ agents:
   # ---------------------------------------------------------------------------
   # Code review
   # ---------------------------------------------------------------------------
+
+  - name: ci_start
+    description: Approves or starts the PR's Actions runs for the exact head being reviewed
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+    args:
+      - "{{ workflow.dir }}/scripts/ci.py"
+      - start
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+    routes:
+      - to: code_review
 
   - name: code_review
     description: Runs the specialist code review and reports what it found, without touching the code or GitHub
@@ -786,9 +868,29 @@ agents:
         type: string
         description: One of ready, needs_work, do_not_merge
     routes:
-      - to: build_questions
-        when: "{{ (output.findings | length) > 0 }}"
+      - to: ci_wait
+
+  - name: ci_wait
+    description: Waits for CI and records failures, missing runs or unverifiable results as blocking feedback
+    type: script
+    command: python3
+    timeout: 2100
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+      - ci_start.output
+    args:
+      - "{{ workflow.dir }}/scripts/ci.py"
+      - wait
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+    stdin: "{{ ci_start.output | tojson }}"
+    routes:
       - to: cleanup
+        when: "{{ not output.ok }}"
+      - to: build_questions
 
   - name: build_questions
     description: Turns the findings into strictly shaped question objects, so a stray key from the reviewer cannot abort the triage node after the review has been paid for
@@ -797,12 +899,15 @@ agents:
     timeout: 60
     input:
       - code_review.output.findings
+      - ci_wait.output.findings
     args:
       - "{{ workflow.dir }}/scripts/build_questions.py"
-    stdin: "{{ code_review.output.findings | tojson }}"
+    stdin: "{{ (code_review.output.findings + ci_wait.output.findings) | tojson }}"
     routes:
       - to: cleanup
-        when: "{{ not output.ok or output.question_count == 0 }}"
+        when: "{{ not output.ok }}"
+      - to: review_clear_gate
+        when: "{{ output.question_count == 0 }}"
       - to: triage
 
   - name: triage
@@ -869,8 +974,47 @@ agents:
     stdin: '{"findings": {{ build_questions.output.findings | tojson }}, "items": {{ triage.output.items | tojson }}}'
     routes:
       - to: cleanup
-        when: "{{ not output.ok or output.approved_count == 0 }}"
+        when: "{{ not output.ok }}"
+      - to: review_clear_gate
+        when: "{{ output.approved_count == 0 }}"
       - to: comment_writer
+
+  - name: review_clear_gate
+    type: human_gate
+    description: Offers LGTM when the full review has no findings left to post
+    input:
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.author
+      - pr_resolver.output.gh_user
+      - ci_wait.output.summary
+      - apply_triage.output.dropped_count?
+    prompt: |
+      ## No findings left to post
+
+      {{ pr_resolver.output.pr_url }}
+
+      {% if apply_triage is defined %}
+      You dropped all {{ apply_triage.output.dropped_count }} findings at triage.
+      This does not mean the original findings or CI failures were resolved.
+      {% else %}
+      The code review and CI produced no blocking or recommended findings.
+      {% endif %}
+
+      **CI:** {{ ci_wait.output.summary }}
+      {% if pr_resolver.output.author | lower == pr_resolver.output.gh_user | lower %}
+
+      GitHub will refuse an approval from the PR author.
+      {% endif %}
+
+      Approving posts `LGTM, thanks for contributing!`. Afterwards, a separate
+      gate shows current merge readiness and asks whether to merge.
+    options:
+      - label: 'Approve - "LGTM, thanks for contributing!"'
+        value: approve
+        route: post_approval
+      - label: Post nothing
+        value: stop
+        route: cleanup
 
   # ---------------------------------------------------------------------------
   # Wording and posting
@@ -1456,6 +1600,9 @@ agents:
       on a pull request with open points says you have decided they can ship
       without them.
 
+      After approval is posted, a separate gate shows current merge readiness
+      and asks whether to squash-merge. Approval alone never merges.
+
       Posting the findings raises exactly the points you kept, worded as a
       follow-up rather than as a first review, with inline comments wherever
       the diff allows.
@@ -1541,6 +1688,9 @@ agents:
       ---
 
       Approving posts `LGTM, thanks for contributing!` and nothing else.
+
+      After approval is posted, a separate gate shows current merge readiness
+      and asks whether to squash-merge. Approval alone never merges.
 
       Writing your own note posts it verbatim as a review comment — nothing
       rewrites it and nothing is appended.
@@ -1794,6 +1944,112 @@ agents:
     stdin: '{"body": "LGTM, thanks for contributing!", "comments": []}'
     routes:
       - to: cleanup
+        when: "{{ not output.ok }}"
+      - to: merge_readiness
+
+  - name: merge_readiness
+    description: Refreshes mergeability, checks and review requirements after LGTM is posted
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+    args:
+      - "{{ workflow.dir }}/scripts/merge_readiness.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "{{ pr_worktree.output.head_sha }}"
+    routes:
+      - to: merge_blocked_gate
+        when: "{{ not output.ok or not output.can_merge }}"
+      - to: merge_gate
+
+  - name: merge_gate
+    type: human_gate
+    description: Asks separately whether to merge after approval and a fresh readiness check
+    input:
+      - pr_resolver.output.pr_url
+      - post_approval.output.review_url
+      - pr_worktree.output.head_sha
+      - merge_readiness.output.summary
+      - merge_readiness.output.issues
+    prompt: |
+      ## LGTM posted. Would you like to merge?
+
+      {{ post_approval.output.review_url }}
+
+      {{ merge_readiness.output.summary }}
+      {% for issue in merge_readiness.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      Squash-merge {{ pr_resolver.output.pr_url }} at reviewed head
+      `{{ pr_worktree.output.head_sha }}` and delete its source branch?
+      Readiness is checked again before merging; no checks or protections are bypassed.
+    options:
+      - label: Squash-merge the approved PR
+        value: merge
+        route: merge_pr
+      - label: Leave it approved without merging
+        value: stop
+        route: cleanup
+
+  - name: merge_blocked_gate
+    type: human_gate
+    description: Shows all known merge blockers and lets the human recheck or leave the PR approved
+    input:
+      - pr_resolver.output.pr_url
+      - post_approval.output.review_url
+      - merge_readiness.output.summary
+      - merge_readiness.output.issues
+      - merge_readiness.output.error
+    prompt: |
+      ## LGTM posted. Merging is blocked or cannot be confirmed safe.
+
+      {{ post_approval.output.review_url }}
+
+      {{ merge_readiness.output.summary }}
+      {% for issue in merge_readiness.output.issues %}
+      - {{ issue }}
+      {% endfor %}
+      {% if merge_readiness.output.error %}
+
+      **Readiness error:** {{ merge_readiness.output.error }}
+      {% endif %}
+
+      Would you like to merge once these issues are resolved? Resolve conflicts,
+      failing or pending checks, or repository requirements on
+      {{ pr_resolver.output.pr_url }}, then recheck to reach the merge decision.
+      If the head changed, start a new review instead. Nothing merges from this gate.
+    options:
+      - label: Recheck readiness
+        value: recheck
+        route: merge_readiness
+      - label: Leave it approved without merging
+        value: stop
+        route: cleanup
+
+  - name: merge_pr
+    description: Rechecks readiness and squash-merges only the approved head, deleting the source branch
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - pr_resolver.output.pr_number
+      - pr_worktree.output.head_sha
+    args:
+      - "{{ workflow.dir }}/scripts/merge_pr.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+      - "squash"
+      - "false"
+      - "true"
+      - "{{ pr_worktree.output.head_sha }}"
+    routes:
+      - to: cleanup
 
   - name: post_note
     description: Posts the note you wrote, verbatim, as a plain review comment
@@ -1845,6 +2101,8 @@ agents:
     routes:
       - to: prior_scan_failed
         when: "{{ prior_review is defined and not prior_review.output.ok }}"
+      - to: ci_failed
+        when: "{{ ci_wait is defined and not ci_wait.output.ok }}"
       - to: findings_unreadable
         when: "{{ (build_questions is defined and not build_questions.output.ok) or (build_followup_questions is defined and not build_followup_questions.output.ok) }}"
       - to: triage_failed
@@ -1855,6 +2113,8 @@ agents:
         when: "{{ post_review is defined and post_review.output.ok }}"
       - to: followup_failed
         when: "{{ (post_followup_review is defined and not post_followup_review.output.ok) or (post_approval is defined and not post_approval.output.ok) or (post_note is defined and not post_note.output.ok) }}"
+      - to: merge_failed
+        when: "{{ merge_pr is defined and not merge_pr.output.ok }}"
       - to: followup_posted
         when: "{{ (post_followup_review is defined and post_followup_review.output.ok) or (post_approval is defined and post_approval.output.ok) or (post_note is defined and post_note.output.ok) }}"
       - to: followup_not_written
@@ -1876,6 +2136,13 @@ agents:
       - build_questions.output.error?
       - build_followup_questions.output.error?
     reason: "The review produced findings that could not be read, so none of them reached you and nothing was posted. The worktree has been removed. {{ build_questions.output.error if build_questions is defined else build_followup_questions.output.error }}"
+
+  - name: ci_failed
+    type: terminate
+    status: failed
+    input:
+      - ci_wait.output.error
+    reason: "CI results could not be incorporated into the review, so nothing was posted. {{ ci_wait.output.error }}"
 
   - name: triage_failed
     type: terminate
@@ -1918,11 +2185,15 @@ agents:
       - apply_followup_triage.output.reclassified_count?
       - post_approval.output.review_url?
       - post_note.output.review_url?
+      - merge_pr.output.merged?
+      - merge_pr.output.queued?
+      - merge_pr.output.branch_deleted?
+      - merge_pr.output.error?
       - post_followup_review.output.review_url?
       - post_followup_review.output.inline_posted?
       - post_followup_review.output.inline_demoted?
       - post_followup_review.output.error?
-    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review unraised{% endif %}. {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; nothing from your earlier review was raised. {{ post_note.output.review_url }}{% else %}Raised {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review again on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} already addressed, {{ apply_followup_triage.output.dropped_count }} let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.inline_demoted }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}"
+    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; nothing from your earlier review was raised. {{ post_note.output.review_url }}{% else %}Raised {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review again on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} already addressed, {{ apply_followup_triage.output.dropped_count }} let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.inline_demoted }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}"
 
   - name: followup_failed
     type: terminate
@@ -1933,6 +2204,16 @@ agents:
       - post_note.output.error?
       - post_followup_review.output.error?
     reason: "{% if post_approval is defined %}The approval of #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_approval.output.error }}{% elif post_note is defined %}Your note on #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_note.output.error }}{% else %}The follow-up review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_followup_review.output.error }}{% endif %} The worktree has been removed."
+
+  - name: merge_failed
+    type: terminate
+    status: failed
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_url
+      - merge_pr.output.error
+      - merge_pr.output.state
+    reason: "Approval for #{{ pr_resolver.output.pr_number }} was posted, but the merge could not be completed or confirmed. {{ merge_pr.output.error }} Check the current PR state and resolve the reported blockers before retrying. If the head changed, start a new review. {{ pr_resolver.output.pr_url }}"
 
   - name: followup_not_written
     type: terminate
