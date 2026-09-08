@@ -115,10 +115,10 @@ workflow:
 agents:
   - name: technical_reviewer
     description: Reviews the document for technical accuracy, factual correctness, and completeness
-    model: claude-opus-5
+    model: gpt-6-astra 
     context_tier: long_context
     reasoning:
-      effort: max
+      effort: xhigh
     input:
       - workflow.input.document_path
       - workflow.input.purpose?

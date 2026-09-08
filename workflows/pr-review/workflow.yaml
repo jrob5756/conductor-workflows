@@ -544,7 +544,7 @@ agents:
 
   - name: concept_review
     description: Judges whether the proposed goal belongs in the repository, assuming a correct implementation
-    model: claude-opus-5
+    model: gpt-6-astra
     context_tier: long_context
     reasoning:
       effort: high
@@ -772,7 +772,7 @@ agents:
 
   - name: code_review
     description: Runs the specialist code review and reports what it found, without touching the code or GitHub
-    model: claude-opus-5
+    model: gpt-6-astra 
     context_tier: long_context
     reasoning:
       effort: high
@@ -1249,7 +1249,7 @@ agents:
 
   - name: followup_review
     description: Checks each point you raised last time against the code as it stands now, rather than reviewing the pull request from scratch
-    model: claude-opus-5
+    model: gpt-6-astra 
     context_tier: long_context
     reasoning:
       effort: high

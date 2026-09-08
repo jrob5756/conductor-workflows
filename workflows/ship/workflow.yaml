@@ -429,7 +429,7 @@ agents:
 
   - name: planner
     description: Studies the codebase and produces an implementation plan for the issue, raising the questions it genuinely cannot answer from the code
-    model: claude-opus-5
+    model: gpt-6-astra
     context_tier: long_context
     reasoning:
       effort: xhigh
@@ -873,7 +873,7 @@ agents:
 
   - name: review
     description: Reviews the pull request and reports what needs changing, without touching the code — a separate step applies the findings
-    model: claude-opus-5
+    model: gpt-6-astra 
     context_tier: long_context
     reasoning:
       effort: high

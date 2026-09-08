@@ -127,10 +127,10 @@ workflow:
 agents:
   - name: architect
     description: Researches the codebase and broader context, then authors a solution design document
-    model: claude-opus-5
+    model: gpt-6-astra
     context_tier: long_context
     reasoning:
-      effort: max 
+      effort: xhigh
     input:
       - workflow.input.purpose
       - workflow.input.output_path?
