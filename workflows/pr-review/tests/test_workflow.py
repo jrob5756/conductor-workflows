@@ -37,17 +37,65 @@ class WorkflowRoutingTests(unittest.TestCase):
         self.assertEqual(self.route("prior_review", {"ok": False}), "cleanup")
         options = self.agents["unchanged_gate"]["options"]
         self.assertEqual([option["route"] for option in options], ["select_review", "cleanup"])
-        self.assertEqual(self.route("select_review", {"followup": True}), "followup_review")
+        self.assertEqual(self.route("select_review", {"followup": True}), "ci_start")
         self.assertEqual(self.route("select_review", {"followup": False}), "concept_review")
 
     def test_code_review_always_bracketed_by_ci(self):
         self.assertEqual(self.route("concept_review", {"blocking": [], "verdict": "good_addition"}), "ci_start")
         self.assertEqual(self.agents["concept_gate"]["options"][0]["route"], "ci_start")
-        self.assertEqual(self.route("ci_start", {"ok": False}), "code_review")
+        self.assertEqual(self.route("ci_start", {"ok": False}, concept_review={"output": {}}), "code_review")
         self.assertEqual(self.route("code_review", {"findings": []}), "ci_wait")
         self.assertEqual(self.route("code_review", {"findings": [{"title": "bug"}]}), "ci_wait")
-        self.assertEqual(self.route("ci_wait", {"ok": True}), "build_questions")
+        self.assertEqual(self.route("ci_wait", {"ok": True}, code_review={"output": {}}), "build_questions")
         self.assertEqual(self.route("ci_wait", {"ok": False}), "cleanup")
+
+    def test_followup_always_starts_and_waits_for_ci(self):
+        self.assertEqual(self.route("select_review", {"followup": True}), "ci_start")
+        for ok in (True, False):
+            self.assertEqual(self.route("ci_start", {"ok": ok}), "followup_review")
+        self.assertEqual(self.route("followup_review", {"items": []}), "ci_wait")
+        self.assertEqual(self.route("ci_wait", {"ok": True}), "build_followup_questions")
+        self.assertEqual(self.route("ci_wait", {"ok": False}), "cleanup")
+        self.assertIn("concept_review.output.verdict?", self.agents["ci_start"]["input"])
+        self.assertIn("code_review.output.findings?", self.agents["ci_wait"]["input"])
+
+    def test_followup_escalation_runs_ci_again_on_full_review_path(self):
+        option = next(option for option in self.agents["followup_clear_gate"]["options"]
+                      if option["value"] == "full_review")
+        self.assertEqual(option["route"], "concept_review")
+        context = {"followup_review": {"output": {}}, "concept_review": {"output": {}}}
+        self.assertEqual(
+            self.route("concept_review", {"blocking": [], "verdict": "good_addition"}, **context),
+            "ci_start",
+        )
+        self.assertEqual(self.route("ci_start", {"ok": True}, **context), "code_review")
+        self.assertEqual(self.route("code_review", {"findings": []}, **context), "ci_wait")
+        self.assertEqual(
+            self.route("ci_wait", {"ok": True}, code_review={"output": {}}, **context),
+            "build_questions",
+        )
+
+    def test_followup_ci_findings_bypass_model_and_prevent_clear_route(self):
+        import json
+
+        findings = [{"severity": "BLOCKING", "title": "CI failed", "body": "Build failed", "suggestion": "Fix build"}]
+        rendered = self.jinja.from_string(self.agents["build_followup_questions"]["stdin"]).render(
+            followup_review={"output": {"items": []}},
+            prior_review={"output": {"prior_items": []}},
+            ci_wait={"output": {"findings": findings}},
+        )
+        self.assertEqual(json.loads(rendered)["ci_findings"], findings)
+        self.assertEqual(
+            self.route("build_followup_questions", {"ok": True, "question_count": 1}),
+            "followup_triage",
+        )
+        self.assertEqual(
+            self.route("build_followup_questions", {"ok": True, "question_count": 0}),
+            "followup_clear_gate",
+        )
+        for name in ("followup_gate", "followup_clear_gate"):
+            self.assertIn("ci_wait.output.summary", self.agents[name]["input"])
+            self.assertIn("{{ ci_wait.output.summary }}", self.agents[name]["prompt"])
 
     def test_ci_findings_are_included_without_model_filtering(self):
         import json

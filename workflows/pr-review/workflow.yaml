@@ -41,10 +41,12 @@
 #
 # The follow-up path — taken when `prior_review` finds your earlier comments:
 #
+#   ci_start (script)            start or approve Actions for the reviewed head
 #   followup_review              did they do what you asked? one status per
 #     ↓                          point: addressed / partly / not / moot /
 #     ↓                          unclear, decided from the code
-#   build_followup_questions     the outstanding points → question objects
+#   ci_wait (script)             wait for CI on this pass too
+#   build_followup_questions     outstanding points and CI problems → questions
 #     ↓
 #   followup_triage (questions)  per point: raise it again as-is / reseverity
 #     ↓                          / reword / let it go
@@ -233,7 +235,7 @@
 
 workflow:
   name: pr-review
-  description: Reviews repository fit before implementation quality, asks before repeating an unchanged review, starts and waits for PR CI alongside the code review, and includes CI problems as blocking findings for triage. Posts only the feedback you approve. Follow-up runs check earlier feedback instead of repeating a full review. After posting LGTM, shows current merge blockers and asks separately whether to squash-merge.
+  description: Reviews repository fit before implementation quality, asks before repeating an unchanged review, starts and waits for PR CI on both first and follow-up passes, and includes CI problems as blocking findings for triage. Posts only the feedback you approve. Follow-up runs check earlier feedback instead of repeating a full review. After posting LGTM, shows current merge blockers and asks separately whether to squash-merge.
   version: "1.3.0"
   entry_point: bootstrap
 
@@ -534,7 +536,7 @@ agents:
     values:
       followup: "{{ prior_review.output.has_prior_review }}"
     routes:
-      - to: followup_review
+      - to: ci_start
         when: "{{ output.followup }}"
       - to: concept_review
 
@@ -761,6 +763,7 @@ agents:
       - bootstrap.output.name_with_owner
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
+      - concept_review.output.verdict?
     args:
       - "{{ workflow.dir }}/scripts/ci.py"
       - start
@@ -768,6 +771,8 @@ agents:
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
     routes:
+      - to: followup_review
+        when: "{{ concept_review is not defined }}"
       - to: code_review
 
   - name: code_review
@@ -880,6 +885,7 @@ agents:
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - ci_start.output
+      - code_review.output.findings?
     args:
       - "{{ workflow.dir }}/scripts/ci.py"
       - wait
@@ -890,6 +896,8 @@ agents:
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
+      - to: build_followup_questions
+        when: "{{ code_review is not defined }}"
       - to: build_questions
 
   - name: build_questions
@@ -1435,16 +1443,17 @@ agents:
         type: string
         description: Exactly one of all_addressed, partially_addressed, not_addressed
     routes:
-      - to: build_followup_questions
+      - to: ci_wait
 
   - name: build_followup_questions
-    description: Turns the outstanding points into strictly shaped question objects, reconciles them against the comments you actually made, and counts the settled ones so a clean result is something you can see rather than infer from an empty list
+    description: Reconciles earlier feedback, counts settled points, and turns outstanding points and current CI problems into triage questions
     type: script
     command: python3
     timeout: 60
     input:
       - followup_review.output.items
       - prior_review.output.prior_items
+      - ci_wait.output.findings
     args:
       - "{{ workflow.dir }}/scripts/build_followup_questions.py"
     # The prior comments travel with the analysis so the script can check that
@@ -1452,7 +1461,7 @@ agents:
     # point would otherwise route straight to the clear gate, which then tells
     # you everything was settled. Anything unaccounted for comes back as an
     # unclear question rather than as silence.
-    stdin: '{"items": {{ followup_review.output.items | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}}'
+    stdin: '{"items": {{ followup_review.output["items"] | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}, "ci_findings": {{ ci_wait.output.findings | tojson }}}'
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
@@ -1476,6 +1485,7 @@ agents:
       - build_followup_questions.output.recommended_count
       - build_followup_questions.output.addressed_count
       - build_followup_questions.output.obsolete_count
+      - build_followup_questions.output.ci_count
     prompt: |
       ## Your earlier review of #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
 
@@ -1488,10 +1498,12 @@ agents:
       {{ build_followup_questions.output.addressed_count }} of your points
       {{ 'has' if build_followup_questions.output.addressed_count == 1 else 'have' }} been
       addressed{% if build_followup_questions.output.obsolete_count %} and {{ build_followup_questions.output.obsolete_count }} no longer appl{{ 'ies' if build_followup_questions.output.obsolete_count == 1 else 'y' }}{% endif %}.
-      {{ build_followup_questions.output.question_count }} {{ 'is' if build_followup_questions.output.question_count == 1 else 'are' }} still open:
+      {{ build_followup_questions.output.question_count }} finding{{ 's' if build_followup_questions.output.question_count != 1 else '' }} need a decision, including {{ build_followup_questions.output.ci_count }} current CI problem{{ 's' if build_followup_questions.output.ci_count != 1 else '' }}:
       {{ build_followup_questions.output.blocking_count }} blocking and
       {{ build_followup_questions.output.recommended_count }} recommended.
       Nothing has been posted to the pull request yet.
+
+      CI findings describe this pass, not an earlier comment the author ignored.
 
       Decide each one. There are four ways to answer:
 
@@ -1557,6 +1569,7 @@ agents:
       - apply_followup_triage.output.blocking_count
       - apply_followup_triage.output.recommended_count
       - apply_followup_triage.output.dropped_count
+      - ci_wait.output.summary
     prompt: |
       ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
 
@@ -1589,6 +1602,8 @@ agents:
       {% endif %}
 
       ### Still open
+
+      **CI:** {{ ci_wait.output.summary }}
 
       You kept {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} —
       {{ apply_followup_triage.output.blocking_count }} blocking and
@@ -1640,6 +1655,7 @@ agents:
       - build_followup_questions.output.obsolete_count
       - build_followup_questions.output.resolved
       - apply_followup_triage.output.dropped_count?
+      - ci_wait.output.summary
     prompt: |
       ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
 
@@ -1662,14 +1678,17 @@ agents:
       {% endif %}
       {% if apply_followup_triage is defined %}
 
-      **Nothing is left to raise** — you let every open point go at triage
+      **Nothing is left to raise** — you let every open point and CI finding go at triage
       ({{ apply_followup_triage.output.dropped_count }} of them).
+      This does not mean the findings or CI failures were resolved.
       {% else %}
 
       **Nothing is left to raise.** Every point from your review of
       {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }} is addressed or no longer
       applies.
       {% endif %}
+
+      **CI:** {{ ci_wait.output.summary }}
 
       {{ followup_review.output.summary }}
       {% if followup_review.output.changes_since %}
@@ -1697,7 +1716,7 @@ agents:
 
       Running the full review starts the first-pass path from the top: concept
       review, code review, and a decision on every finding. That is the route
-      to fresh findings, which this pass deliberately does not produce. It
+      to fresh code findings; this pass only follows up earlier feedback and checks CI. It
       costs a full review and it posts a second, separate review to the pull
       request.
     options:
@@ -1717,7 +1736,7 @@ agents:
         route: cleanup
 
   - name: followup_comment_writer
-    description: Words the points you chose to raise again, framed as a second mention rather than a first
+    description: Words the earlier points and current CI findings you kept, distinguishing follow-up feedback from this pass's CI results
     model: claude-sonnet-5
     context_tier: long_context
     reasoning:
@@ -1757,7 +1776,9 @@ agents:
       The severity on each point is theirs, not the reviewer's. The label wins.
       Write it at the weight it carries and let the wording follow.
 
-      Write it as a second mention, because that is what it is. Say what has
+      Findings with status `ci` describe CI on this pass. Do not frame them as
+      earlier feedback or imply the author has already been asked to fix them.
+      Write the other points as a second mention. Say what has
       landed before what has not — it is true, it is short, and a follow-up
       that opens on the same complaint reads as though the work in between did
       not happen. Then be plain about what is still open. Do not re-argue a
@@ -2193,7 +2214,7 @@ agents:
       - post_followup_review.output.inline_posted?
       - post_followup_review.output.inline_demoted?
       - post_followup_review.output.error?
-    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; nothing from your earlier review was raised. {{ post_note.output.review_url }}{% else %}Raised {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from your earlier review again on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} already addressed, {{ apply_followup_triage.output.dropped_count }} let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.inline_demoted }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}"
+    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; no review or CI findings were posted. {{ post_note.output.review_url }}{% else %}Posted {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} earlier points addressed, {{ apply_followup_triage.output.dropped_count }} findings let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.inline_demoted }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}"
 
   - name: followup_failed
     type: terminate

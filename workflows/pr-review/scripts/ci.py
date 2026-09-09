@@ -131,6 +131,9 @@ def discover(nwo: str, pr_number: str, head_sha: str, pr: dict, deadline=None) -
                     and item["head"].get("sha") == head_sha
                     for item in associated[sha]
                 )
+                # Fork approval runs can omit both run-level and commit-level PR associations.
+                if not associated[sha] and run["event"] == "pull_request":
+                    matches = matches_pr_ref(nwo, pr_number, head_sha, pr, run)
             if not matches:
                 continue
             if (not prs or run["event"] == "push") and not matches_pr_ref(nwo, pr_number, head_sha, pr, run):

@@ -18,17 +18,20 @@ An unrecognised status becomes `unclear`, which is outstanding. A malformed
 entry fails the step. Both defaults run the same way: toward putting the point
 in front of you rather than dropping it on your behalf.
 
+Current CI findings are supplied separately from earlier feedback and always
+reach triage; their wording must not imply a previously raised point.
+
 The choices are the ones `triage_choices.py` defines, so `apply_triage.py`
 reads these answers with no follow-up-specific branch.
 
 Usage:
-    build_followup_questions.py    # {"items": [...], "prior_items": [...]} on
-                                   # stdin; a bare array is the items alone
+    build_followup_questions.py    # {"items": [...], "prior_items": [...],
+                                  #  "ci_findings": [...]} on stdin
 
 Output:
     ok, error, questions, findings, resolved, question_count, blocking_count,
     recommended_count, outstanding_count, addressed_count, obsolete_count,
-    unaccounted_count, unsourced_count
+    unaccounted_count, unsourced_count, ci_count
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from __future__ import annotations
 import json
 import sys
 
+from build_questions import normalize as normalize_ci_finding, question_for as ci_question_for
 from triage_choices import (
     BLOCKING,
     DO_NOT_POST,
@@ -100,6 +104,7 @@ def fail(message: str) -> None:
             "obsolete_count": 0,
             "unaccounted_count": 0,
             "unsourced_count": 0,
+            "ci_count": 0,
         }
     )
 
@@ -251,6 +256,7 @@ EMPTY = {
     "obsolete_count": 0,
     "unaccounted_count": 0,
     "unsourced_count": 0,
+    "ci_count": 0,
 }
 
 
@@ -266,11 +272,13 @@ def main() -> None:
 
     # A bare array is the analysis alone. The object form carries the prior
     # comments too, which is what lets an omitted point be caught.
+    ci_entries = []
     if isinstance(payload, list):
         entries, prior_items = payload, []
     elif isinstance(payload, dict):
         entries = payload.get("items") or []
         prior_items = payload.get("prior_items") or []
+        ci_entries = payload.get("ci_findings", [])
     elif payload is None:
         entries, prior_items = [], []
     else:
@@ -278,6 +286,8 @@ def main() -> None:
 
     if not isinstance(entries, list):
         fail(f"The follow-up analysis must be a JSON array, got {type(entries).__name__}")
+    if not isinstance(ci_entries, list):
+        fail("CI findings must be a JSON array.")
     if not isinstance(prior_items, list):
         prior_items = []
 
@@ -316,6 +326,17 @@ def main() -> None:
     outstanding = [item for item in normalized if item["status"] in OUTSTANDING]
     resolved = [item for item in normalized if item["status"] in CLOSED]
 
+    for entry in ci_entries:
+        if (
+            not isinstance(entry, dict) or entry.get("severity") != BLOCKING
+            or any(not isinstance(entry.get(key), str) for key in ("title", "body", "suggestion"))
+        ):
+            fail("CI findings contain a malformed blocking finding.")
+        item, _ = normalize_ci_finding(entry)
+        if item is None:
+            fail("CI finding could not be read.")
+        outstanding.append({**item, "status": "ci", "source_id": ""})
+
     blocking = [item for item in outstanding if item["severity"] == BLOCKING]
     recommended = [item for item in outstanding if item["severity"] == RECOMMENDED]
 
@@ -329,7 +350,10 @@ def main() -> None:
         {
             "ok": True,
             "error": "",
-            "questions": [question_for(f) for f in findings],
+            "questions": [
+                ci_question_for(f) if f["status"] == "ci" else question_for(f)
+                for f in findings
+            ],
             "findings": findings,
             "resolved": [
                 f"{STATUS_LABEL[str(item['status'])]}: {item['title']}"
@@ -342,6 +366,7 @@ def main() -> None:
             "addressed_count": sum(1 for item in resolved if item["status"] == ADDRESSED),
             "obsolete_count": sum(1 for item in resolved if item["status"] == OBSOLETE),
             "unaccounted_count": unaccounted,
+            "ci_count": len(ci_entries),
             # An entry citing no prior comment, or one that does not exist, is
             # a point the analysis introduced rather than followed up. It is
             # still asked — the human drops what does not belong — but the

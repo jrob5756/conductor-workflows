@@ -69,6 +69,40 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn(f"commits/{SHA}/pulls", paginate.call_args_list[1].args[0])
 
+    def test_fork_with_both_associations_empty_matches_exact_head_ref(self):
+        fork = {"full_name": "contributor/repo"}
+        with patch.object(ci, "paginated", side_effect=[
+            [run(pull_requests=[], head_repository=fork, conclusion="action_required")], [], [],
+        ]):
+            found = ci.discover("owner/repo", "1", SHA, {**PR, "head": {**PR["head"], "repo": fork}})
+        self.assertEqual([item["id"] for item in found], [10])
+
+    def test_empty_associations_require_exact_pr_execution_metadata(self):
+        for changes in (
+            {"head_branch": "other"}, {"head_repository": {"full_name": "other/repo"}},
+            {"head_branch": None}, {"head_repository": None},
+            {"head_sha": "c" * 40}, {"event": "push"},
+        ):
+            with self.subTest(changes=changes), patch.object(ci, "paginated", side_effect=[
+                [run(pull_requests=[], **changes)], [], [],
+            ]):
+                self.assertEqual(ci.discover("owner/repo", "1", SHA, PR), [])
+
+    def test_empty_associations_allow_only_exact_test_merge_ref(self):
+        for branch in ("refs/pull/1/merge", "refs/pull/2/merge"):
+            with self.subTest(branch=branch), patch.object(ci, "paginated", side_effect=[
+                [], [run(head_sha=MERGE, head_branch=branch, pull_requests=[])], [],
+            ]):
+                found = ci.discover("owner/repo", "1", SHA, PR)
+                self.assertEqual(len(found), int(branch == "refs/pull/1/merge"))
+
+    def test_commit_association_query_error_is_not_an_empty_response(self):
+        with patch.object(ci, "paginated", side_effect=[
+            [run(pull_requests=[])], ci.QueryError("HTTP 403"),
+        ]):
+            with self.assertRaisesRegex(ci.QueryError, "403"):
+                ci.discover("owner/repo", "1", SHA, PR)
+
     def test_fallback_test_merge_ref_is_pr_event_only(self):
         for event in ("pull_request", "push"):
             with self.subTest(event=event), patch.object(ci, "paginated", side_effect=[
@@ -179,6 +213,22 @@ class StartTests(unittest.TestCase):
         self.assertEqual(result["runs"][0]["action"], "approve")
         self.assertIn("/actions/runs/10/approve", command.call_args.args[0][1])
         self.assertNotIn("workflow_dispatch", str(command.call_args))
+
+    def test_fork_with_empty_associations_is_approved_then_rerun_on_next_pass(self):
+        fork = {"full_name": "contributor/repo"}
+        pr = {**PR, "head": {**PR["head"], "repo": fork}, "merge_commit_sha": None}
+        for conclusion, action in (("action_required", "approve"), ("success", "rerun")):
+            with self.subTest(conclusion=conclusion), patch.object(
+                ci, "read_pr", return_value=pr,
+            ), patch.object(ci, "paginated", side_effect=[
+                [run(pull_requests=[], head_repository=fork, conclusion=conclusion)], [],
+            ]), patch.object(ci, "command", return_value=subprocess.CompletedProcess([], 0, "", "")) as command:
+                result = ci.start("owner/repo", "1", SHA)
+            self.assertFalse(result["findings"])
+            self.assertEqual(result["runs"][0]["action"], action)
+            self.assertEqual(result["runs"][0]["expected_attempt"], 1 if action == "approve" else 2)
+            self.assertEqual(command.call_count, 1)
+            self.assertIn(f"/actions/runs/10/{action}", command.call_args.args[0][1])
 
     def test_in_progress_run_is_not_rerun(self):
         result, command = self.start([run(status="in_progress", conclusion=None)])
