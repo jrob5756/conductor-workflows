@@ -270,9 +270,9 @@ agents:
       Before writing code:
       - Sanity-check that this epic's prerequisites really are in place by
         inspecting the codebase and tests.
-      - If a real blocker exists, STOP and surface it in `implementation_notes`
-        with a concrete list of what is missing; do not work around or paper
-        over the blocker.
+      - If a real blocker exists, STOP: set `blocked: true` and put a concrete
+        list of what is missing in `blocked_reason`. Do not work around or
+        paper over the blocker.
       - If the plan's "DONE" status is correct and the selector was being
         overly conservative, proceed with the epic.
       {% endif %}
@@ -322,6 +322,18 @@ agents:
          - Update any relevant documentation specified in the epic
 
       **STOP after completing this epic. Do NOT continue to the next epic.**
+
+      ## If You Cannot Implement This Epic
+
+      If work this epic genuinely depends on is absent from the codebase, do not
+      write code you expect to fail and do not implement the missing prerequisite
+      yourself. Set `blocked: true` and describe exactly what is missing in
+      `blocked_reason`. The workflow halts on that flag without committing, so a
+      human can fix the plan.
+
+      Use this only for a real, verified blocker. Design questions, ambiguity in
+      the epic, and issues you worked around are `implementation_notes`, not
+      `blocked`.
     output:
       current_epic:
         type: string
@@ -350,8 +362,30 @@ agents:
       verification_evidence:
         type: array
         description: The exact build, lint and test commands run to verify this epic, each with its outcome (e.g. "pytest -q — 148 passed, 0 failed"). This is the evidence the reviewer checks the work against.
+      blocked:
+        type: boolean
+        description: True only if the epic could not be implemented because work it depends on is genuinely absent. Halts the run before review and commit. False for work that was completed, including work with caveats.
+      blocked_reason:
+        type: string
+        description: Concrete list of what is missing and why the epic cannot proceed. Required when blocked is true, empty otherwise.
     routes:
+      - to: epic_blocked
+        when: "{{ output.blocked }}"
       - to: epic_reviewer
+
+  # A blocked epic must not reach `committer`, which marks epics DONE and commits
+  # them. The coder is told to stop when a prerequisite is genuinely missing, but
+  # an instruction is not a gate: without this route the stop notice travels in
+  # `implementation_notes` and whether the epic gets committed as DONE depends on
+  # `epic_reviewer` choosing to treat it as blocking. Route on the flag instead.
+  - name: epic_blocked
+    type: set
+    description: Record that the epic could not be implemented and halt without committing
+    values:
+      blocked_epic: "{{ coder.output.current_epic }}"
+      blocked_note: "{{ coder.output.blocked_reason }}"
+    routes:
+      - to: $end
 
   - name: epic_reviewer
     description: Reviews the implementation for a single epic
@@ -955,6 +989,7 @@ agents:
       effort: xhigh
     input:
       - workflow.input.plan
+      - workflow.input.epic?
       - workflow.input.allow_human_escalation?
       - epic_selector.output
       - coder.output
@@ -975,7 +1010,23 @@ agents:
 
       You are thorough and ensure the implementation is production-ready.
     prompt: |
+      {% if workflow.input.epic %}
+      This run was scoped to a SINGLE epic: **{{ workflow.input.epic }}**.
+
+      Only that epic was in scope, so only that epic was implemented. Every other epic
+      in the plan is intentionally untouched and is NOT a finding.
+
+      **Review ONLY the changes made for {{ workflow.input.epic }}.**
+
+      - Do NOT report other epics as missing, incomplete, or not started.
+      - Do NOT request changes because the plan as a whole is unfinished — it is
+        supposed to be.
+      - Judge cross-cutting concerns only as they apply to this epic's diff.
+      - If this epic's work is sound, APPROVE. Requesting changes for out-of-scope
+        epics cannot be satisfied by the fixer and will loop until max_iterations.
+      {% else %}
       All epics have been implemented. Perform a holistic review of the entire implementation.
+      {% endif %}
 
       **Original Plan:**
       {{ workflow.input.plan }}
@@ -1033,6 +1084,12 @@ agents:
          - Review all commits made during implementation
          - Ensure commit messages are clear and descriptive
          - Check for any commits that should be squashed or amended
+
+      {% if workflow.input.epic %}
+      Apply tasks 1–7 **only to {{ workflow.input.epic }}'s changes**. "Overall",
+      "entire feature" and "all commits" above mean *this epic's* portion — not the
+      whole plan, which is deliberately incomplete on a scoped run.
+      {% endif %}
 
       ---
 
@@ -1123,6 +1180,8 @@ agents:
       field.
 
       If REQUEST_CHANGES, provide specific issues that need to be fixed.
+      Every issue you raise must be fixable within the scope that was implemented;
+      an issue the fixer cannot act on will loop until max_iterations.
 
       {% if workflow.input.allow_human_escalation %}
       {% if context.history and context.history[-1] == 'plan_reviewer_questions' %}
@@ -1253,6 +1312,7 @@ agents:
       effort: medium
     input:
       - workflow.input.plan
+      - workflow.input.epic?
       - coder.output
       - plan_reviewer.output
     system_prompt: |
@@ -1269,6 +1329,14 @@ agents:
       of the implementation.
     prompt: |
       The plan reviewer has identified issues that need to be fixed.
+
+      {% if workflow.input.epic %}
+      This run is scoped to **{{ workflow.input.epic }}**. Confine every fix to that
+      epic's files and tasks. Do NOT start, extend or "complete" any other epic —
+      they are deliberately untouched, not defects. If a reported issue cannot be
+      fixed inside this epic's scope, say so in your summary and leave it; do not
+      widen the diff to satisfy it.
+      {% endif %}
 
       **Original Plan:**
       {{ workflow.input.plan }}
@@ -1370,6 +1438,8 @@ output:
   epic_review_decision: "{{ epic_reviewer.output.decision if epic_reviewer is defined else '' }}"
   epic_review_rounds: "{{ epic_reviewer.output.review_round if epic_reviewer is defined else 0 }}"
   capped_epic: "{{ mark_round_cap_reached.output.capped_epic if mark_round_cap_reached is defined else '' }}"
+  blocked_epic: "{{ epic_blocked.output.blocked_epic if epic_blocked is defined else '' }}"
+  blocked_reason: "{{ epic_blocked.output.blocked_note if epic_blocked is defined else '' }}"
   plan_review_decision: "{{ plan_reviewer.output.decision if plan_reviewer is defined else '' }}"
   plan_review_suggestions: "{{ plan_reviewer.output.suggestions | json if plan_reviewer is defined else '[]' }}"
   human_questions_answered: "{{ (epic_reviewer_questions is defined and epic_reviewer_questions.output.answered_any) or (plan_reviewer_questions is defined and plan_reviewer_questions.output.answered_any) }}"
