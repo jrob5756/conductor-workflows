@@ -1,0 +1,426 @@
+# One candidate's complete lifecycle; called serially by workflow.yaml.
+#
+#   bootstrap -- completed -------------------------------> already_done
+#       | saved resolution -> cleanup
+#       | saved reproduction -> select_result
+#       v
+#   reproduce -> handoff -> select_result
+#                              | validated -> snapshot -> shortlist ->
+#                              |              verification -> publish
+#                              | rejected/blocked -> decline             |
+#                              +--------------------+--------------------+
+#                                                   v
+#                                                cleanup
+#                                                   v
+#                                                complete -> $end
+#
+# Failure isolation
+#   A stage that fails while leaving the machine intact — a refused publication
+#   gate, an inventory refresh, a reproduction that errored — costs one candidate,
+#   not the run: `block` records it, cleanup still restores state, and the next
+#   candidate proceeds. Only `cleanup`/`complete` failing is fatal, because then
+#   the environment itself is unproven and later candidates cannot be trusted.
+#
+# Completion requires a clean pinned worktree, no unfinished recorded command,
+# and a passing deterministic health check if this candidate touched the cluster.
+#
+# Context is explicit: each step declares what it reads, so a long reproduction
+# transcript is not resent to every later step.
+
+workflow:
+  name: log-service-audit-candidate
+  description: Reproduce, verify, resolve and clean up exactly one persisted audit candidate.
+  version: "1.1.0"
+  entry_point: bootstrap
+  runtime:
+    provider: copilot
+    max_session_seconds: 7200
+    checkpoint:
+      every_agent: true
+      keep_last: 10
+  input:
+    run_dir: {type: string}
+    candidate_id: {type: string}
+  context:
+    mode: explicit
+  limits:
+    max_iterations: 20
+
+agents:
+  - name: bootstrap
+    type: script
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', start-candidate, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}"]
+    timeout: 30
+    routes:
+      - to: failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: already_done
+        when: "{{ output.completed }}"
+      - to: cleanup
+        when: "{{ output.resolved }}"
+      - to: select_result
+        when: "{{ output.has_result }}"
+      - to: reproduce
+
+  - name: already_done
+    type: terminate
+    status: success
+    input:
+      - workflow.input.candidate_id
+    reason: "Candidate already completed; no experiments or publication replayed."
+    output_template:
+      candidate_id: "{{ workflow.input.candidate_id }}"
+      completed: "true"
+
+  - name: reproduce
+    description: Execute a falsifiable proof for this candidate only
+    model: claude-opus-5
+    context_tier: long_context
+    reasoning:
+      effort: high
+    working_dir: "{{ bootstrap.output.worktree }}"
+    plugins: []
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.worktree
+      - workflow.input.candidate_id
+      - bootstrap.output.candidate
+      - bootstrap.output.preparation
+      - bootstrap.output.summary
+    system_prompt: !file prompts/rules.md
+    prompt: |
+      Candidate: {{ bootstrap.output.candidate | tojson }}
+      Environment: {{ bootstrap.output.preparation | tojson }}
+      Run: {{ bootstrap.output.summary | tojson }}
+      Investigate only this candidate. Return one result with its exact ID.
+      Status is validated, rejected, or blocked; never invent missing evidence.
+
+      For bug/stability: write a narrowly scoped executable assertion against
+      unmodified production code, save the test/script/patch, run a passing positive
+      control (stage control), then run the defect assertion twice independently
+      (stage repro). Reset synthetic data between attempts. Both must fail for the
+      claimed invariant, not compilation, missing dependencies, stale binaries,
+      authentication, unrelated flakes or harness errors. Inspect actual test counts.
+      Stability evidence includes repetitions, workload, units, measurements and a
+      justified threshold; investigate >5% throughput drops with comparable repeated
+      measurements. Do not mistake known process-global meter interference for a bug.
+
+      For dead_code: record a passing affected baseline, examine static AND dynamic
+      reachability/compatibility, save a deletion patch, temporarily remove only the
+      candidate, and record passing removed-build and removed-test executions with
+      the deletion present. Check reflection, serialization, DI, SF activation,
+      configuration, generated code, build conditions, public consumers and plugins.
+      Passing tests alone cannot prove unreachability; uncertain cases are blocked.
+
+      For performance: a measurement run exits 0 even when it shows a regression, so
+      there is no failing assertion to point at — the numbers are the evidence.
+      Record a reference measurement of the unchanged path (stage baseline), then at
+      least two independent measurements of the suspect scenario (stage measurement),
+      alternating or interleaving them so drift and warm-up do not masquerade as a
+      result. Keep the machine otherwise idle, state concurrency, operation counts and
+      warm-up, and discard the first run when the path is JIT- or cache-sensitive.
+      Report metric, unit, scenario, reference value, observed value, samples per side
+      and the threshold you are judging against, citing the documented baselines in
+      AGENTS.md when they apply. A difference inside run-to-run noise is not a finding:
+      say so and mark it rejected. End-to-end numbers need environment_ready=true; if
+      the cluster is unavailable, mark the candidate blocked rather than substituting a
+      micro-benchmark and calling it equivalent.
+
+      Use SampleApp, authenticated direct gRPC, bounded load, cancellation and
+      replica/recovery tests where relevant and only when environment_ready=true.
+      Inspect controllers/protos and resolve actual SF endpoints. Record binary
+      provenance; use tenant-scoped synthetic data and existing TLS helpers.
+      Classify every recorder command with --scope local or --scope cluster.
+      Prefix record names with this candidate's ID; never reuse another candidate's
+      proof records. No direct, unrecorded test/deployment commands.
+
+      Save every reproduction script/test/patch as its own file directly in this
+      candidate's directory; the publisher inlines those files verbatim into the
+      issue, so they are the reader's copy of your work. Do not paste their full
+      contents into the prose as well.
+
+      Write all prose (explanation, impact, expected, actual, reproduction,
+      reachability) for someone who has ONLY this repository at the pinned commit
+      and cannot see this machine. Reference repository-relative paths and saved
+      artifacts by bare filename. Never cite run-directory paths, candidate/record
+      directories, absolute local paths, this audit's recorder command, or the run
+      identifier; state commands as the plain tool invocation a reader would type
+      from the repository root. Prefer short paragraphs and lists over one long
+      block of text. Include expected, actual, impact, explanation, reachability,
+      records relative to the run directory, and patch (the saved patch/script
+      filename, or its candidate-relative path; empty only if no file changes were
+      needed).
+      Preserve evidence and leave cleanup details for the cleanup stage.
+    output:
+      result:
+        type: object
+        properties:
+          id: {type: string}
+          status: {type: string}
+          explanation: {type: string}
+          records: {type: array, items: {type: string}}
+          reproduction: {type: string}
+          expected: {type: string}
+          actual: {type: string}
+          impact: {type: string}
+          reachability: {type: string}
+          patch: {type: string}
+          measurement:
+            type: object
+            description: Required for performance candidates; omit otherwise.
+            properties:
+              metric: {type: string}
+              unit: {type: string}
+              scenario: {type: string}
+              baseline_value: {type: number}
+              observed_value: {type: number}
+              samples: {type: number}
+              threshold: {type: string}
+    routes:
+      - to: handoff
+
+  - name: handoff
+    type: script
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', handoff, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}"]
+    stdin: "{{ reproduce.output.result | tojson }}"
+    timeout: 30
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+      - reproduce.output.result
+    routes:
+      - to: block
+        when: "{{ output.exit_code != 0 }}"
+      - to: select_result
+
+  - name: select_result
+    type: set
+    input:
+      - bootstrap.output.has_result
+      - bootstrap.output.result
+      - reproduce.output.result?
+    value: "{{ (bootstrap.output.result if bootstrap.output.has_result else reproduce.output.result) | tojson }}"
+    routes:
+      - to: snapshot
+        when: "{{ output.status == 'validated' }}"
+      - to: decline
+
+  - name: decline
+    type: script
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', resolve, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}"]
+    stdin: ""
+    timeout: 30
+    routes:
+      - to: block
+        when: "{{ output.exit_code != 0 }}"
+      - to: cleanup
+
+  - name: snapshot
+    type: script
+    input:
+      - workflow.input.run_dir
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', snapshot, --run-dir, "{{ workflow.input.run_dir }}"]
+    timeout: 180
+    routes:
+      - to: block
+        when: "{{ output.exit_code != 0 }}"
+      - to: shortlist
+
+  - name: shortlist
+    description: Rank existing issues and PRs against this candidate before the model reads them
+    type: script
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', shortlist, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}"]
+    timeout: 60
+    routes:
+      - to: block
+        when: "{{ output.exit_code != 0 }}"
+      - to: verification
+
+  - name: verification
+    description: Challenge this candidate's proof and compare fresh issues and earlier candidate outcomes
+    model: claude-opus-5
+    context_tier: long_context
+    reasoning:
+      effort: xhigh
+    working_dir: "{{ bootstrap.output.worktree }}"
+    plugins: []
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.worktree
+      - workflow.input.candidate_id
+      - bootstrap.output.candidate
+      - bootstrap.output.summary
+      - bootstrap.output.reports_file
+      - select_result.output
+      - snapshot.output
+      - shortlist.output
+    system_prompt: !file prompts/rules.md
+    prompt: |
+      Candidate: {{ bootstrap.output.candidate | tojson }}
+      Reproduction: {{ select_result.output | tojson }}
+      Run: {{ bootstrap.output.summary | tojson }}
+      Inventory: {{ snapshot.output | tojson }}
+      Prior candidate reports: {{ bootstrap.output.reports_file }}
+
+      Independently inspect source, saved tests/patches and actual recorded commands,
+      logs, assertions, counts, exit codes and diffs. Challenge the causal explanation;
+      "validated" and a failing exit code alone are not proof. Re-run disputed evidence
+      through the recorder if needed; keep this candidate's ID and scope on records.
+      This is a separate review, not necessarily a blind or different-model experiment.
+
+      Duplicate review. These issues/PRs already share wording with this candidate,
+      pre-ranked by term overlap (score = shared terms, highest first):
+      {{ shortlist.output.shortlist | tojson }}
+      That covers {{ shortlist.output.ranked_count }} of
+      {{ shortlist.output.inventory_count }} inventory records. Ranking is lexical, so
+      read the promising ones in full and widen the search yourself whenever cause,
+      symbol or symptom suggests a match the wording missed; the complete inventory
+      stays at {{ shortlist.output.inventory_file }}. Compare open AND closed issues
+      and PRs on root cause, symbol, invariant and symptom, not titles. Use gh
+      read-only for comments/PR detail. Closed matches remain duplicates; never reopen
+      or comment. Compare earlier candidate reports too, including local drafts when
+      publish=false. A rejected hypothesis cannot suppress a valid finding. Uncertain
+      equivalence means blocked, not a speculative new issue.
+
+      Return one decision with this candidate's ID, verdict approved/rejected/blocked/
+      duplicate, substantive reason, evidence_checked and secrets_checked booleans.
+      For an existing issue/PR duplicate, set duplicate_number to its positive inventory
+      number and duplicate_candidate_id="". For an earlier approved candidate duplicate,
+      set duplicate_candidate_id to its C ID and duplicate_number=0. Otherwise use 0/"".
+      Approval requires both booleans true, a self-contained non-secret reproduction,
+      and an explanation of evidence checks AND the complete duplicate review.
+      No credentials, private keys, unrelated tenant data or raw dumps in public prose.
+      Do not rewrite public text; the publisher renders the structured result.
+    output:
+      decision:
+        type: object
+        properties:
+          id: {type: string}
+          verdict: {type: string}
+          reason: {type: string}
+          duplicate_number: {type: number}
+          duplicate_candidate_id: {type: string}
+          evidence_checked: {type: boolean}
+          secrets_checked: {type: boolean}
+    routes:
+      - to: publish
+
+  - name: publish
+    type: script
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', resolve, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}"]
+    stdin: |
+      {
+        "decision": {{ verification.output.decision | tojson }},
+        "snapshot_digest": {{ snapshot.output.digest | tojson }}
+      }
+    timeout: 300
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+      - verification.output.decision
+      - snapshot.output.digest
+    routes:
+      - to: block
+        when: "{{ output.exit_code != 0 }}"
+      - to: cleanup
+
+  - name: block
+    description: Record this candidate as blocked so cleanup still runs and the audit continues
+    type: script
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', block, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}", --reason, "A stage failed before publication; see this candidate's retained evidence."]
+    timeout: 30
+    routes:
+      - to: failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: cleanup
+
+  - name: cleanup
+    description: Restore this candidate's source and test state before another candidate may start
+    model: claude-sonnet-5
+    context_tier: default
+    reasoning:
+      effort: medium
+    working_dir: "{{ bootstrap.output.worktree }}"
+    plugins: []
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.worktree
+      - workflow.input.candidate_id
+      - bootstrap.output.summary
+      - bootstrap.output.candidate_dir
+    system_prompt: !file prompts/rules.md
+    prompt: |
+      Run: {{ bootstrap.output.summary | tojson }}
+      Candidate: {{ workflow.input.candidate_id }}
+      Read saved result/report and record files under {{ bootstrap.output.candidate_dir }}.
+      Restore ONLY this candidate's temporary tracked/untracked source/test changes,
+      preserving reproduction scripts and patches in the run directory first.
+      No broad reset/clean or removal of user files. The next step requires clean
+      git status, including untracked files, and the original pinned HEAD.
+      Restore synthetic test data, settings and deployment provenance affected by
+      this candidate. Inspect specific test processes; ensure no experiment remains
+      running. Record any cleanup commands with stage cleanup and the proper scope.
+      If the cluster was touched, establish its recovery and required app/node health;
+      the helper independently checks aggregate cluster health and all nodes Up.
+      An earlier stage may have failed and marked this candidate blocked; cleaning up
+      after it still matters, because the next candidate inherits this environment.
+      Do not run another candidate or re-execute publication. Do not edit journals,
+      receipts, inflight markers, plan or completed markers. If state cannot safely
+      be restored, return ready=false with the exact blocker. Never claim cleanup
+      succeeded merely because the finding was rejected or an issue was created.
+    output:
+      ready: {type: boolean}
+      reason: {type: string}
+    routes:
+      - to: complete
+
+  - name: complete
+    type: script
+    input:
+      - workflow.input.run_dir
+      - workflow.input.candidate_id
+      - cleanup.output
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', complete, --run-dir, "{{ workflow.input.run_dir }}", --candidate-id, "{{ workflow.input.candidate_id }}"]
+    stdin: "{{ cleanup.output | tojson }}"
+    timeout: 240
+    routes:
+      - to: failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: $end
+
+  - name: failed
+    type: terminate
+    status: failed
+    input:
+      - workflow.input.candidate_id
+      - workflow.input.run_dir
+      - complete.output.candidate_id
+      - complete.output.completed
+    reason: "Candidate {{ workflow.input.candidate_id }} could not restore a trustworthy environment. Later candidates must not run until it is inspected."
+    output_template:
+      candidate_id: "{{ workflow.input.candidate_id }}"
+      run_dir: "{{ workflow.input.run_dir }}"
+      status: failed
+
+output:
+  candidate_id: "{{ workflow.input.candidate_id }}"

@@ -41,6 +41,9 @@ jobs:
       - name: Test PR review scripts and routing
         run: python3 -m unittest discover -s workflows/pr-review/tests -v
 
+      - name: Test LogService audit evidence and publication
+        run: python3 -m unittest discover -s workflows/log-service-audit/tests -v
+
       - name: Validate every workflow under workflows/
         run: |
           set -euo pipefail

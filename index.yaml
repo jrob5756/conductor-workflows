@@ -1,4 +1,7 @@
 workflows:
+  log-service-audit:
+    description: "Find and reproduce LogService bugs, dead code, and stability defects on a disposable local cluster; independently verify evidence and file nonduplicate needs triage issues."
+    path: workflows/log-service-audit/workflow.yaml
   # document-create:
   #   description: "Create a new markdown document grounded in the codebase, with a structure inferred from the stated purpose, reviewed by the document-review sub-workflow for technical accuracy and readability"
   #   path: workflows/document/create.yaml

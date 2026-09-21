@@ -1,0 +1,561 @@
+# LogService Audit
+#
+# Isolated discovery followed by serial, evidence-gated candidate lifecycles.
+# Run from the LogService checkout in an elevated Windows terminal.
+#
+#   bootstrap ---------------------------------------------------+
+#       | new audit                                              | recover_run
+#       v                                                        | retain plan;
+#   preflight      deterministic toolchain check, no agent        | skip completed
+#       |                                                        | candidates
+#       v                                                        |
+#   prepare        scripted deploy + baseline; computes           |
+#       |          environment_ready from observed exit codes     |
+#       +--> prepare_review   only on blockers: explain them;     |
+#       |         |           cannot change readiness             |
+#       v         v                                               |
+#   +---------+---------------+---------------------+             |
+#   v         v               v                     v             |
+# discover  discover      discover              discover          |
+#  _bugs    _dead_code    _stability            _performance      |
+#   |         |               |                     |             |
+#   +---------+-------+-------+---------------------+             |
+#                     v                                           |
+#                consolidate                                      |
+#                     |                                           |
+#                     v                                           |
+#                   queue <---------------------------------------+
+#                     |
+#                     v
+#   candidates: for_each, max_concurrent=1, fail_fast
+#     +-----------------------------------------------------------+
+#     | One candidate.yaml execution at a time:                    |
+#     | reproduce -> save result -> snapshot -> shortlist ->       |
+#     |   verify -> publish                                        |
+#     |                |                                           |
+#     |                +-- rejected/blocked: record without review |
+#     |                +-- recoverable stage failure: block        |
+#     |                                                            |
+#     | -> cleanup -> clean-worktree/cluster-health gate -> next   |
+#     +-----------------------------------------------------------+
+#                     |
+#                     v
+#                   finish -> $end
+#
+# Discovery agents are read-only and cannot see sibling outputs. Consolidation
+# accounts for every discovery: select/group it or explicitly defer it. The
+# max_candidates budget bounds experiments, not a required number of findings.
+# Each candidate gets fresh reproduction/verification sessions and durable state.
+# Rejected, blocked, and duplicate candidates still must pass cleanup.
+#
+# Bugs/stability need a passing control and two failing defect reproductions.
+# Dead code needs reachability analysis plus passing baseline/removal build/tests.
+#   Performance needs a reference measurement, two successful measurement runs and
+#   the numbers themselves, since a measurement succeeds even when it regresses.
+# Only the Python publisher creates issues, always with "needs triage". It checks
+# open/closed issues and PRs, earlier candidate outcomes, fingerprints and receipts.
+# Changed inventory or ambiguous creation stops publication rather than retrying.
+#
+# Default redeploy changes the disposable local cluster; reinstall also normally
+# erases its data. existing skips deployment, not disruptive tests. publish=false
+# suppresses GitHub writes, not experiments. The source checkout is never edited.
+# The machine lock spans the entire audit. Failed cleanup blocks later candidates;
+# failures retain state/lock. Recovery skips completed candidates and reuses saved
+# reproductions or resolutions, never blindly replaying publication.
+# Details, prerequisites, and recovery: README.md beside this file.
+
+workflow:
+  name: log-service-audit
+  description: Find and reproduce LogService bugs, dead code, and stability defects on a disposable local cluster; independently verify evidence and file nonduplicate needs triage issues.
+  version: "1.1.0"
+  entry_point: bootstrap
+  runtime:
+    provider: copilot
+    max_session_seconds: 7200
+    checkpoint:
+      every_agent: true
+      keep_last: 10
+  input:
+    focus:
+      type: string
+      required: false
+      default: "Rotate through under-tested areas using previous audit reports."
+      description: Area, invariant, or scenario to investigate; not permission to expand machine access.
+    environment:
+      type: string
+      required: false
+      default: redeploy
+      description: "redeploy: rebuild plugin/apps; reinstall: also replace local SF runtime and erase cluster data; existing: inspect without redeploying."
+    publish:
+      type: boolean
+      required: false
+      default: true
+      description: Publish verified findings automatically; false writes local drafts only.
+    max_candidates:
+      type: number
+      required: false
+      default: 8
+      description: Integer 1-30; per-category discovery cap and total consolidated experiment cap.
+    recover_run:
+      type: string
+      required: false
+      default: ""
+      description: Retained run directory; continue unfinished candidates without deployment. Other inputs are ignored.
+  context:
+    mode: explicit
+  limits:
+    max_iterations: 500
+    timeout_seconds: 21600
+
+parallel:
+  - name: discovery
+    agents: [discover_bugs, discover_dead_code, discover_stability, discover_performance]
+    failure_mode: fail_fast
+    routes:
+      - to: consolidate
+
+for_each:
+  - name: candidates
+    type: for_each
+    source: queue.output.candidates
+    as: candidate
+    max_concurrent: 1
+    failure_mode: fail_fast
+    agent:
+      name: candidate_audit
+      type: workflow
+      workflow: candidate.yaml
+      input:
+        - bootstrap.output.run_dir
+      input_mapping:
+        run_dir: "{{ bootstrap.output.run_dir }}"
+        candidate_id: "{{ candidate.id }}"
+    routes:
+      - to: finish
+
+agents:
+  - name: bootstrap
+    type: script
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', bootstrap]
+    stdin: "{{ workflow.input | tojson }}"
+    timeout: 180
+    routes:
+      - to: bootstrap_failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: already_finished
+        when: "{{ output.finalized | default(false) }}"
+      - to: queue
+        when: "{{ output.recovering }}"
+      - to: preflight
+
+  - name: preflight
+    description: Assert toolchain prerequisites deterministically before spending agent time
+    type: script
+    input:
+      - bootstrap.output.run_dir
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', preflight, --run-dir, "{{ bootstrap.output.run_dir }}"]
+    timeout: 300
+    routes:
+      - to: preflight_failed
+        when: "{{ output.exit_code != 0 or not output.ok }}"
+      - to: prepare
+
+  - name: preflight_failed
+    type: terminate
+    status: failed
+    input:
+      - preflight.output.blockers
+      - preflight.output.stderr
+      - bootstrap.output.run_dir
+    reason: "Prerequisites are not met, so no agent time was spent: {{ preflight.output.blockers | default([]) | join('; ') }}{{ preflight.output.stderr }}"
+    output_template:
+      error: "{{ preflight.output.blockers | default([]) | join('; ') }}{{ preflight.output.stderr }}"
+      run_dir: "{{ bootstrap.output.run_dir }}"
+
+  - name: bootstrap_failed
+    type: terminate
+    status: failed
+    input:
+      - bootstrap.output.stderr
+    reason: "{{ bootstrap.output.stderr }}"
+    output_template:
+      error: "{{ bootstrap.output.stderr }}"
+
+  - name: already_finished
+    type: terminate
+    status: success
+    input:
+      - bootstrap.output.final_result?
+    reason: "Audit already completed; finalized any remaining owned lock without replaying candidates."
+    output_template:
+      result: "{{ bootstrap.output.final_result | tojson }}"
+
+  - name: prepare
+    description: Deploy and baseline the disposable environment deterministically
+    type: script
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', prepare, --run-dir, "{{ bootstrap.output.run_dir }}"]
+    input:
+      - bootstrap.output.run_dir
+    timeout: 21600
+    routes:
+      - to: prepare_failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: prepare_review
+        when: "{{ output.blockers | default([]) | length > 0 }}"
+      - to: discovery
+
+  - name: prepare_failed
+    type: terminate
+    status: failed
+    input:
+      - bootstrap.output.run_dir
+      - prepare.output.stderr
+    reason: "Preparation could not run to completion: {{ prepare.output.stderr }}"
+    output_template:
+      error: "{{ prepare.output.stderr }}"
+      run_dir: "{{ bootstrap.output.run_dir }}"
+
+  - name: prepare_review
+    description: Explain baseline failures so discovery does not mistake them for product defects
+    model: claude-sonnet-5
+    context_tier: default
+    reasoning:
+      effort: medium
+    working_dir: "{{ bootstrap.output.worktree }}"
+    plugins: []
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.worktree
+      - bootstrap.output.summary
+      - workflow.input.environment
+      - prepare.output.steps
+      - prepare.output.blockers
+      - prepare.output.provenance
+      - prepare.output.environment_ready
+    system_prompt: !file prompts/rules.md
+    prompt: |
+      Run: {{ bootstrap.output.summary | tojson }}
+      Environment mode: {{ workflow.input.environment }}
+      Deterministic result: environment_ready={{ prepare.output.environment_ready }}
+      Steps: {{ prepare.output.steps | tojson }}
+      Blockers: {{ prepare.output.blockers | tojson }}
+      Provenance: {{ prepare.output.provenance | tojson }}
+
+      Deployment and baseline testing already ran as fixed script invocations and
+      their evidence is recorded. Read the stdout/stderr of the failed records and
+      explain, per blocker, what actually failed and whether the cause is the
+      environment/toolchain or plausibly the product under audit.
+
+      You do NOT decide readiness: environment_ready above is computed from observed
+      exit codes and stands. Do not re-run deployments, repair the environment, edit
+      the worktree, or re-execute the suites; a targeted read-only diagnostic through
+      the recorder is allowed when a log is genuinely ambiguous.
+
+      A failing baseline is evidence, not a verdict. Say plainly when a failure looks
+      like a real defect worth investigating, and say plainly when it is a missing
+      prerequisite, a stale binary, or a known flake. Note which areas the failure
+      leaves unverified so discovery can weigh its coverage honestly.
+    output:
+      interpretation: {type: string}
+      likely_product_issues:
+        type: array
+        items: {type: string}
+      unverified_areas:
+        type: array
+        items: {type: string}
+    routes:
+      - to: discovery
+
+  - &discovery_agent
+    name: discover_bugs
+    description: Read-only bug discovery isolated from the other discovery agents
+    model: gpt-6-astra
+    context_tier: long_context
+    reasoning:
+      effort: high
+    working_dir: "{{ bootstrap.output.worktree }}"
+    plugins: []
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.worktree
+      - workflow.input.focus
+      - workflow.input.max_candidates
+      - bootstrap.output.summary
+      - prepare.output.environment_ready
+      - prepare.output.blockers
+      - prepare.output.summary
+      - prepare.output.baseline_records
+      - prepare_review.output?
+    system_prompt: !file prompts/rules.md
+    prompt: |
+      Focus: {{ workflow.input.focus }}
+      Baseline: environment_ready={{ prepare.output.environment_ready }};
+        {{ prepare.output.summary }}
+        blockers: {{ prepare.output.blockers | tojson }}
+        records: {{ prepare.output.baseline_records | tojson }}
+      {% if prepare_review is defined and prepare_review.output %}
+      Baseline failure analysis: {{ prepare_review.output | tojson }}
+      {% endif %}
+      Run: {{ bootstrap.output.summary | tojson }}
+      Find at most {{ workflow.input.max_candidates }} BUG candidates, never a quota.
+      Read-only: no edits, test execution, deployments, record creation, or GitHub writes.
+      Read source/callers, baseline logs, the issue inventory and previous reports.
+      Examine functional correctness: append ordering/idempotency, tenancy, sessions,
+      checkpoint/truncation/recovery, cancellation and sample transaction semantics.
+      Trace reachable failures rather than suspicious syntax. Describe a falsifiable
+      test for each hypothesis; this step does not claim validation.
+      Use B001, B002, ... and category bug. Fields: repository-relative path, fully
+      qualified symbol, root-cause invariant, title and hypothesis. Avoid SHA/line
+      numbers/run IDs in invariants. Group same-cause symptoms within this category.
+      Record coverage and limitations. Zero candidates is valid.
+    output: &discovery_output
+      coverage: {type: string}
+      candidates:
+        type: array
+        items: &candidate_schema
+          type: object
+          properties:
+            id: {type: string}
+            category: {type: string}
+            title: {type: string}
+            path: {type: string}
+            symbol: {type: string}
+            invariant: {type: string}
+            hypothesis: {type: string}
+
+  - <<: *discovery_agent
+    name: discover_dead_code
+    description: Read-only dead-code discovery isolated from the other discovery agents
+    prompt: |
+      Focus: {{ workflow.input.focus }}
+      Baseline: environment_ready={{ prepare.output.environment_ready }};
+        {{ prepare.output.summary }}
+        blockers: {{ prepare.output.blockers | tojson }}
+      {% if prepare_review is defined and prepare_review.output %}
+      Baseline failure analysis: {{ prepare_review.output | tojson }}
+      {% endif %}
+      Run: {{ bootstrap.output.summary | tojson }}
+      Find at most {{ workflow.input.max_candidates }} DEAD-CODE candidates.
+      Read-only: no edits, removals, builds/tests, deployments, or GitHub writes.
+      Read source/callers, baseline logs, the issue inventory and previous reports.
+      Investigate static and dynamic reachability: reflection, serialization, DI,
+      SF activation, configuration, generated code, build/profile conditions,
+      external/public consumers and plugin loading. "No references" is not proof.
+      State the remaining uncertainty and a minimal removal experiment; do not
+      claim a candidate validated just because it looks unused.
+      Use D001, D002, ... and category dead_code. Supply repository-relative path,
+      fully qualified symbol, stable root-cause invariant, title and hypothesis.
+      Record examined areas and compatibility limitations. Zero candidates is valid.
+
+  - <<: *discovery_agent
+    name: discover_stability
+    description: Read-only stability discovery isolated from the other discovery agents
+    prompt: |
+      Focus: {{ workflow.input.focus }}
+      Baseline: environment_ready={{ prepare.output.environment_ready }};
+        {{ prepare.output.summary }}
+        blockers: {{ prepare.output.blockers | tojson }}
+      {% if prepare_review is defined and prepare_review.output %}
+      Baseline failure analysis: {{ prepare_review.output | tojson }}
+      {% endif %}
+      Run: {{ bootstrap.output.summary | tojson }}
+      Find at most {{ workflow.input.max_candidates }} STABILITY candidates.
+      Read-only: no edits, tests, load, fault injection, deployment, or GitHub writes.
+      Read source/callers, baseline logs, the issue inventory and previous reports.
+      Trace bounded resource use, retries/timeouts, cancellation, shutdown, failover,
+      concurrency and recovery. Require a measurable failure or justified threshold,
+      not speculative refactoring. Account for known meter-interference flakiness.
+      Propose controlled experiments, workload/repetition counts and expected behavior.
+      Use S001, S002, ... and category stability. Supply repository-relative path,
+      fully qualified symbol, stable invariant, title and hypothesis.
+      Record coverage/limitations. Do not infer defects from missing prerequisites.
+
+  - <<: *discovery_agent
+    name: discover_performance
+    description: Read-only performance discovery isolated from the other discovery agents
+    prompt: |
+      Focus: {{ workflow.input.focus }}
+      Baseline: environment_ready={{ prepare.output.environment_ready }};
+        {{ prepare.output.summary }}
+        blockers: {{ prepare.output.blockers | tojson }}
+      {% if prepare_review is defined and prepare_review.output %}
+      Baseline failure analysis: {{ prepare_review.output | tojson }}
+      {% endif %}
+      Run: {{ bootstrap.output.summary | tojson }}
+      Find at most {{ workflow.input.max_candidates }} PERFORMANCE candidates.
+      Read-only: no edits, benchmarks, load generation, deployment, or GitHub writes.
+      Read source/callers, baseline logs, the issue inventory and previous reports.
+
+      Target throughput, latency and resource cost on the hot paths: the append and
+      batch-commit path, group-commit and batching settings, per-partition gating and
+      lock contention, checkpoint/truncation work, subscription fan-out, serialization
+      and copying, chatty or serialized RPCs, and avoidable round-trips.
+
+      AGENTS.md documents the numbers that matter: Tests.EndToEnd Scenario 1 over 1000
+      operations reaches roughly 250 ops/s at concurrency 4 and 970 ops/s at 16, close
+      to the no-log-service mode, and a drop over 5% is treated as a regression worth
+      investigating. Defaults that shape this: GroupCommitDelayMs 2 ms,
+      WalManager.MaxRecordsPerCommit 100, AppendBatchOptions.MaxRecords 64,
+      MaxBytes 256 KiB, with BatchAcknowledgementInterval and
+      ReplicationBatchSendInterval both 0.
+
+      Nominate a candidate only with a concrete mechanism and a measurable prediction:
+      name the metric, the scenario that exercises it, the reference it is measured
+      against, and the effect size you expect. "Could be faster" is not a candidate,
+      and neither is a micro-optimisation with no measurable effect on these paths.
+      Note that meaningful end-to-end numbers need a healthy cluster; say so when a
+      hypothesis cannot be measured in the current environment rather than assuming it.
+
+      Use P001, P002, ... and category performance. Supply repository-relative path,
+      fully qualified symbol, stable invariant describing the cost, title and
+      hypothesis. Record coverage/limitations. Zero candidates is valid.
+
+  - name: consolidate
+    description: Group duplicate discoveries without losing distinct causes or deferred work
+    model: claude-sonnet-5
+    context_tier: long_context
+    reasoning:
+      effort: medium
+    working_dir: "{{ bootstrap.output.worktree }}"
+    plugins: []
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.worktree
+      - workflow.input.max_candidates
+      - discovery.outputs
+    system_prompt: !file prompts/rules.md
+    prompt: |
+      Bug discovery: {{ discovery.outputs.discover_bugs | tojson }}
+      Dead-code discovery: {{ discovery.outputs.discover_dead_code | tojson }}
+      Stability discovery: {{ discovery.outputs.discover_stability | tojson }}
+      Performance discovery: {{ discovery.outputs.discover_performance | tojson }}
+      Maximum consolidated candidates: {{ workflow.input.max_candidates }}
+      Read-only: group hypotheses, do not run experiments or publish findings.
+      Combine only discoveries with the same demonstrated causal mechanism and
+      invariant. Shared files/symptoms are insufficient. Preserve distinct causes.
+      Select actionable candidates for this run, assign C001, C002, ... in priority
+      order and retain concrete reproduction hypotheses. Preserve all contributors'
+      useful details. No independent discoveries may be silently dropped.
+      Return exactly one mapping for EVERY B/D/S/P discovery: disposition selected
+      with its C ID, or deferred with candidate_id="" and a substantive reason.
+      Several source IDs may map to one consolidated candidate. Every C candidate
+      needs at least one source. If over budget, defer lower-priority hypotheses,
+      do not mislabel them as duplicates. Deferred work stays in the report.
+      Summarize combined coverage and limitations. Zero candidates is valid.
+    output:
+      <<: *discovery_output
+      mapping:
+        type: array
+        items:
+          type: object
+          properties:
+            source_id: {type: string}
+            disposition: {type: string}
+            candidate_id: {type: string}
+            reason: {type: string}
+    routes:
+      - to: queue
+
+  - name: queue
+    type: script
+    # Everything except the run directory is path-dependent: a recovering run has a
+    # saved plan and no preparation or discovery, and a fresh run is the reverse.
+    input:
+      - bootstrap.output.run_dir
+      - bootstrap.output.recovering
+      - bootstrap.output.saved_plan?
+      - prepare.output.environment_ready?
+      - prepare.output.blockers?
+      - prepare.output.summary?
+      - prepare.output.provenance?
+      - prepare.output.steps?
+      - prepare.output.baseline_records?
+      - prepare_review.output?
+      - discovery.outputs.discover_bugs?
+      - discovery.outputs.discover_dead_code?
+      - discovery.outputs.discover_stability?
+      - discovery.outputs.discover_performance?
+      - consolidate.output?
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', queue, --run-dir, "{{ bootstrap.output.run_dir }}"]
+    stdin: |
+      {% if bootstrap.output.recovering %}
+      {{ bootstrap.output.saved_plan | tojson }}
+      {% else %}
+      {
+        "preparation": {
+          "environment_ready": {{ prepare.output.environment_ready | tojson }},
+          "blockers": {{ prepare.output.blockers | tojson }},
+          "summary": {{ prepare.output.summary | tojson }},
+          "provenance": {{ prepare.output.provenance | tojson }},
+          "steps": {{ prepare.output.steps | tojson }},
+          "baseline_records": {{ prepare.output.baseline_records | tojson }},
+          "interpretation": {{ (prepare_review.output if prepare_review is defined else {}) | tojson }}
+        },
+        "discoveries": {
+          "bug": {{ discovery.outputs.discover_bugs | tojson }},
+          "dead_code": {{ discovery.outputs.discover_dead_code | tojson }},
+          "stability": {{ discovery.outputs.discover_stability | tojson }},
+          "performance": {{ discovery.outputs.discover_performance | tojson }}
+        },
+        "discovery": {{ consolidate.output | tojson }}
+      }
+      {% endif %}
+    timeout: 30
+    routes:
+      - to: queue_failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: finish
+        when: "{{ output.candidates | length == 0 }}"
+      - to: candidates
+
+  - name: queue_failed
+    type: terminate
+    status: failed
+    input:
+      - queue.output.stderr
+      - bootstrap.output.run_dir
+    reason: "{{ queue.output.stderr }}"
+    output_template:
+      error: "{{ queue.output.stderr }}"
+      run_dir: "{{ bootstrap.output.run_dir }}"
+
+  - name: finish
+    type: script
+    input:
+      - bootstrap.output.run_dir
+    command: python
+    args: ['{{ workflow.dir }}\audit.py', finish, --run-dir, "{{ bootstrap.output.run_dir }}"]
+    timeout: 30
+    routes:
+      - to: finish_failed
+        when: "{{ output.exit_code != 0 }}"
+      - to: $end
+
+  - name: finish_failed
+    type: terminate
+    status: failed
+    input:
+      - finish.output.stderr
+      - bootstrap.output.run_dir
+      - finish.output.report
+      - bootstrap.output.worktree
+      - finish.output.coverage
+      - finish.output.environment_ready
+      - finish.output.blockers
+      - finish.output.candidates
+    reason: "{{ finish.output.stderr }}"
+    output_template:
+      error: "{{ finish.output.stderr }}"
+      run_dir: "{{ bootstrap.output.run_dir }}"
+
+output:
+  report: "{{ finish.output.report }}"
+  worktree: "{{ bootstrap.output.worktree }}"
+  coverage: "{{ finish.output.coverage }}"
+  environment_ready: "{{ finish.output.environment_ready }}"
+  blockers: "{{ finish.output.blockers }}"
+  candidates: "{{ finish.output.candidates }}"
