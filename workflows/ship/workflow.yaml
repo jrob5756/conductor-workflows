@@ -141,7 +141,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: claude-sonnet-5
+    default_model: gpt-6-sol
     max_session_seconds: 3600
     checkpoint:
       every_agent: true   # long, human-gated run — keep it resumable after an
@@ -245,7 +245,7 @@ agents:
 
   - name: issue_resolver
     description: Loads the issue to work on from GitHub
-    model: claude-sonnet-5
+    model: gpt-6-luna
     reasoning:
       effort: medium
     plugins:
@@ -321,7 +321,7 @@ agents:
 
   - name: worktree_setup
     description: Claims the issue and creates an isolated worktree and branch for it, using the worktree skill
-    model: claude-sonnet-5
+    model: gpt-6-luna
     plugins:
       - issues@jason-tools    # worktree
     input:
@@ -664,7 +664,7 @@ agents:
 
   - name: coder
     description: Implements the approved plan on autopilot and verifies it with the repository's own build, lint and test commands
-    model: claude-sonnet-5
+    model: gpt-6-sol
     context_tier: long_context
     reasoning:
       effort: high
@@ -836,7 +836,7 @@ agents:
 
   - name: ship_draft
     description: Stages, commits, pushes and opens a draft pull request, using the git-workflow skill
-    model: claude-sonnet-5
+    model: gpt-6-luna
     plugins:
       - git@jason-tools       # git-workflow, gh-cli
     working_dir: "{{ worktree_verify.output.worktree_path }}"
@@ -927,7 +927,7 @@ agents:
 
   - name: review_fixer
     description: Applies the review's findings and pushes them, so the review itself never has to double as an implementer
-    model: claude-sonnet-5
+    model: gpt-6-sol
     context_tier: long_context
     reasoning:
       effort: medium
@@ -1068,7 +1068,7 @@ agents:
 
   - name: publish
     description: Takes the pull request out of draft and reports its CI status, using the gh-cli skill
-    model: claude-sonnet-5
+    model: gpt-6-luna
     plugins:
       - git@jason-tools       # gh-cli
     working_dir: "{{ worktree_verify.output.worktree_path }}"
@@ -1210,7 +1210,7 @@ agents:
 
   - name: merge
     description: Merges the pull request and cleans up the branch and worktree, using the merge-pr skill
-    model: claude-sonnet-5
+    model: gpt-6-luna
     plugins:
       - prs@jason-tools       # merge-pr
     # Pinned to the repository root, NOT the worktree — this step deletes that
@@ -1361,7 +1361,7 @@ agents:
 
   - name: conflict_resolver
     description: Merges the base branch into the pull request branch and resolves the conflicts, re-running the repository's own checks before pushing
-    model: claude-sonnet-5
+    model: gpt-6-sol
     context_tier: long_context
     reasoning:
       effort: high
