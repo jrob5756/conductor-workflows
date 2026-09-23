@@ -241,7 +241,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: claude-sonnet-5
+    default_model: gpt-6-luna
     max_session_seconds: 3600
     checkpoint:
       every_agent: true   # human-gated run — keep it resumable after an
@@ -285,7 +285,7 @@ agents:
 
   - name: pr_resolver
     description: Loads the pull request under review from GitHub
-    model: claude-sonnet-5
+    model: gpt-6-luna
     reasoning:
       effort: medium
     plugins:
@@ -1030,7 +1030,7 @@ agents:
 
   - name: comment_writer
     description: Words the approved findings for the author and maps them to inline anchors, running every comment through the humanizer
-    model: claude-sonnet-5
+    model: gpt-6-luna
     context_tier: long_context
     reasoning:
       effort: medium
@@ -1737,7 +1737,7 @@ agents:
 
   - name: followup_comment_writer
     description: Words the earlier points and current CI findings you kept, distinguishing follow-up feedback from this pass's CI results
-    model: claude-sonnet-5
+    model: gpt-6-luna
     context_tier: long_context
     reasoning:
       effort: medium
