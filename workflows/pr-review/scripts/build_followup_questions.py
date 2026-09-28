@@ -1,37 +1,8 @@
 #!/usr/bin/env python3
-"""Turn a follow-up analysis into questions about what to raise again.
+"""Reconcile distinct earlier points and replace prior CI with final check results.
 
-Same job as `build_questions.py`, and a script for the same reason: Conductor's
-`QuestionDef` forbids unknown keys, so deriving the questions here rather than
-asking the analysis agent to emit them means a stray field cannot abort the
-triage node after the analysis has been paid for.
-
-What differs is the filter. A first-pass review drops nits because they are not
-worth a decision each. This one drops nothing on severity: every entry here is
-a point you already made once, in public, and quietly withholding it the second
-time would leave the author reading agreement into silence. Only an item the
-analysis found *closed* — fixed, or made moot by the change moving on — skips
-the questions, and those are still counted and reported so "everything I asked
-for is done" is a result you can see rather than infer from an empty list.
-
-An unrecognised status becomes `unclear`, which is outstanding. A malformed
-entry fails the step. Both defaults run the same way: toward putting the point
-in front of you rather than dropping it on your behalf.
-
-Current CI findings are supplied separately from earlier feedback and always
-reach triage; their wording must not imply a previously raised point.
-
-The choices are the ones `triage_choices.py` defines, so `apply_triage.py`
-reads these answers with no follow-up-specific branch.
-
-Usage:
-    build_followup_questions.py    # {"items": [...], "prior_items": [...],
-                                  #  "ci_findings": [...]} on stdin
-
-Output:
-    ok, error, questions, findings, resolved, question_count, blocking_count,
-    recommended_count, outstanding_count, addressed_count, obsolete_count,
-    unaccounted_count, unsourced_count, ci_count
+Stdin supplies items, prior_items, duplicate_sources and ci_findings. Unexamined
+legacy sources fail closed; verified code sources remain visible at triage.
 """
 
 from __future__ import annotations
@@ -150,6 +121,20 @@ def normalize(entry: object) -> dict[str, object] | None:
     """
     if not isinstance(entry, dict):
         return None
+    if "source_ids" in entry:
+        sources = entry["source_ids"]
+    else:
+        if any(key in entry and not isinstance(entry[key], str) for key in ("source_id", "id")):
+            return None
+        source = text_of(entry.get("source_id")) or text_of(entry.get("id"))
+        sources = [source] if source else []
+    if (
+        not isinstance(sources, list)
+        or any(not isinstance(source, str) or not source.strip() for source in sources)
+        or len(set(sources)) != len(sources)
+        or entry.get("source_type", "code") not in ("code", "ci")
+    ):
+        return None
 
     original = text_of(entry.get("original")) or text_of(entry.get("body"))
     evidence = text_of(entry.get("evidence"))
@@ -176,7 +161,9 @@ def normalize(entry: object) -> dict[str, object] | None:
         "title": title[:TITLE_LIMIT],
         "body": "\n\n".join(parts) or title,
         "suggestion": recommendation,
-        "source_id": text_of(entry.get("source_id")) or text_of(entry.get("id")),
+        "source_ids": sources,
+        "source_id": sources[0] if sources else "",
+        "source_type": entry.get("source_type", "code"),
     }
 
 
@@ -208,6 +195,8 @@ def synthesize(prior: object) -> dict[str, object] | None:
         "body": f"{body}\n\n{UNEXAMINED_NOTE}",
         "suggestion": "",
         "source_id": text_of(prior.get("id")),
+        "source_ids": [text_of(prior.get("id"))],
+        "source_type": "ci" if prior.get("source_type") == "ci" else "code",
     }
 
 
@@ -273,12 +262,16 @@ def main() -> None:
     # A bare array is the analysis alone. The object form carries the prior
     # comments too, which is what lets an omitted point be caught.
     ci_entries = []
+    duplicates = []
+    ci_verified = False
     if isinstance(payload, list):
         entries, prior_items = payload, []
     elif isinstance(payload, dict):
-        entries = payload.get("items") or []
-        prior_items = payload.get("prior_items") or []
+        entries = payload.get("items", [])
+        prior_items = payload.get("prior_items", [])
         ci_entries = payload.get("ci_findings", [])
+        ci_verified = "ci_findings" in payload
+        duplicates = payload.get("duplicate_sources", [])
     elif payload is None:
         entries, prior_items = [], []
     else:
@@ -288,8 +281,16 @@ def main() -> None:
         fail(f"The follow-up analysis must be a JSON array, got {type(entries).__name__}")
     if not isinstance(ci_entries, list):
         fail("CI findings must be a JSON array.")
-    if not isinstance(prior_items, list):
-        prior_items = []
+    if not isinstance(prior_items, list) or any(
+        not isinstance(prior, dict) or not isinstance(prior.get("id"), str)
+        or not prior["id"] or not isinstance(prior.get("body"), str) or not prior["body"].strip()
+        for prior in prior_items
+    ):
+        fail("Prior items must contain identified, nonempty feedback.")
+    if len({prior["id"] for prior in prior_items}) != len(prior_items):
+        fail("Prior item IDs must be unique.")
+    if not isinstance(duplicates, list):
+        fail("Duplicate-source accounting must be an array.")
 
     normalized: list[dict[str, object]] = []
     invalid = 0
@@ -308,16 +309,53 @@ def main() -> None:
             "instead."
         )
 
-    cited = {str(item["source_id"]) for item in normalized if item["source_id"]}
-    known = {
-        text_of(prior.get("id"))
-        for prior in prior_items
-        if isinstance(prior, dict) and text_of(prior.get("id"))
-    }
+    by_id = {prior["id"]: prior for prior in prior_items}
+    known = set(by_id)
+    cited = {source for item in normalized for source in item["source_ids"]}
+    delegated = {source for source, prior in by_id.items()
+                 if prior.get("source_type") == "ci"} if ci_verified else set()
+    verified_ci = set(delegated)
+    retained = []
+    for item in normalized:
+        sources = set(item["source_ids"])
+        prior_ci = sources & verified_ci
+        if prior_ci and sources - verified_ci:
+            fail("A follow-up point mixes CI and code sources; split them before reconciliation.")
+        if ci_verified and (prior_ci or item["source_type"] == "ci"):
+            if not sources or not sources <= known:
+                fail("A delegated CI point must cite known earlier feedback.")
+            if any(by_id[source].get("source_type") == "code" for source in sources):
+                fail("A genuine code finding cannot be delegated to CI.")
+            delegated.update(sources)
+        else:
+            retained.append(item)
+    normalized = retained
+    duplicate_ids = set()
+    for duplicate in duplicates:
+        if not isinstance(duplicate, dict):
+            fail("Malformed duplicate-source accounting.")
+        source, covered = duplicate.get("source_id"), duplicate.get("covered_by")
+        evidence = duplicate.get("evidence")
+        if (
+            not isinstance(source, str) or source not in known or source in duplicate_ids
+            or source in cited or source in delegated
+            or not isinstance(covered, list) or not covered
+            or any(not isinstance(target, str) or target == source
+                   or target not in known or target not in cited for target in covered)
+            or not isinstance(evidence, str) or not evidence.strip()
+        ):
+            fail("Duplicate sources must explicitly map all their content to examined sources.")
+        duplicate_ids.add(source)
     unaccounted = 0
     for prior in prior_items:
-        if not isinstance(prior, dict) or text_of(prior.get("id")) in cited:
+        if prior["id"] in cited | delegated | duplicate_ids:
             continue
+        if prior.get("source_type", "legacy") == "legacy":
+            fail(
+                f"Earlier source {prior['id']} is unexamined. Account for every point "
+                "or explicitly map the whole source to examined duplicates; its body "
+                "may mix code feedback and superseded CI results."
+            )
         recovered = synthesize(prior)
         if recovered is not None:
             normalized.append(recovered)
@@ -335,7 +373,9 @@ def main() -> None:
         item, _ = normalize_ci_finding(entry)
         if item is None:
             fail("CI finding could not be read.")
-        outstanding.append({**item, "status": "ci", "source_id": ""})
+        outstanding.append({
+            **item, "status": "ci", "source_type": "ci", "source_id": "", "source_ids": []
+        })
 
     blocking = [item for item in outstanding if item["severity"] == BLOCKING]
     recommended = [item for item in outstanding if item["severity"] == RECOMMENDED]
@@ -367,6 +407,8 @@ def main() -> None:
             "obsolete_count": sum(1 for item in resolved if item["status"] == OBSOLETE),
             "unaccounted_count": unaccounted,
             "ci_count": len(ci_entries),
+            "delegated_ci_count": len(delegated),
+            "duplicate_source_count": len(duplicate_ids),
             # An entry citing no prior comment, or one that does not exist, is
             # a point the analysis introduced rather than followed up. It is
             # still asked — the human drops what does not belong — but the
@@ -374,7 +416,7 @@ def main() -> None:
             "unsourced_count": sum(
                 1
                 for item in normalized
-                if known and str(item["source_id"]) not in known
+                if known and (not item["source_ids"] or not set(item["source_ids"]) <= known)
             ),
         }
     )

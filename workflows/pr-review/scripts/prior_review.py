@@ -59,6 +59,8 @@ import json
 import subprocess
 import sys
 
+from review_format import recover
+
 BODY_LIMIT = 6000
 REPLY_LIMIT = 1500
 CONTEXT_LIMIT = 1000
@@ -288,13 +290,46 @@ def main(argv: list[str]) -> None:
         threads.setdefault(thread_root(comment), []).append(comment)
 
     items: list[dict[str, object]] = []
+    represented_inline: set[object] = set()
     for review in my_reviews:
+        provenance = recover(str(review.get("body") or ""))
+        if provenance is not None:
+            for finding in provenance:
+                replies = []
+                for comment in my_inline:
+                    if (
+                        finding["placement"] == "inline"
+                        and review.get("id") is not None
+                        and comment.get("pull_request_review_id") == review["id"]
+                        and comment.get("body") == finding["body"]
+                        and comment.get("path") == finding["path"]
+                        and (comment.get("original_line") or comment.get("line")) == finding["line"]
+                    ):
+                        represented_inline.add(comment.get("id"))
+                        replies.extend(replies_to(comment, threads, mine))
+                items.append({
+                    "kind": "finding",
+                    "finding_id": finding["finding_id"],
+                    "source_type": finding["source_type"],
+                    "author": login_of(review),
+                    "path": finding["path"],
+                    "line": finding["line"],
+                    "created_at": stamp_of(review),
+                    "state": str(review.get("state") or ""),
+                    "url": str(review.get("html_url") or ""),
+                    "body": finding["body"],
+                    "replies": replies,
+                    "review_id": review.get("id"),
+                })
+            continue
         body = truncate(review.get("body"), BODY_LIMIT)
         if not body:
             continue
         items.append(
             {
                 "kind": "review",
+                "source_type": "legacy",
+                "review_id": review.get("id"),
                 "author": login_of(review),
                 "path": "",
                 "line": 0,
@@ -306,12 +341,16 @@ def main(argv: list[str]) -> None:
             }
         )
     for comment in my_inline:
+        if comment.get("id") is not None and comment["id"] in represented_inline:
+            continue
         body = truncate(comment.get("body"), BODY_LIMIT)
         if not body:
             continue
         items.append(
             {
                 "kind": "inline",
+                "source_type": "legacy",
+                "review_id": comment.get("pull_request_review_id"),
                 "author": login_of(comment),
                 "path": str(comment.get("path") or ""),
                 "line": line_of(comment),
@@ -329,6 +368,7 @@ def main(argv: list[str]) -> None:
         items.append(
             {
                 "kind": "conversation",
+                "source_type": "legacy",
                 "author": login_of(comment),
                 "path": "",
                 "line": 0,

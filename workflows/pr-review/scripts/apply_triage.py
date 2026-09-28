@@ -103,6 +103,16 @@ def main() -> None:
     findings = parsed.get("findings")
     if not isinstance(findings, list):
         fail("Triage payload has no findings array")
+    ids = set()
+    for finding in findings:
+        if (
+            not isinstance(finding, dict)
+            or not isinstance(finding.get("id"), str) or not finding["id"].strip()
+            or finding["id"] in ids
+            or not isinstance(finding.get("body"), str) or not finding["body"].strip()
+        ):
+            fail("Triage findings must have unique nonempty IDs and nonempty bodies.")
+        ids.add(finding["id"])
 
     decisions = decisions_from(parsed.get("items"))
 
@@ -110,8 +120,6 @@ def main() -> None:
     dropped = 0
     reclassified = 0
     for finding in findings:
-        if not isinstance(finding, dict):
-            continue
         answer = decisions.get(str(finding.get("id") or ""), POST_AS_IS)
         normalized = answer.casefold()
         if normalized == DO_NOT_POST.casefold():

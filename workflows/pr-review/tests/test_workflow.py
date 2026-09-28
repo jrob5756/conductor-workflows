@@ -9,6 +9,17 @@ WORKFLOW = Path(__file__).resolve().parents[1] / "workflow.yaml"
 
 
 class WorkflowRoutingTests(unittest.TestCase):
+    def test_review_and_publication_use_pinned_base(self):
+        for name in ("concept_review", "code_review", "followup_review"):
+            agent = self.agents[name]
+            self.assertIn("pr_worktree.output.base_sha", agent["input"])
+            self.assertIn("git diff {{ pr_worktree.output.base_sha }}...HEAD", agent["prompt"])
+            self.assertNotIn("{{ pr_worktree.output.remote }}/", agent["prompt"])
+        for name in ("post_review", "post_followup_review", "post_approval", "post_note"):
+            agent = self.agents[name]
+            self.assertIn("pr_worktree.output.base_sha", agent["input"])
+            self.assertIn("{{ pr_worktree.output.base_sha }}", agent["args"])
+
     @classmethod
     def setUpClass(cls):
         cls.document = yaml.safe_load(WORKFLOW.read_text())
@@ -43,7 +54,7 @@ class WorkflowRoutingTests(unittest.TestCase):
     def test_code_review_always_bracketed_by_ci(self):
         self.assertEqual(self.route("concept_review", {"blocking": [], "verdict": "good_addition"}), "ci_start")
         self.assertEqual(self.agents["concept_gate"]["options"][0]["route"], "ci_start")
-        self.assertEqual(self.route("ci_start", {"ok": False}, concept_review={"output": {}}), "code_review")
+        self.assertEqual(self.route("ci_start", {"ok": False}, concept_review={"output": {}}), "cleanup")
         self.assertEqual(self.route("code_review", {"findings": []}), "ci_wait")
         self.assertEqual(self.route("code_review", {"findings": [{"title": "bug"}]}), "ci_wait")
         self.assertEqual(self.route("ci_wait", {"ok": True}, code_review={"output": {}}), "build_questions")
@@ -51,8 +62,8 @@ class WorkflowRoutingTests(unittest.TestCase):
 
     def test_followup_always_starts_and_waits_for_ci(self):
         self.assertEqual(self.route("select_review", {"followup": True}), "ci_start")
-        for ok in (True, False):
-            self.assertEqual(self.route("ci_start", {"ok": ok}), "followup_review")
+        self.assertEqual(self.route("ci_start", {"ok": True}), "followup_review")
+        self.assertEqual(self.route("ci_start", {"ok": False}), "cleanup")
         self.assertEqual(self.route("followup_review", {"items": []}), "ci_wait")
         self.assertEqual(self.route("ci_wait", {"ok": True}), "build_followup_questions")
         self.assertEqual(self.route("ci_wait", {"ok": False}), "cleanup")
@@ -80,7 +91,7 @@ class WorkflowRoutingTests(unittest.TestCase):
 
         findings = [{"severity": "BLOCKING", "title": "CI failed", "body": "Build failed", "suggestion": "Fix build"}]
         rendered = self.jinja.from_string(self.agents["build_followup_questions"]["stdin"]).render(
-            followup_review={"output": {"items": []}},
+            followup_review={"output": {"items": [], "duplicate_sources": []}},
             prior_review={"output": {"prior_items": []}},
             ci_wait={"output": {"findings": findings}},
         )
@@ -104,7 +115,9 @@ class WorkflowRoutingTests(unittest.TestCase):
             code_review={"output": {"findings": []}},
             ci_wait={"output": {"findings": [{"severity": "BLOCKING", "title": "CI failed"}]}},
         )
-        self.assertEqual(json.loads(rendered), [{"severity": "BLOCKING", "title": "CI failed"}])
+        self.assertEqual(json.loads(rendered), {
+            "code_findings": [], "ci_findings": [{"severity": "BLOCKING", "title": "CI failed"}],
+        })
 
     def test_clean_and_dropped_findings_offer_approval(self):
         self.assertEqual(self.route("build_questions", {"ok": True, "question_count": 0}), "review_clear_gate")
@@ -144,6 +157,80 @@ class WorkflowRoutingTests(unittest.TestCase):
             index["workflows"]["pr-review"]["description"],
             self.document["workflow"]["description"],
         )
+
+    def test_closed_merged_and_unknown_states_stop_before_own_pr_gate(self):
+        context = {"bootstrap": {"output": {"name_with_owner": "owner/repo",
+                                            "gh_logins": ["me"]}}}
+        for state in ("CLOSED", "MERGED", "unknown"):
+            output = {"found": True, "name_with_owner": "owner/repo",
+                      "state": state, "author": "me", "gh_user": "me"}
+            self.assertEqual(self.route("pr_resolver", output, **context), "pr_not_open")
+        self.assertEqual(self.agents["pr_not_open"]["type"], "terminate")
+        self.assertNotIn("pr_worktree", self.agents["pr_not_open"]["input"])
+
+    def test_both_writers_use_id_body_items_and_publisher_validates(self):
+        import json
+
+        approved = [{"id": "b1", "body": "CI failure", "path": "", "line": 0}]
+        items = [{"finding_id": "b1", "body": "CI did not pass"}]
+        for writer, publisher, triage in (
+            ("comment_writer", "post_review", "apply_triage"),
+            ("followup_comment_writer", "post_followup_review", "apply_followup_triage"),
+        ):
+            self.assertIn("items", self.agents[writer]["output"])
+            self.assertNotIn("posted_count", self.agents[writer]["output"])
+            self.assertEqual(self.route(writer, {"items": []}), publisher)
+            rendered = self.jinja.from_string(self.agents[publisher]["stdin"]).render(
+                **{writer: {"output": {"items": items}}, triage: {"output": {"approved": approved}}}
+            )
+            self.assertEqual(json.loads(rendered), {
+                "mode": "findings", "items": items, "approved": approved,
+            })
+
+    def test_concept_note_and_approval_use_distinct_plain_modes(self):
+        import json
+
+        rendered = self.jinja.from_string(self.agents["post_review"]["stdin"]).render(
+            concept_gate={"output": {"selected": "post_concept"}},
+            comment_writer={"output": {"review_body": "Concept finding", "items": []}},
+        )
+        self.assertEqual(json.loads(rendered), {"mode": "concept", "body": "Concept finding"})
+        self.assertEqual(json.loads(self.agents["post_approval"]["stdin"])["mode"], "approval")
+        rendered = self.jinja.from_string(self.agents["post_note"]["stdin"]).render(
+            followup_clear_gate={"output": {"additional_input": {"note": "Verbatim"}}},
+        )
+        self.assertEqual(json.loads(rendered), {"mode": "note", "body": "Verbatim"})
+
+    def test_fatal_ci_start_routes_to_failed_termination_after_cleanup(self):
+        self.assertEqual(self.route("ci_start", {"ok": False}), "cleanup")
+        self.assertEqual(self.route("cleanup", {"ok": True}), "cleanup_report")
+        self.assertEqual(
+            self.route("cleanup_report", {}, ci_start={"output": {"ok": False}}), "ci_failed"
+        )
+        self.assertEqual(self.agents["ci_failed"]["status"], "failed")
+
+    def test_cleanup_and_posting_terminal_counts_are_truthful(self):
+        cleanup = self.jinja.from_string(self.agents["cleanup_report"]["values"]["summary"]).render(
+            cleanup={"output": {"ok": False, "worktree_removed": False,
+                                "branch_deleted": False, "notes": "Dirty worktree retained."}}
+        )
+        self.assertIn("not removed", cleanup)
+        self.assertIn("Dirty worktree retained", cleanup)
+        rendered = self.jinja.from_string(self.agents["review_posted"]["reason"]).render(
+            pr_resolver={"output": {"pr_number": 1}},
+            apply_triage={"output": {"approved_count": 99, "dropped_count": 0,
+                                     "reclassified_count": 0}},
+            post_review={"output": {"posted_count": 10, "inline_posted": 8, "body_count": 2,
+                                    "inline_demoted": 0, "review_url": "url", "error": ""}},
+            cleanup_report={"output": {"summary": cleanup}},
+        )
+        self.assertIn("10 findings", rendered)
+        self.assertIn("8 anchored inline and 2 in the body", rendered)
+        self.assertNotIn("worktree has been removed", rendered)
+        self.assertIn(cleanup, rendered)
+        for route in self.agents["cleanup_report"]["routes"]:
+            terminal = self.agents[route["to"]]
+            self.assertIn("cleanup_report.output.summary", terminal["input"])
 
 
 if __name__ == "__main__":

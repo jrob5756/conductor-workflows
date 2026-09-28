@@ -18,7 +18,7 @@ choice strings themselves live in `triage_choices.py`, shared with the script
 that reads the answers back.
 
 Usage:
-    build_questions.py            # findings JSON array on stdin
+    build_questions.py            # {code_findings: [...], ci_findings: [...]} on stdin
 
 Output:
     ok, error, questions, findings, question_count, blocking_count,
@@ -112,6 +112,7 @@ def normalize(entry: object) -> tuple[dict[str, object] | None, str]:
 
     return {
         "severity": severity,
+        "source_type": entry.get("source_type", "code"),
         "path": text_of(entry.get("path")) or text_of(entry.get("file")),
         "line": line_of(entry.get("line")),
         "title": title[:TITLE_LIMIT],
@@ -171,17 +172,23 @@ def main() -> None:
     except json.JSONDecodeError as exc:
         fail(f"Findings are not valid JSON: {exc}")
 
-    if parsed is None:
-        parsed = []
-    if not isinstance(parsed, list):
-        fail(f"Findings must be a JSON array, got {type(parsed).__name__}")
+    if isinstance(parsed, dict):
+        code, ci = parsed.get("code_findings"), parsed.get("ci_findings")
+        if not isinstance(code, list) or not isinstance(ci, list):
+            fail("Code and CI findings must be JSON arrays.")
+        entries = [(entry, "code") for entry in code] + [(entry, "ci") for entry in ci]
+    elif isinstance(parsed, list):
+        entries = [(entry, "code") for entry in parsed]
+    else:
+        fail(f"Findings must be a JSON array or object, got {type(parsed).__name__}")
 
     normalized: list[dict[str, object]] = []
     invalid = 0
     nits = 0
-    for entry in parsed:
+    for entry, source_type in entries:
         finding, reason = normalize(entry)
         if finding is not None:
+            finding["source_type"] = source_type
             normalized.append(finding)
         elif reason == "nit":
             nits += 1
@@ -190,7 +197,7 @@ def main() -> None:
 
     if invalid:
         fail(
-            f"{invalid} of {len(parsed)} findings could not be read. A finding "
+            f"{invalid} of {len(entries)} findings could not be read. A finding "
             "the reviewer produced but this step cannot parse would be dropped "
             "without anyone deciding to drop it, so the run stops instead."
         )

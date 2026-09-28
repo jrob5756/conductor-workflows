@@ -1,27 +1,8 @@
 #!/usr/bin/env python3
-"""Post one review to a pull request, anchoring inline comments where it can.
+"""Validate approved finding coverage and publish against a freshly checked PR head.
 
-GitHub rejects an entire review with a 422 if any one comment names a line
-outside the diff, so a single bad anchor would lose every comment. Rather than
-gamble, this parses the diff, keeps the comments whose `(path, line)` lands on
-the right-hand side of a hunk, and folds the rest into the review body.
-
-The diff is read from the worktree the review actually ran against, so the
-anchors match the code that was read rather than whatever the branch looks like
-by the time this runs. `gh pr diff` is the fallback.
-
-If the POST is refused outright it retries once with every comment folded into
-the body. A review that reads slightly worse beats a review that was never
-posted. It never retries a failure that might have been accepted, such as a
-timeout, because that would post a second public review.
-
-Usage:
-    post_review.py <name_with_owner> <pr_number> <head_sha> <worktree_path> <base_ref> <remote> [event]
-
-    stdin: {"body": "...", "comments": [{"path": "...", "line": 1, "body": "..."}]}
-
-Output:
-    ok, error, review_url, inline_posted, inline_demoted, fallback_used
+Findings use {mode, approved, items}; concept/note/approval use {mode, body}.
+Every POST, including a validation retry, checks the current head and open state.
 """
 
 from __future__ import annotations
@@ -30,16 +11,11 @@ import json
 import re
 import subprocess
 import sys
+import uuid
+
+from review_format import render
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-
-DEMOTED_HEADING = "### Findings that could not be anchored inline"
-DEMOTED_NOTE = (
-    "These name a line outside this pull request's diff, so GitHub cannot "
-    "attach them to a specific line."
-)
-EMPTY_BODY_FALLBACK = "Review findings."
-
 
 def emit(payload: dict[str, object]) -> None:
     print(json.dumps(payload))
@@ -59,6 +35,8 @@ def fail(message: str) -> None:
             "review_url": "",
             "inline_posted": 0,
             "inline_demoted": 0,
+            "body_count": 0,
+            "posted_count": 0,
             "fallback_used": False,
         }
     )
@@ -134,23 +112,28 @@ def load_diff(worktree: str, base_ref: str, remote: str, nwo: str, pr_number: st
     return out if rc == 0 else ""
 
 
-def demote(body: str, demoted: list[dict[str, object]]) -> str:
-    """Append the unanchorable comments to the review body."""
-    if not demoted:
-        return body
-    parts = [body.strip(), "", DEMOTED_HEADING, "", DEMOTED_NOTE, ""]
-    for comment in demoted:
-        location = str(comment.get("path") or "").strip()
-        line = comment.get("line")
-        if location and line:
-            location = f"{location}:{line}"
-        heading = f"**{location}**" if location else "**General**"
-        parts.append(f"{heading}\n\n{str(comment.get('body') or '').strip()}\n")
-    return "\n".join(parts).strip()
+def fresh_pr(nwo: str, pr_number: str, head_sha: str) -> str:
+    rc, out, err = run(["gh", "api", f"repos/{nwo}/pulls/{pr_number}"])
+    if rc:
+        return f"Could not verify the current PR before publication: {err or out}"
+    try:
+        pr = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return f"Could not parse the current PR before publication: {exc}"
+    if not isinstance(pr, dict) or not isinstance(pr.get("head"), dict):
+        return "Current PR response has no valid head."
+    if pr.get("state") != "open" or pr.get("merged") is not False:
+        return "The PR is closed, merged, or its open state could not be verified. Nothing was posted."
+    if pr["head"].get("sha") != head_sha:
+        return "The PR head changed since review. Start a new review; nothing was posted."
+    return ""
 
 
-def post(nwo: str, pr_number: str, payload: dict[str, object]) -> tuple[str, str]:
-    """POST the review, returning (html_url, error)."""
+def post(nwo: str, pr_number: str, payload: dict[str, object]) -> tuple[str, str, bool]:
+    """Return (URL, error, safe-to-retry); freshness failures never permit a POST."""
+    error = fresh_pr(nwo, pr_number, str(payload["commit_id"]))
+    if error:
+        return "", error, False
     rc, out, err = run(
         [
             "gh",
@@ -164,21 +147,65 @@ def post(nwo: str, pr_number: str, payload: dict[str, object]) -> tuple[str, str
         stdin=json.dumps(payload),
     )
     if rc != 0:
-        return "", (err or out or "gh api returned a non-zero exit code")
+        error = err or out or "gh api returned a non-zero exit code"
+        return "", error, rejected_outright(error)
     try:
-        return json.loads(out).get("html_url", ""), ""
+        response = json.loads(out)
+        url = response.get("html_url") if isinstance(response, dict) else None
+        if not isinstance(url, str) or not url:
+            return "", "GitHub accepted the request but returned no review URL; do not retry.", False
+        return url, "", False
     except json.JSONDecodeError:
-        return "", f"Could not parse the GitHub response: {out[:400]}"
+        return "", f"Could not parse the GitHub response: {out[:400]}", False
 
 
 def rejected_outright(error: str) -> bool:
-    """Whether GitHub refused the payload rather than possibly accepting it.
+    """Only a definitive HTTP validation refusal is safe to retry."""
+    return bool(re.search(r"\(HTTP 422\)", error))
 
-    Only a validation refusal is safe to retry. A timeout or dropped response
-    may have been accepted, and retrying that posts a second public review.
-    """
-    lowered = error.lower()
-    return "422" in lowered or "unprocessable" in lowered
+
+def validate_findings(parsed):
+    approved, items = parsed.get("approved"), parsed.get("items")
+    if not isinstance(approved, list) or not approved or not isinstance(items, list):
+        raise ValueError("Findings require a nonempty approved array and an items array.")
+    by_id = {}
+    for finding in approved:
+        if not isinstance(finding, dict):
+            raise ValueError("Malformed approved finding.")
+        identity = finding.get("id")
+        if not isinstance(identity, str) or not identity.strip() or identity in by_id:
+            raise ValueError("Approved finding IDs must be nonempty and unique.")
+        if (
+            not isinstance(finding.get("body"), str) or not finding["body"].strip()
+            or not isinstance(finding.get("path", ""), str)
+            or type(finding.get("line", 0)) is not int or finding.get("line", 0) < 0
+            or finding.get("source_type", "code") not in ("code", "ci")
+        ):
+            raise ValueError(f"Malformed approved finding {identity}.")
+        by_id[identity] = finding
+    written = {}
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"finding_id", "body"}:
+            raise ValueError("Writer items must contain only finding_id and body.")
+        identity, body = item["finding_id"], item["body"]
+        if not isinstance(identity, str) or identity not in by_id or identity in written:
+            raise ValueError("Writer returned an unknown or duplicate finding ID.")
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError(f"Writer returned an empty or malformed body for {identity}.")
+        written[identity] = body.strip()
+    if written.keys() != by_id.keys():
+        raise ValueError("Writer omitted approved finding IDs: " + ", ".join(by_id.keys() - written.keys()))
+    batch = uuid.uuid4().hex
+    return [
+        {
+            "finding_id": f"{batch}:{identity}",
+            "source_type": finding.get("source_type", "code"),
+            "path": finding.get("path", ""),
+            "line": finding.get("line", 0),
+            "body": written[identity],
+        }
+        for identity, finding in by_id.items()
+    ]
 
 
 def main(argv: list[str]) -> None:
@@ -190,6 +217,8 @@ def main(argv: list[str]) -> None:
     base_ref = argv[4] if len(argv) > 4 else ""
     remote = argv[5] if len(argv) > 5 else "origin"
     event = (argv[6] if len(argv) > 6 else "COMMENT") or "COMMENT"
+    if not head_sha or not pr_number.isdigit() or event not in ("COMMENT", "APPROVE"):
+        fail("A reviewed head, numeric PR number and COMMENT or APPROVE event are required.")
 
     raw = sys.stdin.read().strip()
     if not raw:
@@ -201,45 +230,42 @@ def main(argv: list[str]) -> None:
     if not isinstance(parsed, dict):
         fail(f"Review payload must be a JSON object, got {type(parsed).__name__}")
 
-    body = str(parsed.get("body") or "").strip()
-    original_body = body
-    requested = parsed.get("comments") or []
-    if not isinstance(requested, list):
-        requested = []
-
-    anchors = anchorable_lines(
-        load_diff(worktree, base_ref, remote, nwo, pr_number)
-    )
-
-    inline: list[dict[str, object]] = []
-    demoted: list[dict[str, object]] = []
-    for comment in requested:
-        if not isinstance(comment, dict):
-            continue
-        text = str(comment.get("body") or "").strip()
-        if not text:
-            continue
-        path = str(comment.get("path") or comment.get("file") or "").strip()
+    mode = parsed.get("mode")
+    findings = []
+    inline = []
+    demoted = 0
+    if mode == "findings":
+        if event != "COMMENT":
+            fail("Finding reviews must use COMMENT.")
         try:
-            line = int(str(comment.get("line")).strip())
-        except (TypeError, ValueError):
-            line = 0
-        if path and line > 0 and line in anchors.get(path, set()):
-            inline.append({"path": path, "line": line, "side": "RIGHT", "body": text})
-        else:
-            demoted.append({"path": path, "line": line, "body": text})
-
-    body = demote(original_body, demoted)
-    if not body:
-        if not inline:
-            fail("The review has no body and no postable comments")
-        body = EMPTY_BODY_FALLBACK
+            findings = validate_findings(parsed)
+        except ValueError as exc:
+            fail(str(exc))
+        anchors = anchorable_lines(load_diff(worktree, base_ref, remote, nwo, pr_number))
+        for item in findings:
+            path, line = item["path"], item["line"]
+            item["placement"] = "inline" if path and line in anchors.get(path, set()) else "body"
+            if item["placement"] == "inline":
+                inline.append({"path": path, "line": line, "side": "RIGHT", "body": item["body"]})
+            elif path and line:
+                demoted += 1
+        body = render(findings)
+    elif mode in ("concept", "note", "approval"):
+        if (mode == "approval") != (event == "APPROVE"):
+            fail("Approval mode and event must agree.")
+        if set(parsed) != {"mode", "body"}:
+            fail("Concept, note and approval payloads accept only mode and body.")
+        body = parsed.get("body")
+        if not isinstance(body, str) or not body.strip():
+            fail("The review body must be a nonempty string.")
+    else:
+        fail("Review mode must be findings, concept, note or approval.")
 
     payload: dict[str, object] = {"commit_id": head_sha, "event": event, "body": body}
     if inline:
         payload["comments"] = inline
 
-    url, error = post(nwo, pr_number, payload)
+    url, error, retryable = post(nwo, pr_number, payload)
     if url:
         emit(
             {
@@ -247,21 +273,20 @@ def main(argv: list[str]) -> None:
                 "error": "",
                 "review_url": url,
                 "inline_posted": len(inline),
-                "inline_demoted": len(demoted),
+                "inline_demoted": demoted,
+                "body_count": len(findings) - len(inline),
+                "posted_count": len(findings),
                 "fallback_used": False,
             }
         )
 
-    if not inline or not rejected_outright(error):
+    if not inline or not retryable:
         fail(f"Could not post the review: {error}")
 
-    # GitHub refused the payload outright, so nothing was created and the only
-    # thing it can have objected to is an anchor. Rebuild from the original
-    # body rather than the already-demoted one, which would repeat every
-    # finding that was folded in the first time.
-    retry_body = demote(original_body, demoted + inline) or EMPTY_BODY_FALLBACK
-    retry_url, retry_error = post(
-        nwo, pr_number, {"commit_id": head_sha, "event": event, "body": retry_body}
+    for item in findings:
+        item["placement"] = "body"
+    retry_url, retry_error, _ = post(
+        nwo, pr_number, {"commit_id": head_sha, "event": event, "body": render(findings)}
     )
     if not retry_url:
         fail(f"Could not post the review: {error}. Retry without inline comments: {retry_error}")
@@ -272,7 +297,9 @@ def main(argv: list[str]) -> None:
             "error": f"Inline comments were rejected and folded into the body: {error}",
             "review_url": retry_url,
             "inline_posted": 0,
-            "inline_demoted": len(demoted) + len(inline),
+            "inline_demoted": demoted + len(inline),
+            "body_count": len(findings),
+            "posted_count": len(findings),
             "fallback_used": True,
         }
     )

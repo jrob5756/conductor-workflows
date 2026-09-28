@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 
 from merge_readiness import (
     QueryError, command, inspect_checks, paginated, parse_json, query, validate_target,
@@ -14,24 +16,33 @@ from merge_readiness import (
 WAIT_TIMEOUT = 1800
 START_TIMEOUT = 240
 POLL_INTERVAL = 15
+DISCOVERY_GRACE = 120
 ACTIVE = {"queued", "in_progress", "waiting", "pending", "requested"}
 PASSING = {"success", "neutral", "skipped"}
 
 
 def finding(title: str, body: str) -> dict:
     return {
-        "severity": "BLOCKING", "title": title, "body": body,
+        "severity": "BLOCKING", "title": title, "body": body, "source_type": "ci",
         "suggestion": "Resolve the CI problem on the reviewed commit, then rerun the review and verify checks before merging.",
     }
 
 
 def response(findings=None, **extra) -> dict:
-    findings = [] if findings is None else findings
+    findings = [{**item, "source_type": "ci"} for item in findings or []]
     return {
         "ok": True, "error": "", "findings": findings,
         "summary": "; ".join(f"{item['title']}: {item['body']}" for item in findings) if findings else "CI verified.",
         **extra,
     }
+
+
+def fatal(error: str, findings=None, **extra) -> dict:
+    findings = list(findings or [])
+    diagnostic = finding("CI verification could not complete", error)
+    if diagnostic not in findings:
+        findings.append(diagnostic)
+    return response(findings, **{**extra, "ok": False, "error": error})
 
 
 def read_pr(nwo: str, pr_number: str, head_sha: str, deadline=None) -> dict:
@@ -161,25 +172,26 @@ def tracking(run: dict, action: str = "existing") -> dict:
         "id": run["id"], "workflow_id": run["workflow_id"], "head_sha": run["head_sha"],
         "expected_attempt": run["run_attempt"] + (1 if action == "rerun" else 0),
         "action": action, "execution_identity": list(execution_identity(run)),
+        "reason": (
+            "retried_failed" if action == "rerun" else
+            "approved_fork" if action == "approve" else
+            "reused_passing" if run["status"] == "completed" and run.get("conclusion") in PASSING
+            else "already_running" if run["status"] in ACTIVE else "discovered"
+        ),
     }
 
 
 def start(nwo: str, pr_number: str, head_sha: str) -> dict:
-    findings, tracked = [], []
+    findings, tracked, decisions = [], [], []
+    error = ""
     deadline = time.monotonic() + START_TIMEOUT
     try:
         validate_target(nwo, pr_number, head_sha)
         pr = read_pr(nwo, pr_number, head_sha, deadline)
         runs = discover(nwo, pr_number, head_sha, pr, deadline)
-        if not runs:
-            findings.append(finding(
-                "Unable to start or verify PR CI",
-                "No eligible Actions run is associated with this PR and reviewed head. "
-                "Check workflow triggers, fork approval policy and Actions permissions; "
-                "default-branch dispatch is not a substitute for testing the PR.",
-            ))
         for run in runs:
             action = "existing"
+            read_pr(nwo, pr_number, head_sha, deadline)
             try:
                 if run.get("conclusion") == "action_required":
                     if run["event"] != "pull_request":
@@ -189,37 +201,86 @@ def start(nwo: str, pr_number: str, head_sha: str) -> dict:
                     action, endpoint = "rerun", "rerun"
                 else:
                     tracked.append(tracking(run))
+                    decision = "Reused passing" if run["status"] == "completed" else "Already running"
+                    decisions.append(f"{decision}: {run_label(nwo, run)}")
                     continue
-                read_pr(nwo, pr_number, head_sha, deadline)
                 proc = command(["api", f"repos/{nwo}/actions/runs/{run['id']}/{endpoint}", "--method", "POST"], deadline)
                 if proc.returncode:
                     raise QueryError(proc.stderr.strip() or proc.stdout.strip() or "GitHub rejected the request.")
                 tracked.append(tracking(run, action))
+                decision = "Approved fork" if action == "approve" else "Retried failed"
+                decisions.append(
+                    f"{decision}: {run_label(nwo, run)}; "
+                    f"awaiting attempt {tracked[-1]['expected_attempt']}"
+                )
             except QueryError as exc:
                 findings.append(finding(f"Could not {action} PR CI", f"{run_label(nwo, run)}. {exc}"))
         read_pr(nwo, pr_number, head_sha, deadline)
     except QueryError as exc:
-        findings.append(finding("CI startup could not be verified", str(exc)))
+        error = str(exc)
+    extra = {
+        "run_ids": [item["id"] for item in tracked], "runs": tracked,
+        "nwo": nwo, "pr_number": str(pr_number), "reviewed_head_sha": head_sha,
+        "discovery_pending": not tracked and not error,
+    }
+    if error:
+        return fatal(error, findings, **extra)
+    if not tracked:
+        decisions.append(
+            "No Actions runs tracked yet; discovery is provisional. "
+            "Wait will rediscover runs and inspect external/required checks and Actions configuration."
+        )
     return response(
-        findings, run_ids=[item["id"] for item in tracked], runs=tracked,
-        nwo=nwo, pr_number=str(pr_number), reviewed_head_sha=head_sha,
-        **({"summary": f"Tracking {len(tracked)} PR CI run(s) for {head_sha}."} if not findings else {}),
+        findings, **extra,
+        summary="\n".join([
+            *decisions, *(f"{item['title']}: {item['body']}" for item in findings),
+        ]),
     )
 
 
-def failed_jobs(nwo: str, run: dict, deadline: float) -> str:
+def failed_jobs(nwo: str, run: dict, deadline: float) -> list[dict]:
     jobs = paginated(
         f"repos/{nwo}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100",
         "jobs", deadline,
     )
-    details = []
-    for job in jobs:
-        if not isinstance(job.get("conclusion"), str) or job["conclusion"] not in PASSING:
-            details.append(
-                f"{job.get('name') or 'Job'}: {job.get('status', 'unknown')}/"
-                f"{job.get('conclusion') or 'pending'} — {job.get('html_url') or run.get('html_url') or ''}"
-            )
-    return "; ".join(details)
+    return [
+        job for job in jobs
+        if not isinstance(job.get("conclusion"), str) or job["conclusion"] not in PASSING
+    ]
+
+
+def failure_identity(url: str | None) -> tuple | None:
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ("url", url)
+    if parsed.hostname == "github.com":
+        job = re.fullmatch(r"/([^/]+/[^/]+)/(?:actions/runs/\d+/job|runs)/(\d+)/?", parsed.path)
+        if job:
+            return ("job", job[1].lower(), job[2])
+        workflow = re.fullmatch(r"/([^/]+/[^/]+)/actions/runs/(\d+)/?", parsed.path)
+        if workflow:
+            return ("run", workflow[1].lower(), workflow[2])
+        check = re.fullmatch(r"/([^/]+/[^/]+)/checks", parsed.path)
+        check_ids = parse_qs(parsed.query).get("check_run_id", [])
+        if check and len(check_ids) == 1 and check_ids[0].isdigit():
+            return ("check", check[1].lower(), check_ids[0])
+    elif parsed.hostname == "api.github.com":
+        check = re.fullmatch(r"/repos/([^/]+/[^/]+)/check-runs/(\d+)", parsed.path)
+        if check:
+            return ("check", check[1].lower(), check[2])
+    return ("url", url)
+
+
+def enabled_workflows(nwo: str, deadline: float) -> list[dict]:
+    workflows = paginated(f"repos/{nwo}/actions/workflows?per_page=100", "workflows", deadline)
+    states = {"active", "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually"}
+    for workflow in workflows:
+        if not isinstance(workflow.get("state"), str) or workflow["state"] not in states:
+            raise QueryError("Could not determine enabled Actions workflows: unknown workflow state.")
+    return [workflow for workflow in workflows if workflow["state"] == "active"]
 
 
 def startup_findings(data) -> list[dict]:
@@ -232,15 +293,14 @@ def startup_findings(data) -> list[dict]:
         for item in findings
     ):
         raise QueryError("CI start input contains malformed findings.")
-    findings = list(findings)
-    if data.get("error"):
-        findings.append(finding("CI startup reported an error", str(data["error"])))
-    return findings
+    return list(findings)
 
 
 def validate_tracking(data: dict, nwo: str, pr_number: str, head_sha: str) -> list[dict]:
-    if data.get("ok") is not True:
-        raise QueryError(f"CI start failed: {data.get('error') or 'unknown error'}.")
+    if not isinstance(data.get("error"), str):
+        raise QueryError("CI start input contains a malformed error.")
+    if data.get("ok") is not True or data.get("error"):
+        raise QueryError(data["error"] or "CI start failed: unknown error.")
     if (data.get("nwo"), str(data.get("pr_number")), data.get("reviewed_head_sha")) != (nwo, str(pr_number), head_sha):
         raise QueryError("CI start tracking does not match this repository, PR and reviewed head.")
     runs = data.get("runs")
@@ -269,14 +329,11 @@ def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, po
     """Wait at most timeout seconds, preserving startup blockers and rerun attempt barriers."""
     findings, failures = [], []
     deadline = time.monotonic() + timeout
+    discovery_deadline = min(deadline, time.monotonic() + DISCOVERY_GRACE)
     try:
         findings = startup_findings(data)
         validate_target(nwo, pr_number, head_sha)
         tracked = validate_tracking(data, nwo, pr_number, head_sha)
-        if not tracked:
-            findings.append(finding("No PR CI runs to verify", "CI startup did not produce any tracked runs."))
-            read_pr(nwo, pr_number, head_sha, deadline)
-            return response(findings)
         while True:
             pr = read_pr(nwo, pr_number, head_sha, deadline)
             current = discover(nwo, pr_number, head_sha, pr, deadline)
@@ -289,7 +346,7 @@ def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, po
             for run in current:
                 if run["id"] not in known:
                     tracked.append(tracking(run))
-            pending, failures = [], []
+            pending, failures, represented = [], [], set()
             for item in tracked:
                 run = query(["api", f"repos/{nwo}/actions/runs/{item['id']}"], deadline)
                 if not isinstance(run, dict):
@@ -307,24 +364,64 @@ def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, po
                 elif item["action"] == "approve" and run.get("conclusion") == "action_required":
                     pending.append(f"Waiting for fork approval to take effect: {label}")
                 elif run.get("conclusion") not in PASSING:
-                    detail = failed_jobs(nwo, run, deadline)
-                    failures.append(finding("PR CI did not pass", f"{label}. {detail}".strip()))
+                    failure = finding("PR CI did not pass", label)
+                    failures.append(failure)
+                    jobs = failed_jobs(nwo, run, deadline)
+                    details = [
+                        f"{job.get('name') or 'Job'}: {job.get('status', 'unknown')}/"
+                        f"{job.get('conclusion') or 'pending'} — {job.get('html_url') or ''}"
+                        for job in jobs
+                    ]
+                    if details:
+                        failure["body"] += ". " + "; ".join(details)
+                    represented.add(("run", nwo.lower(), str(run["id"])))
+                    represented.add(failure_identity(run.get("html_url")))
+                    for job in jobs:
+                        if type(job.get("id")) is int and job["id"] > 0:
+                            represented.add(("job", nwo.lower(), str(job["id"])))
+                        represented.update(failure_identity(job.get(key)) for key in ("html_url", "check_run_url"))
+            represented.discard(None)
             checks = inspect_checks(nwo, pr_number, pr["base"]["ref"], deadline)
             pending.extend(checks["pending"])
-            failures.extend(finding("PR check did not pass", issue) for issue in checks["issues"])
+            for issue in checks["issues"]:
+                url = issue.rsplit(" — ", 1)[1] if " — " in issue else ""
+                identity = failure_identity(url)
+                if identity is None or identity not in represented:
+                    failures.append(finding("PR check did not pass", issue))
+            discovery_pending = False
+            if not tracked and enabled_workflows(nwo, deadline):
+                message = (
+                    "No eligible Actions run is associated with this PR and reviewed head, but enabled "
+                    "workflows exist. Their applicability is unknown; verify PR triggers, filters and "
+                    "fork policy. Default-branch dispatch does not verify the reviewed head."
+                )
+                if time.monotonic() < discovery_deadline:
+                    discovery_pending = True
+                    pending.append("Waiting for Actions discovery: " + message)
+                else:
+                    failures.append(finding("Actions applicability could not be verified", message))
             read_pr(nwo, pr_number, head_sha, deadline)
             if not pending:
-                return response(findings + failures)
+                no_ci = (
+                    not tracked and not checks["checks"] and not checks["required_names"]
+                    and not failures and not findings
+                )
+                return response(
+                    findings + failures, no_ci=no_ci,
+                    **({"summary": "No CI checks apply: no enabled Actions workflows, reported checks or required contexts."}
+                       if no_ci and not findings else {}),
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return response(findings + failures + [finding("CI verification timed out", "; ".join(pending))])
-            if remaining <= poll_interval:
+            delay = min(poll_interval, discovery_deadline - time.monotonic()) if discovery_pending else poll_interval
+            if remaining <= delay:
                 # Preserve actionable pending statuses when the next request would exceed the deadline.
                 time.sleep(max(0, remaining))
                 return response(findings + failures + [finding("CI verification timed out", "; ".join(pending))])
-            time.sleep(poll_interval)
+            time.sleep(max(0, delay))
     except QueryError as exc:
-        return response(findings + failures + [finding("CI verification could not complete", str(exc))])
+        return fatal(str(exc), findings + failures)
 
 
 def main(argv: list[str]) -> None:
@@ -337,7 +434,7 @@ def main(argv: list[str]) -> None:
         else:
             payload = wait(nwo, pr_number, head_sha, parse_json(sys.stdin.read(), "CI start input"))
     except QueryError as exc:
-        payload = response([finding("CI helper failed", str(exc))], run_ids=[])
+        payload = fatal(str(exc), run_ids=[])
     print(json.dumps(payload))
 
 

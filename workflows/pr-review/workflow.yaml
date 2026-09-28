@@ -31,7 +31,7 @@
 #     ↓                      drop
 #   apply_triage (script)    drop what you dropped, before a model sees it
 #     ↓
-#   comment_writer           [humanizer skill] final wording, inline anchors
+#   comment_writer           [humanizer skill] one structured body per approved ID
 #     ↓
 #   post_review (script)     one review, event=COMMENT, inline where it can
 #     ↓
@@ -55,7 +55,7 @@
 #     ↓
 #   followup_gate ──────────────→ approve / post the outstanding points /
 #     ↓                           post nothing
-#   followup_comment_writer      [humanizer skill] wording, inline anchors
+#   followup_comment_writer      [humanizer skill] one body per approved ID
 #     ↓
 #   post_followup_review         one review, event=COMMENT
 #     ↓
@@ -98,20 +98,10 @@
 #
 #   Approval and merging require separate decisions, with fresh readiness shown after approval.
 #
-#   `build_followup_questions` reconciles what came back against what went in.
-#   A point the analysis simply failed to mention would otherwise vanish, and
-#   the gate downstream would go on to tell you everything was settled — so
-#   any prior comment no entry cites is rebuilt from its own text and asked as
-#   `unclear`. Nothing reaches a terminal state without a human having seen it.
-#
-#   `followup_comment_writer` is handed no summary and no account of what
-#   changed, only the points that survived triage and the ones already
-#   settled. Both of those narratives are written before you decide anything,
-#   so either could name a point you went on to drop, and a dropped point
-#   reaching the author through a summary line is no better than one reaching
-#   them through a finding. The gates show you those narratives, because you
-#   are the one deciding; the model that writes the public text does not get
-#   them.
+#   Reconciliation requires explicit duplicate-source accounting for legacy summaries.
+#   Unexamined legacy sources stop; omitted verified code findings reach triage as unclear.
+#   Prior CI findings delegate to ci_wait rather than retain the model's earlier status.
+#   Writers receive only approved findings; Python creates the count-only summary.
 #
 # Targeting
 #   The reference may name a repository — `owner/repo#123`, or a full URL —
@@ -146,6 +136,7 @@
 #   leak a dropped one into a summary line, and the person whose pull request
 #   it is cannot tell that happened. Removing them first makes it impossible
 #   rather than discouraged.
+#   Publication validates exact ID coverage and checks fresh PR state/head before every POST.
 #
 # Triage
 #   Every finding is put to you individually, prefixed BLOCKING or RECOMMENDED.
@@ -236,8 +227,8 @@
 
 workflow:
   name: pr-review
-  description: Reviews repository fit before implementation quality, asks before repeating an unchanged review, reuses passing PR CI and reruns or approves only what needs it on both first and follow-up passes, waits for it, and includes CI problems as blocking findings for triage. Posts only the feedback you approve. Follow-up runs check earlier feedback instead of repeating a full review. After posting LGTM, shows current merge blockers and asks separately whether to squash-merge.
-  version: "1.3.0"
+  description: Reviews open pull requests for repository fit and implementation quality in isolated worktrees. Reuses passing CI, approves or retries runs only when needed, and reconciles current checks without duplicate findings. Follow-up runs track distinct earlier findings. Validates approved finding coverage and the reviewed head before publishing. Approval and squash-merge require separate decisions; stopped runs remain resumable until explicitly discarded.
+  version: "1.4.0"
   entry_point: bootstrap
 
   runtime:
@@ -334,9 +325,9 @@ agents:
       `found: false` and put the exact `gh` error in `notes`. Do not invent a
       pull request and do not open one.
 
-      A closed, merged or draft pull request is not a failure. Set
-      `found: true` and say so plainly in `notes`; the human decides whether
-      reviewing it is still worth doing.
+      Report closed, merged and draft pull requests with `found: true` and
+      their exact state. Closed or merged PRs stop before any review or CI.
+      Draft PRs may still be reviewed.
 
       Report it exactly as GitHub returned it. Do not paraphrase the title or
       body, and do not summarise or judge the change — that is the reviewers'
@@ -380,9 +371,19 @@ agents:
         when: "{{ not output.found }}"
       - to: wrong_repository
         when: "{{ output.name_with_owner | lower != bootstrap.output.name_with_owner | lower }}"
+      - to: pr_not_open
+        when: "{{ output.state != 'OPEN' }}"
       - to: author_gate
         when: "{{ output.author | lower == output.gh_user | lower or output.author | lower in bootstrap.output.gh_logins | map('lower') | list }}"
       - to: pr_worktree
+
+  - name: pr_not_open
+    type: terminate
+    status: success
+    input:
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.state
+    reason: "Stopped: {{ pr_resolver.output.pr_url }} is {{ pr_resolver.output.state }}. No worktree, review, CI action or publication was started."
 
   - name: wrong_repository
     type: terminate
@@ -558,6 +559,7 @@ agents:
       - pr_resolver.output.pr_title
       - pr_resolver.output.pr_url
       - pr_resolver.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.worktree_path
       - pr_worktree.output.branch
       - pr_worktree.output.remote
@@ -601,7 +603,7 @@ agents:
       The diff against the base branch is:
 
       ```
-      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      git diff {{ pr_worktree.output.base_sha }}...HEAD
       ```
 
       ## What to report
@@ -772,6 +774,8 @@ agents:
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
     routes:
+      - to: cleanup
+        when: "{{ not output.ok }}"
       - to: followup_review
         when: "{{ concept_review is not defined }}"
       - to: code_review
@@ -795,6 +799,7 @@ agents:
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_title
       - pr_resolver.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.worktree_path
       - pr_worktree.output.branch
       - pr_worktree.output.remote
@@ -829,7 +834,7 @@ agents:
       again. The diff under review is:
 
       ```
-      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      git diff {{ pr_worktree.output.base_sha }}...HEAD
       ```
 
       ## How to report findings
@@ -911,7 +916,7 @@ agents:
       - ci_wait.output.findings
     args:
       - "{{ workflow.dir }}/scripts/build_questions.py"
-    stdin: "{{ (code_review.output.findings + ci_wait.output.findings) | tojson }}"
+    stdin: '{"code_findings": {{ code_review.output.findings | tojson }}, "ci_findings": {{ ci_wait.output.findings | tojson }}}'
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
@@ -1030,7 +1035,7 @@ agents:
   # ---------------------------------------------------------------------------
 
   - name: comment_writer
-    description: Words the approved findings for the author and maps them to inline anchors, running every comment through the humanizer
+    description: Words each approved finding by ID, leaving placement and coverage validation to Python
     model: gpt-6-luna
     context_tier: long_context
     reasoning:
@@ -1068,7 +1073,7 @@ agents:
       severely than its label. The label wins. Write it at the weight it
       carries and let the wording follow.
 
-      Your job is wording and placement.
+      Your job is wording, not placement.
 
       Every comment goes through the `humanizer` skill before you return it.
       Apply it properly — draft, audit what still reads as machine-generated,
@@ -1083,7 +1088,7 @@ agents:
       Write a review of pull request #{{ pr_resolver.output.pr_number }} —
       **{{ pr_resolver.output.pr_title }}** — from a concept review. The human
       chose to publish these findings and stop, so no code review ran and there
-      are no line-level findings to place. Return an empty `inline_comments`.
+      are no line-level findings to place. Return an empty `items` array.
 
       The review body is the whole artefact. Lead with what the change is and
       the verdict, then the findings.
@@ -1132,9 +1137,7 @@ agents:
       {% endfor %}
       {% endif %}
 
-      Set `has_content: true`. The verdict, the assessment and the project-fit
-      judgement are always worth posting, so this path always produces a
-      review even when the finding lists happen to be short.
+      Return the concept review in `review_body`.
       {% else %}
       Write a review of pull request #{{ pr_resolver.output.pr_number }} —
       **{{ pr_resolver.output.pr_title }}**.
@@ -1171,58 +1174,37 @@ agents:
 
       ## How to lay it out
 
-      **`inline_comments`** carries every finding above that has a `path` and
-      a `line`. One object per finding:
+      Return one object in `items` for EVERY approved finding, including
+      findings with no line or path:
 
       ```json
-      {"path": "src/thing.ts", "line": 42, "body": "The comment, in markdown."}
+      {"finding_id": "b1", "body": "The complete finding, in markdown."}
       ```
 
-      Copy `path` and `line` from the finding exactly. Do not adjust, round or
-      guess a line — a comment that does not land on the diff gets folded into
-      the body automatically, which is a worse result than a correct anchor.
+      Copy the approved finding's `id` into `finding_id` exactly once.
+      Return only those two keys. Python uses the approved location to choose
+      inline or body placement; you never choose or invent an anchor.
 
       Include a ```suggestion``` block in the body wherever the fix is a short,
       concrete edit to those exact lines. Getting the indentation right matters:
       the author applies it with one click.
 
-      Prefix each inline comment with **BLOCKING** or **RECOMMENDED** so its
+      Prefix each finding with **BLOCKING** or **RECOMMENDED** so its
       weight is obvious without opening the summary.
 
-      **`review_body`** is the top-level comment. It holds:
-
-      - Two or three sentences on the state of the change, drawn from the
-        findings above and nothing else. If none of them are blocking, do not
-        imply the change cannot merge; if some are, say so plainly.
-      - A short list of the blocking findings by location, so the author can
-        see the shape of the work without reading every inline thread.
-      - Any finding above with no `path` or `line`, written out in full, since
-        it has nowhere else to go.
-
-      Do not repeat an inline comment's full text in the body. The author reads
-      both.
-
-      Every finding above must appear exactly once, either inline or in the
-      body. Set `has_content: true`.
-
-      Set `posted_count` to how many findings survived and appear in your
-      output, and `dropped_count` to how many you dropped. The two together
-      must equal the number of findings you were given, so a finding you
-      cannot place has to be counted somewhere rather than quietly vanishing.
+      Keep prose concise and limited to the approved findings. Do not write
+      a separate summary or repeat any finding. Set `review_body` to "" on
+      this path; Python generates a count-only summary and preserves each
+      finding exactly once. Never drop a finding you cannot anchor.
       {% endif %}
     output:
       review_body:
         type: string
-        description: The top-level review comment in markdown. Empty only when has_content is false.
-      inline_comments:
+        description: Concept-only review prose; empty for structured finding reviews.
+      items:
         type: array
-        description: 'One object per finding anchored to a line: {"path": "...", "line": 42, "body": "..."}. Empty when no surviving finding has a location.'
-      has_content:
-        type: boolean
-        description: False only when there is genuinely nothing to post. Both paths hand you content, so this is a safety net rather than a normal outcome.
+        description: 'Every approved ID exactly once as {"finding_id": "b1", "body": "Nonempty complete finding"}. Empty only on the concept-only path.'
     routes:
-      - to: cleanup
-        when: "{{ not output.has_content }}"
       - to: post_review
 
   - name: post_review
@@ -1235,20 +1217,27 @@ agents:
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
-      - pr_worktree.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.remote
       - comment_writer.output.review_body
-      - comment_writer.output.inline_comments
+      - comment_writer.output.items
+      - apply_triage.output.approved?
+      - concept_gate.output.selected?
     args:
       - "{{ workflow.dir }}/scripts/post_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
       - "{{ pr_worktree.output.worktree_path }}"
-      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.base_sha }}"
       - "{{ pr_worktree.output.remote }}"
       - "COMMENT"
-    stdin: '{"body": {{ comment_writer.output.review_body | tojson }}, "comments": {{ comment_writer.output.inline_comments | tojson }}}'
+    stdin: >-
+      {% if concept_gate is defined and concept_gate.output.selected == 'post_concept' %}
+      {"mode": "concept", "body": {{ comment_writer.output.review_body | tojson }}}
+      {% else %}
+      {"mode": "findings", "approved": {{ apply_triage.output.approved | tojson }}, "items": {{ comment_writer.output["items"] | tojson }}}
+      {% endif %}
     routes:
       - to: cleanup
 
@@ -1268,6 +1257,7 @@ agents:
       - pr_resolver.output.pr_title
       - pr_resolver.output.pr_url
       - pr_resolver.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.worktree_path
       - pr_worktree.output.branch
       - pr_worktree.output.remote
@@ -1322,7 +1312,7 @@ agents:
 
       ---
 
-      ### `{{ item.id }}` — {{ item.kind }}{% if item.path %} on `{{ item.path }}{% if item.line %}:{{ item.line }}{% endif %}`{% endif %}
+      ### `{{ item.id }}` — {{ item.kind }} (source type: {{ item.source_type }}){% if item.path %} on `{{ item.path }}{% if item.line %}:{{ item.line }}{% endif %}`{% endif %}
 
       {{ item.body }}
       {% if (item.replies | length) > 0 %}
@@ -1366,7 +1356,7 @@ agents:
       the whole diff and check every point against the current file:
 
       ```
-      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      git diff {{ pr_worktree.output.base_sha }}...HEAD
       ```
       {% else %}
 
@@ -1374,7 +1364,7 @@ agents:
       against the current file. The whole diff is:
 
       ```
-      git diff {{ pr_worktree.output.remote }}/{{ pr_resolver.output.base_ref }}...HEAD
+      git diff {{ pr_worktree.output.base_sha }}...HEAD
       ```
       {% endif %}
 
@@ -1389,7 +1379,8 @@ agents:
 
       ```json
       {
-        "source_id": "p3",
+        "source_ids": ["p1", "p3"],
+        "source_type": "code",
         "status": "not_addressed",
         "severity": "BLOCKING",
         "path": "src/thing.ts",
@@ -1401,8 +1392,19 @@ agents:
       }
       ```
 
-      - `source_id` is the `p...` id of the comment the point came from.
-        Several entries may share one.
+      - `source_ids` lists EVERY `p...` source of this distinct point, including
+        summary and inline duplicates. Several points may share one source
+        when a body raises multiple concerns. Do not count the summary as an
+        additional finding or discard its body-only points.
+      - `source_type` is `code` or `ci`. Items with verified `ci` provenance
+        belong to the final CI check, not a code-based status assessment.
+        Legacy CI-only points may be explicitly classified `ci`; split mixed
+        code/CI comments into separate points. Never label code feedback CI.
+      - `duplicate_sources` accounts for a legacy summary not cited in items:
+        {"source_id": "p1", "covered_by": ["p2", "p3"], "evidence": "Every point in p1 duplicates these examined sources."}
+        Use this ONLY after reading all its content. Every covered source
+        must itself be cited by an item. Body-only and additional points must
+        have their own entries, not be hidden by a duplicate mapping.
       - `status` is exactly one of:
         - `addressed` — the code now does what you asked.
         - `partially_addressed` — some of it landed and some did not. Say
@@ -1433,7 +1435,10 @@ agents:
     output:
       items:
         type: array
-        description: 'One object per point you made previously: {"source_id": "p3", "status": "addressed"|"partially_addressed"|"not_addressed"|"obsolete"|"unclear", "severity": "BLOCKING"|"RECOMMENDED", "path": "...", "line": 42, "title": "...", "original": "...", "evidence": "...", "recommendation": "..."}. `path` and `line` omitted when the point has no single location.'
+        description: 'One object per distinct point with source_ids, source_type (code or ci), status, severity, path, line, title, original, evidence and recommendation. Cite every duplicate source; split multi-point bodies.'
+      duplicate_sources:
+        type: array
+        description: 'Explicit whole-source duplicate accounting: {"source_id": "p1", "covered_by": ["p2", "p3"], "evidence": "Why all content is covered"}. Empty unless fully examined duplicates remain uncited.'
       summary:
         type: string
         description: Where the pull request now stands against your earlier review, in a few sentences
@@ -1453,16 +1458,13 @@ agents:
     timeout: 60
     input:
       - followup_review.output.items
+      - followup_review.output.duplicate_sources
       - prior_review.output.prior_items
       - ci_wait.output.findings
     args:
       - "{{ workflow.dir }}/scripts/build_followup_questions.py"
-    # The prior comments travel with the analysis so the script can check that
-    # every one of them was accounted for. An analysis that quietly omits a
-    # point would otherwise route straight to the clear gate, which then tells
-    # you everything was settled. Anything unaccounted for comes back as an
-    # unclear question rather than as silence.
-    stdin: '{"items": {{ followup_review.output["items"] | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}, "ci_findings": {{ ci_wait.output.findings | tojson }}}'
+    # Legacy sources must be examined before summary duplicates or superseded CI can be excluded.
+    stdin: '{"items": {{ followup_review.output["items"] | tojson }}, "duplicate_sources": {{ followup_review.output.duplicate_sources | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}, "ci_findings": {{ ci_wait.output.findings | tojson }}}'
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
@@ -1749,9 +1751,6 @@ agents:
       - pr_resolver.output.pr_title
       - prior_review.output.last_review_at
       - prior_review.output.last_interaction_at
-      - build_followup_questions.output.addressed_count
-      - build_followup_questions.output.obsolete_count
-      - build_followup_questions.output.resolved
       - apply_followup_triage.output.approved
       - apply_followup_triage.output.approved_count
       - apply_followup_triage.output.blocking_count
@@ -1771,18 +1770,16 @@ agents:
       what has changed, deliberately. Both are written before the human
       decides anything, so either could name a point they went on to drop, and
       a dropped point reaching the author through a summary line is no better
-      than one reaching them through a finding. Everything you have is either
-      a point they kept or a point that is settled.
+      than one reaching them through a finding. Everything you have is
+      a point they kept.
 
       The severity on each point is theirs, not the reviewer's. The label wins.
       Write it at the weight it carries and let the wording follow.
 
       Findings with status `ci` describe CI on this pass. Do not frame them as
       earlier feedback or imply the author has already been asked to fix them.
-      Write the other points as a second mention. Say what has
-      landed before what has not — it is true, it is short, and a follow-up
-      that opens on the same complaint reads as though the work in between did
-      not happen. Then be plain about what is still open. Do not re-argue a
+      Write the other points as a second mention. Credit partial progress
+      described in that approved point, then be plain about what remains. Do not re-argue a
       point from scratch, do not apologise for raising it again, and do not
       accuse anyone of ignoring it.
 
@@ -1798,22 +1795,7 @@ agents:
       #{{ pr_resolver.output.pr_number }} —
       **{{ pr_resolver.output.pr_title }}**.
 
-      You reviewed it on {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}. Since
-      then, {{ build_followup_questions.output.addressed_count }} of the points
-      you made {{ 'has' if build_followup_questions.output.addressed_count == 1 else 'have' }} been
-      addressed{% if build_followup_questions.output.obsolete_count %} and {{ build_followup_questions.output.obsolete_count }} no longer appl{{ 'ies' if build_followup_questions.output.obsolete_count == 1 else 'y' }}{% endif %}.
-      {% if (build_followup_questions.output.resolved | length) > 0 %}
-
-      ## What has landed
-
-      Open the review by crediting these. They are settled, so they are context
-      rather than findings — a sentence or two drawn from them, not a list
-      repeated back.
-
-      {% for item in build_followup_questions.output.resolved %}
-      - {{ item }}
-      {% endfor %}
-      {% endif %}
+      You reviewed it on {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}.
 
       ## The points to raise again
 
@@ -1855,64 +1837,31 @@ agents:
       register. `unclear` is a question, not a finding — you could not tell
       from the code, so ask.
 
-      **`inline_comments`** carries every point above that has a `path` and a
-      `line`. One object per point:
+      Return one object in `items` for EVERY approved point, including
+      body-only and CI findings:
 
       ```json
-      {"path": "src/thing.ts", "line": 42, "body": "The comment, in markdown."}
+      {"finding_id": "b1", "body": "The complete finding, in markdown."}
       ```
 
-      Copy `path` and `line` from the point exactly. Do not adjust, round or
-      guess a line — a comment that does not land on the diff gets folded into
-      the body automatically, which is a worse result than a correct anchor.
+      Copy its approved `id` into `finding_id` exactly once. Return only those
+      two keys. Python uses approved locations to compute placement and counts.
 
       Include a ```suggestion``` block in the body wherever what is left is a
       short, concrete edit to those exact lines. Getting the indentation right
       matters: the author applies it with one click.
 
-      Prefix each inline comment with **BLOCKING** or **RECOMMENDED** so its
+      Prefix each finding with **BLOCKING** or **RECOMMENDED** so its
       weight is obvious without opening the summary.
 
-      **`review_body`** is the top-level comment. It holds:
-
-      - One or two sentences on what has landed since your last review, drawn
-        from the settled points above.
-      - Two or three on what is still open, and whether it blocks.
-      - A short list of the blocking points by location, so the author can see
-        the shape of the remaining work without opening every thread.
-      - Any point above with no `path` or `line`, written out in full, since it
-        has nowhere else to go.
-
-      Do not repeat an inline comment's full text in the body. The author reads
-      both.
-
-      Every point above must appear exactly once, either inline or in the body.
-      Set `has_content: true`.
-
-      Set `posted_count` to how many of the points you were given appear in
-      your output and `dropped_count` to how many you could not place. The two
-      together must equal {{ apply_followup_triage.output.approved_count }}. A
-      `posted_count` below that stops the run rather than posting a follow-up
-      the human approved more of than it contains.
+      Keep the prose concise and limited to the approved points. Do not add
+      a summary or repeat findings. Never omit a point you cannot anchor;
+      the publisher preserves valid unanchorable content in the body.
     output:
-      review_body:
-        type: string
-        description: The top-level review comment in markdown. Empty only when has_content is false.
-      inline_comments:
+      items:
         type: array
-        description: 'One object per point anchored to a line: {"path": "...", "line": 42, "body": "..."}. Empty when no surviving point has a location.'
-      posted_count:
-        type: number
-        description: How many of the points you were given appear in your output, inline or in the body
-      dropped_count:
-        type: number
-        description: How many of the points you were given you could not place. Should be zero.
-      has_content:
-        type: boolean
-        description: False only when there is genuinely nothing to post. This path always hands you points, so it is a safety net rather than a normal outcome.
+        description: 'Every approved ID exactly once as {"finding_id": "b1", "body": "Nonempty complete finding"}. No model counts or anchors.'
     routes:
-      - to: cleanup
-        when: "{{ not output.has_content or (output.posted_count | int) < (apply_followup_triage.output.approved_count | int) }}"
       - to: post_followup_review
 
   - name: post_followup_review
@@ -1925,20 +1874,20 @@ agents:
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
-      - pr_worktree.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.remote
-      - followup_comment_writer.output.review_body
-      - followup_comment_writer.output.inline_comments
+      - followup_comment_writer.output.items
+      - apply_followup_triage.output.approved
     args:
       - "{{ workflow.dir }}/scripts/post_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
       - "{{ pr_worktree.output.worktree_path }}"
-      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.base_sha }}"
       - "{{ pr_worktree.output.remote }}"
       - "COMMENT"
-    stdin: '{"body": {{ followup_comment_writer.output.review_body | tojson }}, "comments": {{ followup_comment_writer.output.inline_comments | tojson }}}'
+    stdin: '{"mode": "findings", "approved": {{ apply_followup_triage.output.approved | tojson }}, "items": {{ followup_comment_writer.output["items"] | tojson }}}'
     routes:
       - to: cleanup
 
@@ -1952,7 +1901,7 @@ agents:
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
-      - pr_worktree.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.remote
     args:
       - "{{ workflow.dir }}/scripts/post_review.py"
@@ -1960,10 +1909,10 @@ agents:
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
       - "{{ pr_worktree.output.worktree_path }}"
-      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.base_sha }}"
       - "{{ pr_worktree.output.remote }}"
       - "APPROVE"
-    stdin: '{"body": "LGTM, thanks for contributing!", "comments": []}'
+    stdin: '{"mode": "approval", "body": "LGTM, thanks for contributing!"}'
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
@@ -2083,7 +2032,7 @@ agents:
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
-      - pr_worktree.output.base_ref
+      - pr_worktree.output.base_sha
       - pr_worktree.output.remote
       - followup_clear_gate.output.additional_input
     args:
@@ -2092,13 +2041,13 @@ agents:
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
       - "{{ pr_worktree.output.worktree_path }}"
-      - "{{ pr_worktree.output.base_ref }}"
+      - "{{ pr_worktree.output.base_sha }}"
       - "{{ pr_worktree.output.remote }}"
       - "COMMENT"
     # No agent reads this. A note you wrote yourself is already the wording you
     # want, and passing it through the writer would return something adjacent
     # to it that you never approved.
-    stdin: '{"body": {{ followup_clear_gate.output.additional_input.note | default("") | tojson }}, "comments": []}'
+    stdin: '{"mode": "note", "body": {{ followup_clear_gate.output.additional_input.note | default("") | tojson }}}'
     routes:
       - to: cleanup
 
@@ -2121,10 +2070,22 @@ agents:
       - "{{ pr_worktree.output.worktree_path if pr_worktree is defined else '' }}"
       - "{{ pr_worktree.output.branch if pr_worktree is defined else '' }}"
     routes:
+      - to: cleanup_report
+
+  - name: cleanup_report
+    type: set
+    input:
+      - cleanup.output.ok
+      - cleanup.output.worktree_removed
+      - cleanup.output.branch_deleted
+      - cleanup.output.notes
+    values:
+      summary: "Cleanup: worktree {{ 'removed' if cleanup.output.worktree_removed else 'not removed' }}; branch {{ 'deleted' if cleanup.output.branch_deleted else 'not deleted' }}.{% if not cleanup.output.ok %} Cleanup did not complete.{% endif %}{% if cleanup.output.notes %} {{ cleanup.output.notes }}{% endif %}"
+    routes:
       - to: prior_scan_failed
         when: "{{ prior_review is defined and not prior_review.output.ok }}"
       - to: ci_failed
-        when: "{{ ci_wait is defined and not ci_wait.output.ok }}"
+        when: "{{ (ci_start is defined and not ci_start.output.ok) or (ci_wait is defined and not ci_wait.output.ok) }}"
       - to: findings_unreadable
         when: "{{ (build_questions is defined and not build_questions.output.ok) or (build_followup_questions is defined and not build_followup_questions.output.ok) }}"
       - to: triage_failed
@@ -2139,8 +2100,6 @@ agents:
         when: "{{ merge_pr is defined and not merge_pr.output.ok }}"
       - to: followup_posted
         when: "{{ (post_followup_review is defined and post_followup_review.output.ok) or (post_approval is defined and post_approval.output.ok) or (post_note is defined and post_note.output.ok) }}"
-      - to: followup_not_written
-        when: "{{ followup_comment_writer is defined and post_followup_review is not defined }}"
       - to: no_review
 
   - name: prior_scan_failed
@@ -2149,7 +2108,8 @@ agents:
     input:
       - pr_resolver.output.pr_number
       - prior_review.output.error
-    reason: "Could not tell whether you have already reviewed #{{ pr_resolver.output.pr_number }}, so the run stopped rather than risk posting a second first-pass review over your own comments. The worktree has been removed. {{ prior_review.output.error }}"
+      - cleanup_report.output.summary
+    reason: "Could not tell whether you have already reviewed #{{ pr_resolver.output.pr_number }}, so the run stopped rather than risk posting a second first-pass review over your own comments. {{ prior_review.output.error }} {{ cleanup_report.output.summary }}"
 
   - name: findings_unreadable
     type: terminate
@@ -2157,14 +2117,18 @@ agents:
     input:
       - build_questions.output.error?
       - build_followup_questions.output.error?
-    reason: "The review produced findings that could not be read, so none of them reached you and nothing was posted. The worktree has been removed. {{ build_questions.output.error if build_questions is defined else build_followup_questions.output.error }}"
+      - cleanup_report.output.summary
+    reason: "The review produced findings that could not be read, so none of them reached you and nothing was posted. {{ build_questions.output.error if build_questions is defined else build_followup_questions.output.error }} {{ cleanup_report.output.summary }}"
 
   - name: ci_failed
     type: terminate
     status: failed
     input:
-      - ci_wait.output.error
-    reason: "CI results could not be incorporated into the review, so nothing was posted. {{ ci_wait.output.error }}"
+      - ci_start.output.error?
+      - ci_start.output.ok?
+      - ci_wait.output.error?
+      - cleanup_report.output.summary
+    reason: "CI could not safely proceed, so nothing was posted. {{ ci_start.output.error if ci_start is defined and not ci_start.output.ok else ci_wait.output.error }} {{ cleanup_report.output.summary }}"
 
   - name: triage_failed
     type: terminate
@@ -2172,7 +2136,8 @@ agents:
     input:
       - apply_triage.output.error?
       - apply_followup_triage.output.error?
-    reason: "Your triage decisions could not be applied, so nothing was posted. The worktree has been removed. {{ apply_triage.output.error if apply_triage is defined else apply_followup_triage.output.error }}"
+      - cleanup_report.output.summary
+    reason: "Your triage decisions could not be applied, so nothing was posted. {{ apply_triage.output.error if apply_triage is defined else apply_followup_triage.output.error }} {{ cleanup_report.output.summary }}"
 
   - name: review_posted
     type: terminate
@@ -2184,9 +2149,11 @@ agents:
       - apply_triage.output.reclassified_count?
       - post_review.output.review_url
       - post_review.output.inline_posted
-      - post_review.output.inline_demoted
+      - post_review.output.body_count
+      - post_review.output.posted_count
       - post_review.output.error
-    reason: "Posted a review on #{{ pr_resolver.output.pr_number }}{% if apply_triage is defined %} with {{ apply_triage.output.approved_count }} finding{{ 's' if apply_triage.output.approved_count != 1 else '' }} ({{ apply_triage.output.dropped_count }} dropped{% if apply_triage.output.reclassified_count %} and {{ apply_triage.output.reclassified_count }} reclassified{% endif %} at triage){% else %} from the concept review{% endif %}, {{ post_review.output.inline_posted }} anchored inline and {{ post_review.output.inline_demoted }} in the body. {{ post_review.output.review_url }}{% if post_review.output.error %} Note: {{ post_review.output.error }}{% endif %}"
+      - cleanup_report.output.summary
+    reason: "Posted a review on #{{ pr_resolver.output.pr_number }}{% if apply_triage is defined %} with {{ post_review.output.posted_count }} findings ({{ apply_triage.output.dropped_count }} dropped{% if apply_triage.output.reclassified_count %} and {{ apply_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_review.output.inline_posted }} anchored inline and {{ post_review.output.body_count }} in the body{% else %} from the concept review{% endif %}. {{ post_review.output.review_url }}{% if post_review.output.error %} Note: {{ post_review.output.error }}{% endif %} {{ cleanup_report.output.summary }}"
 
   - name: review_failed
     type: terminate
@@ -2194,7 +2161,8 @@ agents:
     input:
       - pr_resolver.output.pr_number
       - post_review.output.error
-    reason: "The review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_review.output.error }}"
+      - cleanup_report.output.summary
+    reason: "The review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_review.output.error }} {{ cleanup_report.output.summary }}"
 
   - name: followup_posted
     type: terminate
@@ -2213,9 +2181,11 @@ agents:
       - merge_pr.output.error?
       - post_followup_review.output.review_url?
       - post_followup_review.output.inline_posted?
-      - post_followup_review.output.inline_demoted?
+      - post_followup_review.output.body_count?
+      - post_followup_review.output.posted_count?
       - post_followup_review.output.error?
-    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; no review or CI findings were posted. {{ post_note.output.review_url }}{% else %}Posted {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} earlier points addressed, {{ apply_followup_triage.output.dropped_count }} findings let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.inline_demoted }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}"
+      - cleanup_report.output.summary
+    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; no review or CI findings were posted. {{ post_note.output.review_url }}{% else %}Posted {{ post_followup_review.output.posted_count }} findings from this follow-up pass on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} earlier points addressed, {{ apply_followup_triage.output.dropped_count }} findings let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.body_count }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %} {{ cleanup_report.output.summary }}"
 
   - name: followup_failed
     type: terminate
@@ -2225,7 +2195,8 @@ agents:
       - post_approval.output.error?
       - post_note.output.error?
       - post_followup_review.output.error?
-    reason: "{% if post_approval is defined %}The approval of #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_approval.output.error }}{% elif post_note is defined %}Your note on #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_note.output.error }}{% else %}The follow-up review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_followup_review.output.error }}{% endif %} The worktree has been removed."
+      - cleanup_report.output.summary
+    reason: "{% if post_approval is defined %}The approval of #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_approval.output.error }}{% elif post_note is defined %}Your note on #{{ pr_resolver.output.pr_number }} could not be posted. {{ post_note.output.error }}{% else %}The follow-up review of #{{ pr_resolver.output.pr_number }} was written but could not be posted. {{ post_followup_review.output.error }}{% endif %} {{ cleanup_report.output.summary }}"
 
   - name: merge_failed
     type: terminate
@@ -2235,18 +2206,8 @@ agents:
       - pr_resolver.output.pr_url
       - merge_pr.output.error
       - merge_pr.output.state
-    reason: "Approval for #{{ pr_resolver.output.pr_number }} was posted, but the merge could not be completed or confirmed. {{ merge_pr.output.error }} Check the current PR state and resolve the reported blockers before retrying. If the head changed, start a new review. {{ pr_resolver.output.pr_url }}"
-
-  - name: followup_not_written
-    type: terminate
-    status: failed
-    input:
-      - pr_resolver.output.pr_number
-      - pr_resolver.output.pr_url
-      - apply_followup_triage.output.approved_count
-      - followup_comment_writer.output.posted_count?
-      - followup_comment_writer.output.has_content?
-    reason: "You kept {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} to raise on #{{ pr_resolver.output.pr_number }}, but the review written from them {% if not followup_comment_writer.output.has_content %}came back empty{% else %}carried only {{ followup_comment_writer.output.posted_count }}{% endif %}. Nothing was posted: a follow-up missing points you approved is worse than none, because the ones it drops read as withdrawn. The worktree has been removed. {{ pr_resolver.output.pr_url }}"
+      - cleanup_report.output.summary
+    reason: "Approval for #{{ pr_resolver.output.pr_number }} was posted, but the merge could not be completed or confirmed. {{ merge_pr.output.error }} Check the current PR state and resolve the reported blockers before retrying. If the head changed, start a new review. {{ pr_resolver.output.pr_url }} {{ cleanup_report.output.summary }}"
 
   - name: no_review
     type: terminate
@@ -2254,7 +2215,8 @@ agents:
     input:
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_url
-    reason: "Nothing was posted to #{{ pr_resolver.output.pr_number }}. Either the review found nothing, you dropped every finding, or you stopped at a gate. The worktree has been removed. {{ pr_resolver.output.pr_url }}"
+      - cleanup_report.output.summary
+    reason: "Nothing was posted to #{{ pr_resolver.output.pr_number }}. Either the review found nothing, you dropped every finding, or you stopped at a gate. {{ pr_resolver.output.pr_url }} {{ cleanup_report.output.summary }}"
 
   - name: stopped
     type: terminate

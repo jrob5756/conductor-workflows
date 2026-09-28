@@ -3,14 +3,17 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "prior_review.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("prior_review", SCRIPT)
 prior_review = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prior_review)
+from review_format import render
 
 
 class ChangesSinceReviewTests(unittest.TestCase):
@@ -71,6 +74,56 @@ class ChangesSinceReviewTests(unittest.TestCase):
     def test_conversation_only_is_unknown(self):
         result = self.scan([], conversation=[{"user": {"login": "me"}, "body": "Question"}])
         self.assertEqual(result["change_status"], "unknown")
+
+    def test_structured_review_recovers_distinct_code_and_ci_not_summary(self):
+        findings = [
+            {"finding_id": "run:b1", "source_type": "code", "path": "a.py",
+             "line": 3, "body": "Fix the bug", "placement": "inline"},
+            {"finding_id": "run:b2", "source_type": "ci", "path": "",
+             "line": 0, "body": "CI is still running", "placement": "body"},
+            {"finding_id": "run:r1", "source_type": "code", "path": "",
+             "line": 0, "body": "Add coverage for both operations", "placement": "body"},
+        ]
+        review = {"id": 10, "user": {"login": "me"}, "body": render(findings),
+                  "state": "COMMENTED", "commit_id": "abc"}
+        inline = {"id": 20, "user": {"login": "me"}, "pull_request_review_id": 10,
+                  "path": "a.py", "original_line": 3, "body": "Fix the bug",
+                  "created_at": "2026-01-01"}
+        reply = {"id": 21, "user": {"login": "author"}, "in_reply_to_id": 20,
+                 "body": "Fixed", "created_at": "2026-01-02"}
+        result = self.scan([review], [inline, reply])
+        self.assertEqual(len(result["prior_items"]), 3)
+        self.assertEqual([item["source_type"] for item in result["prior_items"]],
+                         ["code", "ci", "code"])
+        self.assertEqual(result["prior_items"][0]["replies"][0]["body"], "Fixed")
+        self.assertEqual([item["finding_id"] for item in result["prior_items"]],
+                         [item["finding_id"] for item in findings])
+
+    def test_edited_summary_and_unrecognized_metadata_remain_reviewable(self):
+        finding = {"finding_id": "run:b1", "source_type": "code", "path": "",
+                   "line": 0, "body": "Body-only bug", "placement": "body"}
+        for body in (
+            "Extra unexamined concern\n" + render([finding]),
+            "Review text\n\n<!-- conductor-review:v1:broken -->",
+            "First issue. Second issue.",
+        ):
+            with self.subTest(body=body):
+                result = self.scan([{"id": 10, "user": {"login": "me"},
+                                     "body": body, "state": "COMMENTED"}])
+                self.assertEqual(result["prior_items"][0]["body"], body)
+                self.assertEqual(result["prior_items"][0]["source_type"], "legacy")
+
+    def test_changed_inline_text_is_not_suppressed_by_manifest(self):
+        finding = {"finding_id": "run:b1", "source_type": "code", "path": "a.py",
+                   "line": 3, "body": "Original point", "placement": "inline"}
+        result = self.scan(
+            [{"id": 10, "user": {"login": "me"}, "body": render([finding]),
+              "state": "COMMENTED"}],
+            [{"id": 20, "user": {"login": "me"}, "pull_request_review_id": 10,
+              "path": "a.py", "line": 3, "body": "Additional concern"}],
+        )
+        self.assertEqual(len(result["prior_items"]), 2)
+        self.assertIn("Additional concern", [item["body"] for item in result["prior_items"]])
 
 
 if __name__ == "__main__":

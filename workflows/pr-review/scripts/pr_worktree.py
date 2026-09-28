@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
-"""Check a pull request out into a throwaway git worktree.
-
-The worktree is read-only as far as this workflow is concerned - nothing is
-ever written to it - so the checkout is rebuilt from scratch on every run
-rather than reconciled. That makes the step idempotent: a worktree or branch
-left behind by an interrupted run is removed and recreated, not worked around.
-
-`pull/<n>/head` is fetched rather than the head branch, which is what makes
-this work identically for a fork PR and a same-repository one.
-
-Usage:
-    pr_worktree.py <repo_root> <worktrees_dir> <pr_number> <name_with_owner> <base_ref>
-
-Output:
-    ok, error, worktree_path, branch, base_ref, remote, head_sha
-"""
+"""Create a uniquely owned PR checkout; interrupted reviews remain resumable."""
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
+import uuid
+
+from worktree_lifecycle import (
+    LifecycleError, git, ref_sha, registry, remove_owned, runner_context, safe_path, write_record,
+)
 
 
 def emit(payload: dict[str, object]) -> None:
@@ -35,7 +24,7 @@ def run(args: list[str]) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def fail(message: str) -> None:
+def fail(message: str, **provenance: object) -> None:
     emit(
         {
             "ok": False,
@@ -45,6 +34,9 @@ def fail(message: str) -> None:
             "base_ref": "",
             "remote": "",
             "head_sha": "",
+            "base_sha": "",
+            "ownership_id": "",
+            **provenance,
         }
     )
 
@@ -70,19 +62,6 @@ def resolve_remote(repo_root: str, name_with_owner: str) -> str:
     return matches[0] if matches else "origin"
 
 
-def discard_existing(repo_root: str, worktree_path: str, branch: str) -> None:
-    """Remove a worktree and branch left over from an earlier run."""
-    run(["git", "-C", repo_root, "worktree", "prune"])
-    if os.path.isdir(worktree_path):
-        run(["git", "-C", repo_root, "worktree", "remove", "--force", worktree_path])
-    if os.path.isdir(worktree_path):
-        shutil.rmtree(worktree_path, ignore_errors=True)
-        run(["git", "-C", repo_root, "worktree", "prune"])
-    # Deleted only after the worktree is gone; git refuses while one holds it.
-    if run(["git", "-C", repo_root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])[0] == 0:
-        run(["git", "-C", repo_root, "branch", "-D", branch])
-
-
 def main(argv: list[str]) -> None:
     if len(argv) < 4:
         fail("pr_worktree.py requires repo_root, worktrees_dir, pr_number and name_with_owner")
@@ -93,51 +72,65 @@ def main(argv: list[str]) -> None:
     if not pr_number.isdigit():
         fail(f"Pull request number is not numeric: {pr_number!r}")
 
-    branch = f"pr-review/{pr_number}"
-    worktrees_dir = os.path.abspath(os.path.expanduser(worktrees_dir))
-    worktree_path = os.path.join(worktrees_dir, f"pr-{pr_number}")
-    remote = resolve_remote(repo_root, name_with_owner)
-
-    discard_existing(repo_root, worktree_path, branch)
-    os.makedirs(worktrees_dir, exist_ok=True)
-
-    rc, _, err = run(
-        [
-            "git",
-            "-C",
-            repo_root,
-            "fetch",
-            "--force",
-            remote,
-            f"pull/{pr_number}/head:{branch}",
-        ]
-    )
-    if rc != 0:
-        fail(
-            f"Could not fetch pull/{pr_number}/head from remote '{remote}'. "
-            f"Check the PR number and your access to {name_with_owner}. {err}"
-        )
-
-    # The base branch is needed later to diff the PR. A shallow or partial
-    # clone may not have it, and a stale remote-tracking ref moves the merge
-    # base backwards, which quietly widens the reviewed diff with commits the
-    # pull request never touched.
-    if base_ref:
-        rc, _, err = run(["git", "-C", repo_root, "fetch", "--force", remote, base_ref])
-        if rc != 0:
-            fail(
-                f"Could not fetch the base branch '{base_ref}' from remote '{remote}'. "
-                f"Reviewing against a stale base would show changes this pull request "
-                f"did not make. {err}"
-            )
-
-    rc, _, err = run(["git", "-C", repo_root, "worktree", "add", worktree_path, branch])
-    if rc != 0:
-        fail(f"Could not create a worktree at {worktree_path}. {err}")
-
-    rc, head_sha, err = run(["git", "-C", worktree_path, "rev-parse", "HEAD"])
-    if rc != 0 or not head_sha:
-        fail(f"Worktree at {worktree_path} is not a usable git checkout. {err}")
+    ownership_id = uuid.uuid4().hex
+    branch = f"pr-review/{pr_number}-{ownership_id}"
+    record = None
+    remote = ""
+    try:
+        repo_root = str(safe_path(repo_root))
+        worktrees = safe_path(worktrees_dir)
+        worktree_path = str(worktrees / f"pr-{pr_number}-{ownership_id}")
+        if worktrees == safe_path(repo_root) or safe_path(repo_root) in worktrees.parents:
+            raise LifecycleError("Review worktrees must live outside the repository checkout.")
+        if base_ref:
+            git(repo_root, "check-ref-format", f"refs/heads/{base_ref}")
+        context = runner_context()
+        remote = resolve_remote(repo_root, name_with_owner)
+        with registry(repo_root) as (directory, common):
+            if os.path.lexists(worktree_path) or ref_sha(repo_root, f"refs/heads/{branch}"):
+                raise LifecycleError("Unique review identity already exists; nothing overwritten.")
+            base_pin = f"refs/pr-review/{ownership_id}/base"
+            if ref_sha(repo_root, base_pin):
+                raise LifecycleError("Unique base identity already exists; nothing overwritten.")
+            record = {
+                "version": 1, "ownership_id": ownership_id, "repo_root": repo_root,
+                "common_dir": common, "worktree_path": worktree_path, "branch": branch,
+                "head_sha": "", "base_sha": "", "base_ref": base_ref, "base_pin": base_pin,
+                "worktree_identity": None, **context,
+            }
+            write_record(directory, record, create=True)
+            try:
+                worktrees.mkdir(parents=True, exist_ok=True)
+                git(repo_root, "fetch", "--no-write-fetch-head", "--", remote,
+                    f"pull/{pr_number}/head:refs/heads/{branch}")
+                record["head_sha"] = git(repo_root, "rev-parse", f"refs/heads/{branch}^{{commit}}")
+                write_record(directory, record)
+                if base_ref:
+                    git(repo_root, "fetch", "--no-write-fetch-head", "--", remote,
+                        f"refs/heads/{base_ref}:{base_pin}")
+                    record["base_sha"] = git(repo_root, "rev-parse", f"{base_pin}^{{commit}}")
+                    write_record(directory, record)
+                git(repo_root, "worktree", "add", "--", worktree_path, branch)
+                info = safe_path(worktree_path).stat()
+                record["worktree_identity"] = [info.st_dev, info.st_ino]
+                write_record(directory, record)
+                if git(worktree_path, "rev-parse", "HEAD") != record["head_sha"]:
+                    raise LifecycleError("Created checkout does not match the fetched review head.")
+            except (LifecycleError, OSError) as exc:
+                try:
+                    remove_owned(repo_root, record)
+                    (directory / f"{ownership_id}.json").unlink()
+                except (LifecycleError, OSError) as cleanup_error:
+                    raise LifecycleError(
+                        f"{exc} Partial resources retained at {worktree_path}: {cleanup_error}"
+                    ) from exc
+                raise
+    except (LifecycleError, OSError) as exc:
+        fail(str(exc), **({
+            "worktree_path": record["worktree_path"], "branch": branch,
+            "ownership_id": ownership_id, "head_sha": record["head_sha"],
+            "base_sha": record["base_sha"], "base_ref": base_ref,
+        } if record else {}))
 
     emit(
         {
@@ -147,7 +140,9 @@ def main(argv: list[str]) -> None:
             "branch": branch,
             "base_ref": base_ref,
             "remote": remote,
-            "head_sha": head_sha,
+            "head_sha": record["head_sha"],
+            "base_sha": record["base_sha"],
+            "ownership_id": ownership_id,
         }
     )
 
