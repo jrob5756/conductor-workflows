@@ -138,16 +138,27 @@ def check_rows(nwo: str, pr_number: str, required: bool, deadline=None) -> list[
     return rows
 
 
-def inspect_checks(nwo: str, pr_number: str, base: str, deadline=None) -> dict:
+def validate_ignored_checks(value) -> set[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(name, str) or not name.strip() or name != name.strip()
+        for name in value
+    ):
+        raise QueryError("ignored_checks must be a JSON array of nonempty exact check names.")
+    return set(value)
+
+
+def inspect_checks(nwo: str, pr_number: str, base: str, deadline=None, *, ignored_checks=None) -> dict:
     """Return failing and pending checks; raise QueryError if their configuration is unknown."""
+    excluded = validate_ignored_checks([] if ignored_checks is None else ignored_checks)
     configured = required_contexts(nwo, pr_number, base, deadline)
     rows = check_rows(nwo, pr_number, False, deadline)
     required = check_rows(nwo, pr_number, True, deadline)
-    issues, pending = [], []
+    issues, pending, ignored = [], [], []
     required_names = configured | {row["name"] for row in required}
     names = {row["name"] for row in rows}
     for name in sorted(required_names - names):
-        pending.append(f"Required check {name!r} is missing (no result reported).")
+        message = f"Required check {name!r} is missing (no result reported)."
+        (ignored if name in excluded else pending).append(message)
     seen = set()
     for row in [*rows, *required]:
         label = f"{row.get('workflow') or 'Check'} / {row['name']}: {row['state']}"
@@ -156,6 +167,9 @@ def inspect_checks(nwo: str, pr_number: str, base: str, deadline=None) -> dict:
         if label in seen:
             continue
         seen.add(label)
+        if row["name"] in excluded:
+            ignored.append(label)
+            continue
         bucket = row["bucket"]
         state = str(row["state"]).upper()
         if bucket == "pending" or state in {"EXPECTED", "PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"}:
@@ -168,6 +182,7 @@ def inspect_checks(nwo: str, pr_number: str, base: str, deadline=None) -> dict:
         "issues": issues, "pending": pending, "checks": rows,
         "required_names": sorted(required_names),
         "no_checks_configured": not required_names,
+        "ignored": ignored,
     }
 
 

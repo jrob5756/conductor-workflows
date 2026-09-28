@@ -341,6 +341,55 @@ class StartTests(unittest.TestCase):
 
 
 class WaitTests(unittest.TestCase):
+    def test_queued_cla_is_excluded_without_waiting_and_is_disclosed(self):
+        from merge_readiness import inspect_checks
+
+        module = sys.modules[inspect_checks.__module__]
+        cla = {"name": "license/cla", "state": "QUEUED", "bucket": "pending",
+               "workflow": "", "link": "https://github.com/apps/microsoft-github-policy-service"}
+        for exclusions in (["license/cla"], []):
+            with self.subTest(exclusions=exclusions), patch.object(ci, "read_pr", return_value=PR), \
+                    patch.object(ci, "discover", return_value=[]), \
+                    patch.object(ci, "query", return_value=run(run_attempt=2)), \
+                    patch.object(module, "required_contexts", return_value={"license/cla"}), \
+                    patch.object(module, "check_rows", return_value=[cla]), \
+                    patch.object(ci.time, "sleep") as sleep:
+                result = ci.wait("owner/repo", "1", SHA, start_data(), timeout=0.01,
+                                 ignored_checks=exclusions)
+            self.assertTrue(result["ok"])
+            if exclusions:
+                self.assertFalse(result["findings"])
+                sleep.assert_not_called()
+                self.assertIn("license/cla", result["summary"])
+                self.assertIn("merge requirements still apply", result["summary"])
+                self.assertIn("Non-excluded CI verified", result["summary"])
+            else:
+                self.assertIn("timed out", result["summary"])
+
+    def test_excluded_check_does_not_suppress_underlying_actions_failure(self):
+        with patch.object(ci, "read_pr", return_value=PR), \
+                patch.object(ci, "discover", return_value=[]), \
+                patch.object(ci, "query", return_value=run(run_attempt=2, conclusion="failure")), \
+                patch.object(ci, "failed_jobs", return_value=[]), \
+                patch.object(ci, "inspect_checks", return_value={**CHECKS, "ignored": ["license/cla: FAILURE"]}):
+            result = ci.wait("owner/repo", "1", SHA, start_data(), ignored_checks=["license/cla"])
+        self.assertTrue(result["findings"])
+        self.assertIn("PR CI did not pass", result["summary"])
+        self.assertIn("license/cla: FAILURE", result["summary"])
+
+    def test_cli_accepts_explicit_exclusions_and_rejects_bad_shapes(self):
+        with patch.object(ci, "wait", return_value=ci.response()) as wait, \
+                patch.object(sys, "stdin", io.StringIO(json.dumps(start_data()))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ci.main(["wait", "owner/repo", "1", SHA, '["license/cla"]'])
+        self.assertEqual(wait.call_args.kwargs["ignored_checks"], ["license/cla"])
+        for raw in ('null', '"license/cla"', '[""]', 'not JSON'):
+            with self.subTest(raw=raw), patch.object(ci, "wait") as wait, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                ci.main(["wait", "owner/repo", "1", SHA, raw])
+            wait.assert_not_called()
+            self.assertFalse(json.loads(out.getvalue())["ok"])
+
     def wait(self, current, data=None, checks=None, timeout=0.01):
         with patch.object(ci, "read_pr", return_value=PR), patch.object(
             ci, "discover", return_value=[],

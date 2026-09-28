@@ -237,6 +237,10 @@ def main(argv: list[str]) -> None:
     if mode == "findings":
         if event != "COMMENT":
             fail("Finding reviews must use COMMENT.")
+        opening = parsed.get("opening")
+        if not isinstance(opening, str) or not opening.strip():
+            fail("Finding reviews require a nonempty opening.")
+        opening = opening.strip()
         try:
             findings = validate_findings(parsed)
         except ValueError as exc:
@@ -249,7 +253,7 @@ def main(argv: list[str]) -> None:
                 inline.append({"path": path, "line": line, "side": "RIGHT", "body": item["body"]})
             elif path and line:
                 demoted += 1
-        body = render(findings)
+        body = render(findings, opening)
     elif mode in ("concept", "note", "approval"):
         if (mode == "approval") != (event == "APPROVE"):
             fail("Approval mode and event must agree.")
@@ -286,7 +290,7 @@ def main(argv: list[str]) -> None:
     for item in findings:
         item["placement"] = "body"
     retry_url, retry_error, _ = post(
-        nwo, pr_number, {"commit_id": head_sha, "event": event, "body": render(findings)}
+        nwo, pr_number, {"commit_id": head_sha, "event": event, "body": render(findings, opening)}
     )
     if not retry_url:
         fail(f"Could not post the review: {error}. Retry without inline comments: {retry_error}")

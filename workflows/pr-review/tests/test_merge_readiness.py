@@ -43,6 +43,17 @@ class ReadinessTests(unittest.TestCase):
         self.assertTrue(result["can_merge"])
         self.assertEqual(result["issues"], [])
 
+    def test_merge_readiness_still_waits_for_default_review_exclusion(self):
+        cla = check(name="license/cla", state="QUEUED", bucket="pending", workflow="",
+                    link="https://github.com/apps/microsoft-github-policy-service")
+        with patch.object(readiness, "query", side_effect=[pr(), {"headRefOid": SHA}]), \
+                patch.object(readiness, "required_contexts", return_value={"license/cla"}), \
+                patch.object(readiness, "check_rows", return_value=[cla]):
+            result = readiness.inspect_readiness("owner/repo", "1", SHA)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["can_merge"])
+        self.assertIn("license/cla", result["summary"])
+
     def test_each_ineligible_state_blocks(self):
         cases = [
             {"headRefOid": "b" * 40}, {"state": "CLOSED"}, {"state": "MERGED"},
@@ -128,11 +139,40 @@ class ReadinessTests(unittest.TestCase):
 
 
 class CheckTests(unittest.TestCase):
-    def inspect(self, rows, required=(), configured=()):
+    def inspect(self, rows, required=(), configured=(), ignored_checks=None):
         with patch.object(readiness, "required_contexts", return_value=set(configured)), patch.object(
             readiness, "check_rows", side_effect=[rows, list(required)],
         ):
-            return readiness.inspect_checks("owner/repo", "1", "main")
+            return readiness.inspect_checks("owner/repo", "1", "main", ignored_checks=ignored_checks)
+
+    def test_exact_exclusions_skip_queued_failed_and_missing_checks_only_for_review(self):
+        for state, bucket in (("QUEUED", "pending"), ("FAILURE", "fail"), ("SUCCESS", "pass")):
+            row = check(name="license/cla", state=state, bucket=bucket,
+                        workflow="", link="https://github.com/apps/microsoft-github-policy-service")
+            with self.subTest(state=state):
+                reviewed = self.inspect([row], [row], ["license/cla"], ["license/cla"])
+                self.assertFalse(reviewed["issues"] or reviewed["pending"])
+                self.assertEqual(len(reviewed["ignored"]), 1)
+                self.assertIn(state, reviewed["ignored"][0])
+                strict = self.inspect([row], [row], ["license/cla"])
+                self.assertEqual(bool(strict["issues"] or strict["pending"]), state != "SUCCESS")
+        missing = self.inspect([], configured=["license/cla", "build"], ignored_checks=["license/cla"])
+        self.assertEqual(len(missing["pending"]), 1)
+        self.assertIn("build", missing["pending"][0])
+        self.assertIn("license/cla", missing["ignored"][0])
+
+    def test_exclusions_are_case_sensitive_not_substrings_or_globs(self):
+        for names in ([], ["cla"], ["license/*"], ["LICENSE/CLA"]):
+            result = self.inspect([check(name="license/cla", state="QUEUED", bucket="pending")],
+                                  ignored_checks=names)
+            self.assertEqual(len(result["pending"]), 1)
+
+    def test_malformed_exclusions_fail_before_query(self):
+        for value in ("license/cla", {}, [None], [""], [" build"], [42]):
+            with self.subTest(value=value), patch.object(readiness, "required_contexts") as query:
+                with self.assertRaises(readiness.QueryError):
+                    readiness.inspect_checks("owner/repo", "1", "main", ignored_checks=value)
+                query.assert_not_called()
 
     def test_status_categories_including_external_and_required(self):
         cases = [

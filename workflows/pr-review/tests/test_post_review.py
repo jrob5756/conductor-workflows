@@ -1,4 +1,5 @@
 import contextlib
+import base64
 import copy
 import io
 import json
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import post_review
-from review_format import recover
+from review_format import recover, visible_body
 
 
 DIFF = """diff --git a/code.py b/code.py
@@ -32,6 +33,7 @@ OPEN = {"state": "open", "merged": False, "head": {"sha": "head"}}
 def finding_payload(count=1):
     return {
         "mode": "findings",
+        "opening": "Thanks for working on this. I found a few points to address before moving forward.",
         "approved": [
             {"id": f"b{i}", "body": f"Original {i}", "path": "code.py", "line": i,
              "source_type": "code"}
@@ -73,6 +75,7 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual((result["posted_count"], result["inline_posted"],
                           result["body_count"], result["inline_demoted"]), (10, 8, 2, 0))
         posted = json.loads(calls[-1][1])
+        self.assertTrue(posted["body"].startswith(payload["opening"] + "\n\n10 approved findings"))
         self.assertEqual(posted["commit_id"], "head")
         self.assertEqual(len(posted["comments"]), 8)
         recovered = recover(posted["body"])
@@ -147,6 +150,8 @@ class PublishingTests(unittest.TestCase):
         retry = json.loads(calls[-1][1])
         self.assertNotIn("comments", retry)
         self.assertEqual(retry["commit_id"], "head")
+        self.assertTrue(retry["body"].startswith(payload["opening"] + "\n\n"))
+        self.assertEqual(retry["body"].count(payload["opening"]), 1)
         self.assertEqual([f["body"] for f in recover(retry["body"])],
                          [i["body"] for i in payload["items"]])
 
@@ -194,6 +199,43 @@ class PublishingTests(unittest.TestCase):
         original = copy.deepcopy(payload)
         self.execute(payload)
         self.assertEqual(payload, original)
+
+    def test_missing_or_invalid_opening_never_reaches_api(self):
+        for opening in (None, "", " \n ", [], {}):
+            with self.subTest(opening=opening):
+                payload = finding_payload()
+                payload["opening"] = opening
+                result, calls = self.execute(payload)
+                self.assertFalse(result["ok"])
+                self.assertEqual(calls, [])
+        payload = finding_payload()
+        del payload["opening"]
+        result, calls = self.execute(payload)
+        self.assertFalse(result["ok"])
+        self.assertEqual(calls, [])
+
+    def test_opening_is_not_recovered_as_a_finding_and_edits_invalidate_provenance(self):
+        payload = finding_payload()
+        result, calls = self.execute(payload)
+        self.assertTrue(result["ok"])
+        body = json.loads(calls[-1][1])["body"]
+        findings = recover(body)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["body"], "Written finding 1")
+        self.assertIsNone(recover(body.replace(payload["opening"], "A new concern.")))
+        encoded = base64.urlsafe_b64encode(json.dumps(findings).encode()).decode()
+        legacy = visible_body(findings) + f"\n\n<!-- conductor-review:v1:{encoded} -->"
+        self.assertEqual(recover(legacy), findings)
+
+    def test_tailored_approval_body_is_posted_without_fixed_signoff(self):
+        for body in (
+            "Looks good. Thanks for fixing the timeout handling!",
+            "LGTM, thanks for adding the export option.",
+        ):
+            with self.subTest(body=body):
+                result, calls = self.execute({"mode": "approval", "body": body}, event="APPROVE")
+                self.assertTrue(result["ok"])
+                self.assertEqual(json.loads(calls[-1][1])["body"], body)
 
 
 if __name__ == "__main__":

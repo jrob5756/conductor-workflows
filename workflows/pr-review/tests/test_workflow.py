@@ -123,10 +123,13 @@ class WorkflowRoutingTests(unittest.TestCase):
         self.assertEqual(self.route("build_questions", {"ok": True, "question_count": 0}), "review_clear_gate")
         self.assertEqual(self.route("apply_triage", {"ok": True, "approved_count": 0}), "review_clear_gate")
         self.assertEqual(self.route("apply_triage", {"ok": False}), "cleanup")
-        self.assertEqual(self.agents["review_clear_gate"]["options"][0]["route"], "post_approval")
+        self.assertEqual(self.agents["review_clear_gate"]["options"][0]["route"], "approval_writer")
 
     def test_approval_and_merge_are_separate(self):
-        self.assertEqual(self.route("post_approval", {"ok": True}), "merge_readiness")
+        self.assertEqual(self.route("post_approval", {"ok": True},
+                                    workflow={"input": {"merge": True}}), "merge_readiness")
+        self.assertEqual(self.route("post_approval", {"ok": True},
+                                    workflow={"input": {"merge": False}}), "cleanup")
         self.assertEqual(self.route("post_approval", {"ok": False}), "cleanup")
         self.assertEqual(self.route("merge_readiness", {"ok": True, "can_merge": True}), "merge_gate")
         self.assertEqual(self.route("merge_readiness", {"ok": True, "can_merge": False}), "merge_blocked_gate")
@@ -158,6 +161,23 @@ class WorkflowRoutingTests(unittest.TestCase):
             self.document["workflow"]["description"],
         )
 
+    def test_repository_policy_inputs_and_review_only_exclusions(self):
+        import json
+
+        inputs = self.document["workflow"]["input"]
+        self.assertEqual(inputs["ignored_checks"]["default"], ["license/cla"])
+        self.assertIs(inputs["merge"]["default"], True)
+        self.assertEqual(inputs["merge"]["type"], "boolean")
+        for excluded in ([], ["license/cla"], ["other/check"]):
+            argument = self.jinja.from_string(self.agents["ci_wait"]["args"][-1]).render(
+                workflow={"input": {"ignored_checks": excluded}}
+            )
+            self.assertEqual(json.loads(argument), excluded)
+        for name in ("merge_readiness", "merge_pr"):
+            self.assertNotIn("workflow.input.ignored_checks", self.agents[name]["input"])
+        for name in ("review_clear_gate", "followup_gate", "followup_clear_gate", "post_approval"):
+            self.assertIn("workflow.input.merge", self.agents[name]["input"])
+
     def test_closed_merged_and_unknown_states_stop_before_own_pr_gate(self):
         context = {"bootstrap": {"output": {"name_with_owner": "owner/repo",
                                             "gh_logins": ["me"]}}}
@@ -173,6 +193,7 @@ class WorkflowRoutingTests(unittest.TestCase):
 
         approved = [{"id": "b1", "body": "CI failure", "path": "", "line": 0}]
         items = [{"finding_id": "b1", "body": "CI did not pass"}]
+        opening = 'Thanks for working on "exports".\nA few points need attention.'
         for writer, publisher, triage in (
             ("comment_writer", "post_review", "apply_triage"),
             ("followup_comment_writer", "post_followup_review", "apply_followup_triage"),
@@ -181,10 +202,11 @@ class WorkflowRoutingTests(unittest.TestCase):
             self.assertNotIn("posted_count", self.agents[writer]["output"])
             self.assertEqual(self.route(writer, {"items": []}), publisher)
             rendered = self.jinja.from_string(self.agents[publisher]["stdin"]).render(
-                **{writer: {"output": {"items": items}}, triage: {"output": {"approved": approved}}}
+                **{writer: {"output": {"items": items, "opening": opening}},
+                   triage: {"output": {"approved": approved}}}
             )
             self.assertEqual(json.loads(rendered), {
-                "mode": "findings", "items": items, "approved": approved,
+                "mode": "findings", "opening": opening, "items": items, "approved": approved,
             })
 
     def test_concept_note_and_approval_use_distinct_plain_modes(self):
@@ -195,11 +217,40 @@ class WorkflowRoutingTests(unittest.TestCase):
             comment_writer={"output": {"review_body": "Concept finding", "items": []}},
         )
         self.assertEqual(json.loads(rendered), {"mode": "concept", "body": "Concept finding"})
-        self.assertEqual(json.loads(self.agents["post_approval"]["stdin"])["mode"], "approval")
+        rendered = self.jinja.from_string(self.agents["post_approval"]["stdin"]).render(
+            approval_writer={"output": {"body": 'Looks good. Thanks for fixing "export"!\n'}},
+        )
+        self.assertEqual(json.loads(rendered), {
+            "mode": "approval", "body": 'Looks good. Thanks for fixing "export"!\n',
+        })
         rendered = self.jinja.from_string(self.agents["post_note"]["stdin"]).render(
             followup_clear_gate={"output": {"additional_input": {"note": "Verbatim"}}},
         )
         self.assertEqual(json.loads(rendered), {"mode": "note", "body": "Verbatim"})
+
+    def test_all_approval_gates_use_contribution_specific_writer(self):
+        for name in ("review_clear_gate", "followup_gate", "followup_clear_gate"):
+            approve = next(option for option in self.agents[name]["options"]
+                           if option["value"] == "approve")
+            self.assertEqual(approve["route"], "approval_writer")
+            self.assertNotIn("LGTM, thanks for contributing!", self.agents[name]["prompt"])
+        self.assertEqual(self.route("approval_writer", {"body": "Looks good, thanks!"}), "post_approval")
+        self.assertEqual(self.agents["approval_writer"]["input"], ["pr_resolver.output.pr_title"])
+        self.assertIn("approval_writer.output.body", self.agents["post_approval"]["input"])
+        prompt = self.jinja.from_string(self.agents["approval_writer"]["prompt"])
+        fix = prompt.render(pr_resolver={"output": {"pr_title": "Fix timeout handling"}})
+        feature = prompt.render(pr_resolver={"output": {"pr_title": "Add export option"}})
+        self.assertIn("Fix timeout handling", fix)
+        self.assertIn("Add export option", feature)
+        self.assertNotEqual(fix, feature)
+
+    def test_review_writers_request_warm_openings_without_reclassifying_findings(self):
+        for name in ("comment_writer", "followup_comment_writer"):
+            writer = self.agents[name]
+            self.assertEqual(writer["output"]["opening"]["type"], "string")
+            self.assertIn("brief, genuine appreciation", writer["system_prompt"])
+            self.assertIn("not merge blockers", " ".join(writer["prompt"].split()))
+        self.assertIn("including that warm opening", self.agents["comment_writer"]["prompt"])
 
     def test_fatal_ci_start_routes_to_failed_termination_after_cleanup(self):
         self.assertEqual(self.route("ci_start", {"ok": False}), "cleanup")

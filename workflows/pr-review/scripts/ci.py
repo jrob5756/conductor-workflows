@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from merge_readiness import (
     QueryError, command, inspect_checks, paginated, parse_json, query, validate_target,
+    validate_ignored_checks,
 )
 
 WAIT_TIMEOUT = 1800
@@ -325,12 +326,27 @@ def validate_tracking(data: dict, nwo: str, pr_number: str, head_sha: str) -> li
     return list(runs)
 
 
-def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, poll_interval=POLL_INTERVAL) -> dict:
+def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, poll_interval=POLL_INTERVAL,
+         ignored_checks=None) -> dict:
     """Wait at most timeout seconds, preserving startup blockers and rerun attempt barriers."""
     findings, failures = [], []
     deadline = time.monotonic() + timeout
     discovery_deadline = min(deadline, time.monotonic() + DISCOVERY_GRACE)
+    ignored = []
+
+    def finish(payload):
+        payload["ignored_checks"] = ignored
+        if ignored:
+            if payload["summary"] == "CI verified.":
+                payload["summary"] = "Non-excluded CI verified."
+            payload["summary"] += (
+                " Excluded from review-time verification (merge requirements still apply): "
+                + "; ".join(ignored)
+            )
+        return payload
+
     try:
+        exclusions = sorted(validate_ignored_checks([] if ignored_checks is None else ignored_checks))
         findings = startup_findings(data)
         validate_target(nwo, pr_number, head_sha)
         tracked = validate_tracking(data, nwo, pr_number, head_sha)
@@ -381,7 +397,10 @@ def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, po
                             represented.add(("job", nwo.lower(), str(job["id"])))
                         represented.update(failure_identity(job.get(key)) for key in ("html_url", "check_run_url"))
             represented.discard(None)
-            checks = inspect_checks(nwo, pr_number, pr["base"]["ref"], deadline)
+            checks = inspect_checks(
+                nwo, pr_number, pr["base"]["ref"], deadline, ignored_checks=exclusions,
+            )
+            ignored = checks.get("ignored", [])
             pending.extend(checks["pending"])
             for issue in checks["issues"]:
                 url = issue.rsplit(" — ", 1)[1] if " — " in issue else ""
@@ -406,33 +425,36 @@ def wait(nwo: str, pr_number: str, head_sha: str, data, timeout=WAIT_TIMEOUT, po
                     not tracked and not checks["checks"] and not checks["required_names"]
                     and not failures and not findings
                 )
-                return response(
+                return finish(response(
                     findings + failures, no_ci=no_ci,
                     **({"summary": "No CI checks apply: no enabled Actions workflows, reported checks or required contexts."}
                        if no_ci and not findings else {}),
-                )
+                ))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return response(findings + failures + [finding("CI verification timed out", "; ".join(pending))])
+                return finish(response(findings + failures + [finding("CI verification timed out", "; ".join(pending))]))
             delay = min(poll_interval, discovery_deadline - time.monotonic()) if discovery_pending else poll_interval
             if remaining <= delay:
                 # Preserve actionable pending statuses when the next request would exceed the deadline.
                 time.sleep(max(0, remaining))
-                return response(findings + failures + [finding("CI verification timed out", "; ".join(pending))])
+                return finish(response(findings + failures + [finding("CI verification timed out", "; ".join(pending))]))
             time.sleep(max(0, delay))
     except QueryError as exc:
-        return fatal(str(exc), findings + failures)
+        return finish(fatal(str(exc), findings + failures))
 
 
 def main(argv: list[str]) -> None:
     try:
-        if len(argv) != 4 or argv[0] not in {"start", "wait"}:
-            raise QueryError("Usage: ci.py <start|wait> <owner/repo> <pr_number> <reviewed_head_sha>")
-        mode, nwo, pr_number, head_sha = argv
+        if len(argv) not in (4, 5) or argv[0] not in {"start", "wait"} or (len(argv) == 5 and argv[0] != "wait"):
+            raise QueryError("Usage: ci.py <start|wait> <owner/repo> <pr_number> <reviewed_head_sha> [ignored_checks_json (wait only)]")
+        mode, nwo, pr_number, head_sha = argv[:4]
         if mode == "start":
             payload = start(nwo, pr_number, head_sha)
         else:
-            payload = wait(nwo, pr_number, head_sha, parse_json(sys.stdin.read(), "CI start input"))
+            exclusions = parse_json(argv[4], "ignored_checks") if len(argv) == 5 else []
+            validate_ignored_checks(exclusions)
+            payload = wait(nwo, pr_number, head_sha, parse_json(sys.stdin.read(), "CI start input"),
+                           ignored_checks=exclusions)
     except QueryError as exc:
         payload = fatal(str(exc), run_ids=[])
     print(json.dumps(payload))

@@ -36,6 +36,24 @@ Run `pr-review` from the repository containing an open pull request. Closed
 and merged pull requests stop before review. Each invocation owns a separate
 worktree; starting another review does not remove an earlier checkout.
 
+Two inputs control repository-specific policy without changing the workflow:
+
+| Input | Default | Behavior |
+|-------|---------|----------|
+| `ignored_checks` | `["license/cla"]` | Exact, case-sensitive PR check names excluded from review-time waiting and findings. Pass `[]` to inspect every check, or a different array to replace the default. Exclusions are disclosed in the CI summary. |
+| `merge` | `true` | Offer merge-readiness inspection and a separate human-confirmed merge after approval. Set `false` to finish after review/approval and cleanup, without merge checks or prompts. |
+
+```bash
+conductor run pr-review@sample --input pr=572 --input merge=false
+conductor run pr-review@sample --input pr=572 --input 'ignored_checks=[]'
+conductor run pr-review@sample --input pr=572 --input 'ignored_checks=["license/cla","another/check"]'
+```
+
+Exclusions never bypass merge requirements or suppress underlying Actions run
+failures. A pending or failing required CLA check can therefore still block
+merging when `merge=true`. Enabling merge does not authorize an automatic merge;
+the separate human gate is retained.
+
 CI startup distinguishes passing results reused, runs already in progress,
 fork approvals, and retries of failed runs. The workflow still inspects fresh
 results after review. Missing Actions runs trigger bounded rediscovery, not
@@ -50,6 +68,11 @@ additional findings when their relationship to inline findings is accounted
 for. Publication rejects missing or duplicate approved findings and checks
 that the pull request is still open at the reviewed head immediately before
 posting. A changed head requires a new review.
+
+Generated reviews open with brief appreciation before presenting the findings.
+Approvals use a short LGTM or equivalent and thanks tailored to the contribution,
+without claiming that waived findings were resolved. Inline findings keep their
+approved severity, and notes you write yourself are posted verbatim.
 
 Stopping through the dashboard retains the checkpoint and worktree for
 resumption. It is not the same as choosing **Post nothing**, which follows the
