@@ -185,7 +185,7 @@ def start(nwo: str, pr_number: str, head_sha: str) -> dict:
                     if run["event"] != "pull_request":
                         raise QueryError("Only pull_request runs can receive fork execution approval.")
                     action, endpoint = "approve", "approve"
-                elif run["status"] == "completed":
+                elif run["status"] == "completed" and run.get("conclusion") not in PASSING:
                     action, endpoint = "rerun", "rerun"
                 else:
                     tracked.append(tracking(run))

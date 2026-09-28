@@ -154,8 +154,17 @@ class StartTests(unittest.TestCase):
             result = ci.start("owner/repo", "1", SHA)
         return result, command
 
+    def test_passing_run_is_reused_without_rerun(self):
+        for conclusion in sorted(ci.PASSING):
+            with self.subTest(conclusion=conclusion):
+                result, command = self.start([run(run_attempt=3, conclusion=conclusion)])
+                self.assertFalse(result["findings"])
+                self.assertEqual(result["runs"][0]["action"], "existing")
+                self.assertEqual(result["runs"][0]["expected_attempt"], 3)
+                command.assert_not_called()
+
     def test_completed_run_reruns_and_tracks_next_attempt(self):
-        result, command = self.start([run(run_attempt=3)])
+        result, command = self.start([run(run_attempt=3, conclusion="failure")])
         self.assertFalse(result["findings"])
         self.assertEqual(result["runs"][0]["expected_attempt"], 4)
         self.assertIn("/rerun", command.call_args.args[0][1])
@@ -198,7 +207,7 @@ class StartTests(unittest.TestCase):
     def test_valid_push_and_pr_runs_are_both_started(self):
         with patch.object(ci, "read_pr", return_value={**PR, "merge_commit_sha": None}), patch.object(
             ci, "paginated", side_effect=[
-                [run(event="push", pull_requests=[]), run(id=11)],
+                [run(event="push", pull_requests=[], conclusion="failure"), run(id=11, conclusion="failure")],
                 [{"number": 1, "head": {"sha": SHA}}],
             ],
         ), patch.object(ci, "command", return_value=subprocess.CompletedProcess([], 0, "", "")) as command:
@@ -217,7 +226,7 @@ class StartTests(unittest.TestCase):
     def test_fork_with_empty_associations_is_approved_then_rerun_on_next_pass(self):
         fork = {"full_name": "contributor/repo"}
         pr = {**PR, "head": {**PR["head"], "repo": fork}, "merge_commit_sha": None}
-        for conclusion, action in (("action_required", "approve"), ("success", "rerun")):
+        for conclusion, action in (("action_required", "approve"), ("failure", "rerun")):
             with self.subTest(conclusion=conclusion), patch.object(
                 ci, "read_pr", return_value=pr,
             ), patch.object(ci, "paginated", side_effect=[
@@ -242,7 +251,7 @@ class StartTests(unittest.TestCase):
         command.assert_not_called()
 
     def test_approval_and_rerun_failure_are_explicit(self):
-        for conclusion in ("success", "action_required"):
+        for conclusion in ("failure", "action_required"):
             with self.subTest(conclusion=conclusion):
                 result, _ = self.start([run(conclusion=conclusion)], subprocess.CompletedProcess([], 403, "", "approval denied"))
                 self.assertIn("approval denied", result["summary"])
@@ -251,7 +260,7 @@ class StartTests(unittest.TestCase):
 
     def test_head_change_prevents_mutation(self):
         with patch.object(ci, "read_pr", side_effect=[PR, ci.QueryError("stale head"), ci.QueryError("stale head")]), patch.object(
-            ci, "discover", return_value=[run()],
+            ci, "discover", return_value=[run(conclusion="failure")],
         ), patch.object(ci, "command") as command:
             result = ci.start("owner/repo", "1", SHA)
         self.assertIn("stale head", result["summary"])

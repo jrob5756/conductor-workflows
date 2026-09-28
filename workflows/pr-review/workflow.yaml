@@ -20,7 +20,8 @@
 #   concept_gate ───────────→ only when it found blocking gaps:
 #     ↓                        proceed / post the concept findings and stop /
 #     ↓                        stop without posting
-#   ci_start (script)        start or approve Actions for the reviewed head
+#   ci_start (script)        approve or rerun Actions for the reviewed head
+#                            only when needed; passing runs are reused
 #   code_review              [code-review skill] report only, change nothing
 #   ci_wait (script)         wait for CI; problems join the findings as BLOCKING
 #     ↓
@@ -41,7 +42,7 @@
 #
 # The follow-up path — taken when `prior_review` finds your earlier comments:
 #
-#   ci_start (script)            start or approve Actions for the reviewed head
+#   ci_start (script)            approve or rerun Actions only when needed
 #   followup_review              did they do what you asked? one status per
 #     ↓                          point: addressed / partly / not / moot /
 #     ↓                          unclear, decided from the code
@@ -235,7 +236,7 @@
 
 workflow:
   name: pr-review
-  description: Reviews repository fit before implementation quality, asks before repeating an unchanged review, starts and waits for PR CI on both first and follow-up passes, and includes CI problems as blocking findings for triage. Posts only the feedback you approve. Follow-up runs check earlier feedback instead of repeating a full review. After posting LGTM, shows current merge blockers and asks separately whether to squash-merge.
+  description: Reviews repository fit before implementation quality, asks before repeating an unchanged review, reuses passing PR CI and reruns or approves only what needs it on both first and follow-up passes, waits for it, and includes CI problems as blocking findings for triage. Posts only the feedback you approve. Follow-up runs check earlier feedback instead of repeating a full review. After posting LGTM, shows current merge blockers and asks separately whether to squash-merge.
   version: "1.3.0"
   entry_point: bootstrap
 
@@ -755,7 +756,7 @@ agents:
   # ---------------------------------------------------------------------------
 
   - name: ci_start
-    description: Approves or starts the PR's Actions runs for the exact head being reviewed
+    description: Approves pending or reruns non-passing Actions runs for the exact head being reviewed, reusing runs that already passed
     type: script
     command: python3
     timeout: 300
