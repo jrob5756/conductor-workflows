@@ -1003,35 +1003,13 @@ agents:
       - build_questions.output.blocking_count
       - build_questions.output.recommended_count
     prompt: |
-      ## Findings on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+      ## #{{ pr_resolver.output.pr_number }} — {{ build_questions.output.question_count }} finding{{ 's' if build_questions.output.question_count != 1 else '' }} to decide
+
+      {{ build_questions.output.blocking_count }} blocking, {{ build_questions.output.recommended_count }} recommended.
       {% if pr_resolver.output.state != 'OPEN' or pr_resolver.output.is_draft %}
-
-      > This pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}. Anything you approve still posts to it.
+      Note: this pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}.
       {% endif %}
-      {% if pr_resolver.output.notes %}
-
-      > {{ pr_resolver.output.notes }}
-      {% endif %}
-
-      The code review found {{ build_questions.output.blocking_count }} blocking
-      and {{ build_questions.output.recommended_count }} recommended
-      finding{{ 's' if build_questions.output.question_count != 1 else '' }}.
-      Nothing has been posted to the pull request yet.
-
-      Decide each one. There are four ways to answer:
-
-      - **Post as-is** keeps the reviewer's wording and its severity.
-      - **Post as BLOCKING** / **Post as RECOMMENDED** posts the same wording
-        at the other severity, so you can promote something the reviewer
-        under-rated or demote something that should not hold up a merge. Only
-        the severity the finding does not already carry is offered.
-      - **Do not post** drops the finding entirely.
-      - **Write your own** posts the finding with your note applied, so use it
-        to soften the tone, add context the reviewer lacked, or narrow the ask.
-
-      Skipping a question posts it as-is, which makes "skip all remaining" a
-      quick way to accept the rest once you have read the first few. Aborting
-      posts nothing at all.
+      Nothing is posted yet. Skip = post as-is; abort = post nothing.
     allow_back: true
     allow_skip: true
     allow_skip_all: true
@@ -1606,47 +1584,12 @@ agents:
       - build_followup_questions.output.new_count
       - build_followup_questions.output.confirmations
     prompt: |
-      ## Your earlier review of #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+      ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ build_followup_questions.output.question_count }} to decide
 
-      {{ followup_review.output.summary }}
-      {% if followup_review.output.changes_since %}
-
-      **What changed since {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}:** {{ followup_review.output.changes_since }}
-      {% endif %}
-
-      {{ build_followup_questions.output.addressed_count }} of your points
-      {{ 'has' if build_followup_questions.output.addressed_count == 1 else 'have' }} been
-      addressed{% if build_followup_questions.output.obsolete_count %} and {{ build_followup_questions.output.obsolete_count }} no longer appl{{ 'ies' if build_followup_questions.output.obsolete_count == 1 else 'y' }}{% endif %}.
-      {{ build_followup_questions.output.question_count }} finding{{ 's' if build_followup_questions.output.question_count != 1 else '' }} need a decision, including {{ build_followup_questions.output.ci_count }} current CI problem{{ 's' if build_followup_questions.output.ci_count != 1 else '' }}:
-      {{ build_followup_questions.output.blocking_count }} blocking and
-      {{ build_followup_questions.output.recommended_count }} recommended.
-      {{ build_followup_questions.output.new_count }} of them {{ 'is' if build_followup_questions.output.new_count == 1 else 'are' }} new, introduced since your review.
-      {% if (build_followup_questions.output.confirmations | length) > 0 %}
-      {{ build_followup_questions.output.confirmations | length }} addressed point{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }}
-      will get a "fix confirmed" reply and be resolved when you post.
-      {% endif %}
-      Nothing has been posted to the pull request yet.
-
-      Points that came from an earlier comment are raised as a reply on that
-      comment's thread, reopening it if it was resolved. New points become new
-      inline comments.
-
-      CI findings describe this pass, not an earlier comment the author ignored.
-
-      Decide each one. There are four ways to answer:
-
-      - **Post as-is** raises it again at the severity it carries now.
-      - **Post as BLOCKING** / **Post as RECOMMENDED** raises the same wording
-        at the other severity, so a point the author has now sat on twice can
-        be promoted, or one you no longer want to hold up a merge demoted.
-        Only the severity it does not already carry is offered.
-      - **Do not post** lets it go. Nothing about it reaches the author.
-      - **Write your own** raises it with your note applied — the place to
-        acknowledge a partial fix, accept a reason you were given, or narrow
-        what is left.
-
-      Skipping a question raises it as-is, so "skip all remaining" means
-      "raise the rest verbatim". Aborting posts nothing at all.
+      {{ build_followup_questions.output.blocking_count }} blocking, {{ build_followup_questions.output.recommended_count }} recommended
+      ({{ build_followup_questions.output.new_count }} new, {{ build_followup_questions.output.ci_count }} CI).
+      {{ build_followup_questions.output.addressed_count }} earlier point{{ 's' if build_followup_questions.output.addressed_count != 1 else '' }} addressed{% if build_followup_questions.output.obsolete_count %}, {{ build_followup_questions.output.obsolete_count }} moot{% endif %}.
+      Nothing is posted yet. Skip = post as-is; abort = post nothing.
     allow_back: true
     allow_skip: true
     allow_skip_all: true
@@ -1671,6 +1614,8 @@ agents:
         when: "{{ not output.ok }}"
       - to: followup_clear_gate
         when: "{{ output.approved_count == 0 }}"
+      - to: followup_blocking_gate
+        when: "{{ output.blocking_count > 0 }}"
       - to: followup_gate
 
   - name: followup_gate
@@ -1768,6 +1713,91 @@ agents:
       - label: Approve with a personal thank-you
         value: approve
         route: confirm_threads_approve
+      - label: Post the points you kept as a review
+        value: comment
+        route: followup_comment_writer
+      - label: Post nothing
+        value: stop
+        route: cleanup
+
+  - name: followup_blocking_gate
+    type: human_gate
+    description: The publish decision when blocking points remain after triage; approval is not offered
+    input:
+      - pr_resolver.output.pr_number
+      - pr_resolver.output.pr_title
+      - pr_resolver.output.pr_url
+      - pr_resolver.output.state
+      - pr_resolver.output.is_draft
+      - pr_resolver.output.author
+      - pr_resolver.output.gh_user
+      - prior_review.output.last_review_at
+      - prior_review.output.last_interaction_at
+      - prior_review.output.matched_logins
+      - prior_review.output.other_login_items
+      - followup_review.output.summary
+      - followup_review.output.changes_since
+      - build_followup_questions.output.addressed_count
+      - build_followup_questions.output.obsolete_count
+      - build_followup_questions.output.resolved
+      - apply_followup_triage.output.approved_count
+      - apply_followup_triage.output.blocking_count
+      - apply_followup_triage.output.recommended_count
+      - apply_followup_triage.output.dropped_count
+      - ci_wait.output.summary
+      - build_followup_questions.output.confirmations
+      - prior_review.output.thread_error
+    prompt: |
+      ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
+
+      {{ pr_resolver.output.pr_url }}
+      {% if pr_resolver.output.state != 'OPEN' or pr_resolver.output.is_draft %}
+
+      > This pull request is {% if pr_resolver.output.is_draft %}a draft{% if pr_resolver.output.state != 'OPEN' %} and {% endif %}{% endif %}{% if pr_resolver.output.state != 'OPEN' %}{{ pr_resolver.output.state | lower }}{% endif %}. Anything you choose here still posts to it.
+      {% endif %}
+      {% if prior_review.output.other_login_items %}
+
+      > The review being followed up on was posted as {{ prior_review.output.matched_logins | join(', ') }}, and `gh` is now active as `{{ pr_resolver.output.gh_user }}`. Anything you publish here goes up under `{{ pr_resolver.output.gh_user }}`, so the pull request will show one reviewer under two names. Run `gh auth switch` and start again if you would rather keep them together.
+      {% endif %}
+
+      {{ followup_review.output.summary }}
+      {% if followup_review.output.changes_since %}
+
+      **What changed since {{ prior_review.output.last_review_at or prior_review.output.last_interaction_at }}:** {{ followup_review.output.changes_since }}
+      {% endif %}
+      {% if (build_followup_questions.output.resolved | length) > 0 %}
+
+      ### Settled
+
+      {% for item in build_followup_questions.output.resolved %}
+      - {{ item }}
+      {% endfor %}
+      {% endif %}
+
+      ### Still open
+
+      **CI:** {{ ci_wait.output.summary }}
+
+      You kept {{ apply_followup_triage.output.approved_count }} point{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} —
+      {{ apply_followup_triage.output.blocking_count }} blocking and
+      {{ apply_followup_triage.output.recommended_count }} recommended{% if apply_followup_triage.output.dropped_count %}, and let {{ apply_followup_triage.output.dropped_count }} go{% endif %}.
+
+      Blocking points remain, so approval is not offered.
+
+      {% if (build_followup_questions.output.confirmations | length) > 0 %}
+      Posting first replies "Fix confirmed" on {{ build_followup_questions.output.confirmations | length }} addressed
+      thread{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }} and resolves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }}.
+      {% endif %}
+      {% if prior_review.output.thread_error %}
+      > Review threads could not be read ({{ prior_review.output.thread_error }}), so no earlier comment can be confirmed, resolved or reopened on this run.
+      {% endif %}
+
+      ---
+
+      Posting the findings raises exactly the points you kept, worded as a
+      follow-up rather than as a first review, with inline comments wherever
+      the diff allows.
+    options:
       - label: Post the points you kept as a review
         value: comment
         route: followup_comment_writer

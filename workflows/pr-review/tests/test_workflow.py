@@ -383,5 +383,23 @@ class WorkflowRoutingTests(unittest.TestCase):
         self.assertIn("reopens", rendered)
 
 
+    def test_blocking_points_after_triage_never_offer_approval(self):
+        self.assertEqual(
+            self.route("apply_followup_triage", {"ok": True, "approved_count": 2, "blocking_count": 1}),
+            "followup_blocking_gate",
+        )
+        self.assertEqual(
+            self.route("apply_followup_triage", {"ok": True, "approved_count": 2, "blocking_count": 0}),
+            "followup_gate",
+        )
+        values = [o["value"] for o in self.agents["followup_blocking_gate"]["options"]]
+        self.assertEqual(values, ["comment", "stop"])
+        self.assertNotIn("approval_writer", str(self.agents["followup_blocking_gate"]["options"]))
+
+    def test_triage_prompts_stay_short_so_first_question_is_visible(self):
+        for name in ("triage", "followup_triage"):
+            self.assertLess(len(self.agents[name]["prompt"].splitlines()), 12)
+
+
 if __name__ == "__main__":
     unittest.main()
