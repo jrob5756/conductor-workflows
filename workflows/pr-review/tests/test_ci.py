@@ -263,6 +263,43 @@ class StartTests(unittest.TestCase):
                 self.assertEqual(result["run_ids"], [])
                 self.assertEqual(result["findings"][0]["severity"], "BLOCKING")
 
+    def test_authorization_refusal_stops_before_other_runs_or_review(self):
+        for conclusion in ("failure", "action_required"):
+            for error in (
+                "gh: Must have admin rights to Repository. (HTTP 403)",
+                "gh: Bad credentials (HTTP 401)",
+                "Unauthorized: As an Enterprise Managed User, you cannot access this content",
+            ):
+                with self.subTest(conclusion=conclusion, error=error):
+                    result, command = self.start([
+                        run(conclusion=conclusion), run(id=11, conclusion=conclusion),
+                    ], subprocess.CompletedProcess([], 1, "", error))
+                    self.assertFalse(result["ok"])
+                    self.assertTrue(result["auth_error"])
+                    self.assertIn(error, result["error"])
+                    self.assertEqual(command.call_count, 1)
+                    self.assertFalse(result["discovery_pending"])
+
+    def test_ci_server_error_is_not_classified_as_authentication(self):
+        result, _ = self.start(
+            [run(conclusion="failure")],
+            subprocess.CompletedProcess([], 1, "", "GitHub unavailable (HTTP 503)"),
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["auth_error"])
+        self.assertTrue(result["findings"])
+
+    def test_approval_rejection_preserves_successfully_started_run_tracking(self):
+        with patch.object(ci, "read_pr", return_value=PR), patch.object(
+            ci, "discover", return_value=[run(conclusion="failure"), run(id=11, conclusion="failure")],
+        ), patch.object(ci, "command", side_effect=[
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "HTTP 403"),
+        ]):
+            result = ci.start("owner/repo", "1", SHA)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["run_ids"], [10])
+
     def test_head_change_prevents_mutation(self):
         with patch.object(ci, "read_pr", side_effect=[PR, ci.QueryError("stale head"), ci.QueryError("stale head")]), patch.object(
             ci, "discover", return_value=[run(conclusion="failure")],

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -62,6 +63,24 @@ def resolve_remote(repo_root: str, name_with_owner: str) -> str:
     return matches[0] if matches else "origin"
 
 
+def fetch(repo_root: str, remote: str, name_with_owner: str, refspec: str) -> None:
+    """Fetch using the pinned GitHub credential, or the existing remote for standalone use."""
+    host = os.environ.get("PR_REVIEW_GH_HOST")
+    options = []
+    if host:
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", host) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", name_with_owner,
+        ):
+            raise LifecycleError("Invalid pinned GitHub host or repository.")
+        remote = f"https://{host}/{name_with_owner}.git"
+        # CLI-local overrides keep SSH keys and ambient helpers from choosing another identity.
+        options = [
+            "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential",
+            "-c", f"http.{remote}.extraHeader=",
+        ]
+    git(repo_root, *options, "fetch", "--no-write-fetch-head", "--", remote, refspec)
+
+
 def main(argv: list[str]) -> None:
     if len(argv) < 4:
         fail("pr_worktree.py requires repo_root, worktrees_dir, pr_number and name_with_owner")
@@ -101,13 +120,12 @@ def main(argv: list[str]) -> None:
             write_record(directory, record, create=True)
             try:
                 worktrees.mkdir(parents=True, exist_ok=True)
-                git(repo_root, "fetch", "--no-write-fetch-head", "--", remote,
-                    f"pull/{pr_number}/head:refs/heads/{branch}")
+                fetch(repo_root, remote, name_with_owner,
+                      f"pull/{pr_number}/head:refs/heads/{branch}")
                 record["head_sha"] = git(repo_root, "rev-parse", f"refs/heads/{branch}^{{commit}}")
                 write_record(directory, record)
                 if base_ref:
-                    git(repo_root, "fetch", "--no-write-fetch-head", "--", remote,
-                        f"refs/heads/{base_ref}:{base_pin}")
+                    fetch(repo_root, remote, name_with_owner, f"refs/heads/{base_ref}:{base_pin}")
                     record["base_sha"] = git(repo_root, "rev-parse", f"{base_pin}^{{commit}}")
                     write_record(directory, record)
                 git(repo_root, "worktree", "add", "--", worktree_path, branch)

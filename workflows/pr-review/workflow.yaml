@@ -61,6 +61,13 @@
 #     ↓
 #   cleanup
 #
+#   Threads on a follow-up: a point that landed gets a "Fix confirmed" reply
+#   and its thread is resolved; a point still open (or partly done) is
+#   answered on its original thread, which is reopened if it was resolved; a
+#   problem introduced since the last review is a new inline comment. The
+#   review body lists all three. Fixed-point confirmations go out with
+#   whichever publish option you choose, and never on "Post nothing".
+#
 #   followup_clear_gate replaces `followup_gate` when nothing is left to
 #   raise — because every point landed, or because you let the rest go at
 #   triage. It offers the approval, a note you write yourself, and the escape
@@ -111,11 +118,7 @@
 #   a reference from elsewhere reviews one pull request and comments on
 #   another that happens to share its number.
 #
-#   For the same reason `pr_resolver` reports the `gh` login it ended up
-#   authenticated as rather than the one captured at startup: it is allowed to
-#   switch accounts to read a private pull request, and the own-PR gate is
-#   worthless if it compares the author against a login that is no longer in
-#   effect.
+#   GitHub commands use the preflight-selected identity without global account switches.
 #
 # Order
 #   The concept review runs first because it is the cheap question. Deciding a
@@ -190,7 +193,6 @@
 #   dispatches to the seven specialist subagents `prs` ships in `agents/`;
 #   discovering the skill alone leaves it calling agents that are not there.
 #
-#     pr_resolver                     git@jason-tools      gh-cli
 #     code_review                     prs@jason-tools      code-review
 #     comment_writer                  writing@jason-tools  humanizer
 #     followup_comment_writer         writing@jason-tools  humanizer
@@ -227,7 +229,7 @@
 
 workflow:
   name: pr-review
-  description: Reviews open pull requests for repository fit and implementation quality in isolated worktrees. Reuses passing CI, approves or retries runs only when needed, and reconciles current checks without duplicate findings. Follow-up runs track distinct earlier findings. Validates approved finding coverage and the reviewed head before publishing. Approval and squash-merge require separate decisions; stopped runs remain resumable until explicitly discarded.
+  description: Reviews open pull requests for repository fit and implementation quality in isolated worktrees. Reuses passing CI, approves or retries runs only when needed, and reconciles current checks without duplicate findings. Follow-up runs track distinct earlier findings. Fixed points get a fix-confirmed reply and are resolved, unfixed ones are replied to on their original thread (reopened if resolved), and new problems become new inline comments. Validates approved finding coverage and the reviewed head before publishing. Approval and squash-merge require separate decisions; stopped runs remain resumable until explicitly discarded.
   version: "1.4.0"
   entry_point: bootstrap
 
@@ -267,16 +269,40 @@ agents:
   # ---------------------------------------------------------------------------
 
   - name: bootstrap
-    description: Resolves the target repository and your GitHub identity from the directory the workflow was invoked in
+    description: Resolves the target repository and automatically selects a writable GitHub account without changing the global login
     type: script
     command: python3
     timeout: 120
     args:
       - "{{ workflow.dir }}/scripts/bootstrap.py"
     routes:
+      - to: authentication_gate
+        when: "{{ output.auth_error is defined and output.auth_error }}"
       - to: bootstrap_failed
         when: "{{ not output.ok }}"
       - to: pr_resolver
+
+  - name: authentication_gate
+    type: human_gate
+    description: Pauses only when no configured GitHub identity can perform the review
+    input:
+      - bootstrap.output.error
+    prompt: |
+      ## GitHub access needs attention
+
+      {{ bootstrap.output.error }}
+
+      No review, worktree, CI action, or publication has started.
+      Authenticate a suitable account or fix its repository permissions, then retry.
+      Account selection is automatic; you do not need to choose one for each run.
+      An explicit environment token must be fixed at launch and requires a new run.
+    options:
+      - label: Stop without reviewing
+        value: stop
+        route: bootstrap_failed
+      - label: Retry the automatic authentication check
+        value: retry
+        route: bootstrap
 
   - name: bootstrap_failed
     type: terminate
@@ -286,106 +312,61 @@ agents:
     reason: "{{ bootstrap.output.error }}"
 
   - name: pr_resolver
-    description: Loads the pull request under review from GitHub
-    model: gpt-6-luna
-    reasoning:
-      effort: medium
-    plugins:
-      - git@jason-tools       # gh-cli — account switching on a 404 or 403
+    description: Reads the existing pull request with the preflight-selected GitHub identity
+    type: script
+    command: python3
+    timeout: 120
     input:
       - workflow.input.pr
       - bootstrap.output.name_with_owner
       - bootstrap.output.gh_user
-      - bootstrap.output.default_branch
-    system_prompt: |
-      You resolve the unit of work for a review pipeline: you read an existing
-      pull request and report it. You never create, edit, close, approve or
-      merge a pull request, you never comment on one, and you never touch git
-      branches or working trees.
-
-      Use the `gh` CLI for every GitHub operation. If a `gh` call fails with a
-      404 or a permission error, run `gh auth status`, try `gh auth switch`,
-      and retry once before reporting failure.
-    prompt: |
-      Repository: `{{ bootstrap.output.name_with_owner }}`
-      Default branch: `{{ bootstrap.output.default_branch }}`
-
-      ## Load pull request `{{ workflow.input.pr }}`
-
-      The reference may be a bare number, a full URL, or `owner/repo#123`.
-      Normalise it, then read the pull request:
-
-      ```
-      gh pr view <number> -R <owner>/<repo> \
-        --json number,title,author,baseRefName,state,isDraft,isCrossRepository,url
-      ```
-
-      Report the repository you actually read in `name_with_owner`, as
-      `owner/repo`. If the reference named one, that is the one you report,
-      even when it is not the repository above — a later step compares the two
-      and stops rather than reviewing the wrong pull request.
-
-      Report the GitHub login the `gh` CLI is authenticated as in `gh_user`,
-      read fresh with `gh api user --jq .login` **after** any account switch
-      you had to make. A later step compares it against the author to decide
-      whether you are reviewing your own work, and a stale login there means
-      that check silently passes.
-
-      If it cannot be read at all — it does not exist, or you lack access — set
-      `found: false` and put the exact `gh` error in `notes`. Do not invent a
-      pull request and do not open one.
-
-      Report closed, merged and draft pull requests with `found: true` and
-      their exact state. Closed or merged PRs stop before any review or CI.
-      Draft PRs may still be reviewed.
-
-      Report it exactly as GitHub returned it. Do not paraphrase the title or
-      body, and do not summarise or judge the change — that is the reviewers'
-      job, and a summary here would prime them.
-    output:
-      found:
-        type: boolean
-        description: True when the pull request was read from GitHub. False when it does not exist or is not accessible.
-      pr_number:
-        type: number
-        description: The pull request number
-      pr_title:
-        type: string
-        description: The title, verbatim from GitHub
-      pr_url:
-        type: string
-        description: Full URL of the pull request
-      name_with_owner:
-        type: string
-        description: The repository this pull request actually belongs to, as owner/repo, taken from the reference you were given rather than assumed
-      gh_user:
-        type: string
-        description: The GitHub login the gh CLI is authenticated as, read after any account switch
-      author:
-        type: string
-        description: The GitHub login of the author, with no @ prefix
-      base_ref:
-        type: string
-        description: The branch this pull request merges into
-      state:
-        type: string
-        description: One of OPEN, CLOSED, MERGED
-      is_draft:
-        type: boolean
-        description: True when the pull request is still a draft
-      notes:
-        type: string
-        description: Anything the human should know before the review starts, such as the pull request being closed, merged or a draft. Empty when there is nothing to flag.
+      - bootstrap.output.host
+      - bootstrap.output.auth_source
+    args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
+      - "{{ workflow.dir }}/scripts/pr_resolver.py"
+      - "{{ workflow.input.pr }}"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ bootstrap.output.host }}"
     routes:
+      - to: pr_authentication_gate
+        when: "{{ output.auth_error is defined and output.auth_error }}"
+      - to: wrong_repository
+        when: "{{ output.name_with_owner is defined and output.name_with_owner | lower != bootstrap.output.name_with_owner | lower }}"
       - to: pr_resolver_failed
         when: "{{ not output.found }}"
-      - to: wrong_repository
-        when: "{{ output.name_with_owner | lower != bootstrap.output.name_with_owner | lower }}"
       - to: pr_not_open
         when: "{{ output.state != 'OPEN' }}"
       - to: author_gate
         when: "{{ output.author | lower == output.gh_user | lower or output.author | lower in bootstrap.output.gh_logins | map('lower') | list }}"
       - to: pr_worktree
+
+  - name: pr_authentication_gate
+    type: human_gate
+    description: Pauses when the selected credential cannot read the pull request
+    input:
+      - bootstrap.output.gh_user
+      - pr_resolver.output.notes
+    prompt: |
+      ## GitHub could not read the pull request
+
+      Account: `{{ bootstrap.output.gh_user }}`
+
+      {{ pr_resolver.output.notes }}
+
+      No review, worktree, CI action, or publication has started.
+      Fix the account's access or authenticate another writable account, then
+      retry preflight. Explicit environment-token changes require a new run.
+    options:
+      - label: Stop without reviewing
+        value: stop
+        route: pr_resolver_failed
+      - label: Retry the automatic authentication check
+        value: retry
+        route: bootstrap
 
   - name: pr_not_open
     type: terminate
@@ -461,9 +442,16 @@ agents:
       - bootstrap.output.repo_root
       - bootstrap.output.worktrees_dir
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_resolver.output.base_ref
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/pr_worktree.py"
       - "{{ bootstrap.output.repo_root }}"
       - "{{ bootstrap.output.worktrees_dir }}"
@@ -489,12 +477,19 @@ agents:
     timeout: 180
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_resolver.output.gh_user
       - bootstrap.output.gh_logins
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/prior_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -565,6 +560,9 @@ agents:
     plugins: []
     working_dir: "{{ pr_worktree.output.worktree_path }}"
     input:
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_title
       - pr_resolver.output.pr_url
@@ -598,6 +596,10 @@ agents:
       A defect fixable without changing the proposed goal is not a conceptual
       finding. Do not disguise an implementation defect as a "logical gap."
     prompt: |
+      For read-only GitHub queries, replace the `gh` command with:
+      `python3 "{{ workflow.dir }}/scripts/github_auth.py" "{{ bootstrap.output.host }}" "{{ bootstrap.output.gh_user }}" "{{ bootstrap.output.auth_source }}" gh`.
+      Never run `gh auth switch`; it changes the login of concurrent workflows.
+
       Review pull request #{{ pr_resolver.output.pr_number }} as a proposed
       change to this project.
 
@@ -774,21 +776,57 @@ agents:
     timeout: 300
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - concept_review.output.verdict?
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/ci.py"
       - start
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
       - "{{ pr_worktree.output.head_sha }}"
     routes:
+      - to: ci_authentication_gate
+        when: "{{ output.auth_error is defined and output.auth_error }}"
       - to: cleanup
         when: "{{ not output.ok }}"
       - to: followup_review
         when: "{{ concept_review is not defined }}"
       - to: code_review
+
+  - name: ci_authentication_gate
+    type: human_gate
+    description: Stops before code review when GitHub refuses the selected account's CI access
+    input:
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
+      - ci_start.output.error
+    prompt: |
+      ## CI could not start with the selected GitHub account
+
+      Account: `{{ bootstrap.output.gh_user }}`
+
+      {{ ci_start.output.error }}
+
+      Code review has not started on this pass. Restore this account's access
+      or refresh its stored credential, then retry CI. Already running or passing
+      runs will be reused. No global account switch is needed.
+      To use another identity or change an explicit environment token, stop and
+      launch a new run so the author and prior-review checks use that identity too.
+    options:
+      - label: Stop and clean up without reviewing
+        value: stop
+        route: cleanup
+      - label: Retry CI with the selected account
+        value: retry
+        route: ci_start
 
   - name: code_review
     description: Runs the specialist code review and reports what it found, without touching the code or GitHub
@@ -806,6 +844,9 @@ agents:
       - prs@jason-tools       # code-review
     working_dir: "{{ pr_worktree.output.worktree_path }}"
     input:
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_title
       - pr_resolver.output.base_ref
@@ -828,6 +869,11 @@ agents:
       reading only that entry should know what is wrong, where, and what to
       do about it.
     prompt: |
+      For read-only GitHub queries, replace the `gh` command with:
+      `python3 "{{ workflow.dir }}/scripts/github_auth.py" "{{ bootstrap.output.host }}" "{{ bootstrap.output.gh_user }}" "{{ bootstrap.output.auth_source }}" gh`.
+      Pass this prefix to review subagents too. Never run `gh auth switch`;
+      it changes the login of concurrent workflows.
+
       Review pull request #{{ pr_resolver.output.pr_number }} —
       **{{ pr_resolver.output.pr_title }}**.
 
@@ -898,12 +944,19 @@ agents:
     timeout: 2100
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - ci_start.output
       - workflow.input.ignored_checks
       - code_review.output.findings?
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/ci.py"
       - wait
       - "{{ bootstrap.output.name_with_owner }}"
@@ -1245,6 +1298,9 @@ agents:
     timeout: 300
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
@@ -1256,6 +1312,10 @@ agents:
       - apply_triage.output.approved?
       - concept_gate.output.selected?
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/post_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -1285,6 +1345,9 @@ agents:
       effort: high
     working_dir: "{{ pr_worktree.output.worktree_path }}"
     input:
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_title
       - pr_resolver.output.pr_url
@@ -1315,16 +1378,23 @@ agents:
       than guessing in either direction — the human decides what to do with an
       unclear point, and they cannot if you have already decided for them.
 
-      Raise nothing new. A finding you did not make before does not belong in
-      a follow-up: posted there it masquerades as something the author read
-      and ignored. If the change has grown new problems, that is a fresh
-      review, and the human has a route to one.
+      Keep the two kinds of result apart. Everything in `items` is a point you
+      made before. A problem you did not raise before, but which the change
+      since your review has introduced, goes in `new_items` and nowhere else,
+      so it is never presented to the author as something they already read
+      and ignored. Report only problems in code this pull request adds or
+      changes, do not re-review what was already covered, and leave
+      `new_items` empty when there is nothing.
 
       You are a reviewer, not an implementer and not a publisher. Do not edit
       files, do not commit, do not push, and do not comment on GitHub. A later
       step publishes what a human approves, and it can only publish what you
       actually wrote down.
     prompt: |
+      For read-only GitHub queries, replace the `gh` command with:
+      `python3 "{{ workflow.dir }}/scripts/github_auth.py" "{{ bootstrap.output.host }}" "{{ bootstrap.output.gh_user }}" "{{ bootstrap.output.auth_source }}" gh`.
+      Never run `gh auth switch`; it changes the login of concurrent workflows.
+
       You have reviewed pull request #{{ pr_resolver.output.pr_number }}
       before. Work out what became of each point you made.
 
@@ -1462,6 +1532,14 @@ agents:
       a finding — a question, a thank-you, an answer to someone else — is
       `obsolete`.
 
+      ## New problems
+
+      `new_items` holds problems that were not in what you said before. Each
+      entry has the same fields as an item except `source_ids`, `status` and
+      `duplicate_sources`, which are omitted, and `source_type` is always
+      `code`. `path` and `line` must anchor to a line this pull request adds or
+      touches so it can be posted inline.
+
       Everything having been addressed is a real and common result. Report it
       plainly rather than hunting for something still wrong to justify the pass.
     output:
@@ -1471,6 +1549,9 @@ agents:
       duplicate_sources:
         type: array
         description: 'Explicit whole-source duplicate accounting: {"source_id": "p1", "covered_by": ["p2", "p3"], "evidence": "Why all content is covered"}. Empty unless fully examined duplicates remain uncited.'
+      new_items:
+        type: array
+        description: 'Problems not raised before, introduced by the change since your review: severity, path, line, title, original, evidence, recommendation and source_type code. Empty when there are none.'
       summary:
         type: string
         description: Where the pull request now stands against your earlier review, in a few sentences
@@ -1490,13 +1571,14 @@ agents:
     timeout: 60
     input:
       - followup_review.output.items
+      - followup_review.output.new_items
       - followup_review.output.duplicate_sources
       - prior_review.output.prior_items
       - ci_wait.output.findings
     args:
       - "{{ workflow.dir }}/scripts/build_followup_questions.py"
     # Legacy sources must be examined before summary duplicates or superseded CI can be excluded.
-    stdin: '{"items": {{ followup_review.output["items"] | tojson }}, "duplicate_sources": {{ followup_review.output.duplicate_sources | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}, "ci_findings": {{ ci_wait.output.findings | tojson }}}'
+    stdin: '{"items": {{ followup_review.output["items"] | tojson }}, "new_items": {{ followup_review.output["new_items"] | default([]) | tojson }}, "duplicate_sources": {{ followup_review.output.duplicate_sources | tojson }}, "prior_items": {{ prior_review.output.prior_items | tojson }}, "ci_findings": {{ ci_wait.output.findings | tojson }}}'
     routes:
       - to: cleanup
         when: "{{ not output.ok }}"
@@ -1521,6 +1603,8 @@ agents:
       - build_followup_questions.output.addressed_count
       - build_followup_questions.output.obsolete_count
       - build_followup_questions.output.ci_count
+      - build_followup_questions.output.new_count
+      - build_followup_questions.output.confirmations
     prompt: |
       ## Your earlier review of #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
 
@@ -1536,7 +1620,16 @@ agents:
       {{ build_followup_questions.output.question_count }} finding{{ 's' if build_followup_questions.output.question_count != 1 else '' }} need a decision, including {{ build_followup_questions.output.ci_count }} current CI problem{{ 's' if build_followup_questions.output.ci_count != 1 else '' }}:
       {{ build_followup_questions.output.blocking_count }} blocking and
       {{ build_followup_questions.output.recommended_count }} recommended.
+      {{ build_followup_questions.output.new_count }} of them {{ 'is' if build_followup_questions.output.new_count == 1 else 'are' }} new, introduced since your review.
+      {% if (build_followup_questions.output.confirmations | length) > 0 %}
+      {{ build_followup_questions.output.confirmations | length }} addressed point{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }}
+      will get a "fix confirmed" reply and be resolved when you post.
+      {% endif %}
       Nothing has been posted to the pull request yet.
+
+      Points that came from an earlier comment are raised as a reply on that
+      comment's thread, reopening it if it was resolved. New points become new
+      inline comments.
 
       CI findings describe this pass, not an earlier comment the author ignored.
 
@@ -1606,6 +1699,8 @@ agents:
       - apply_followup_triage.output.recommended_count
       - apply_followup_triage.output.dropped_count
       - ci_wait.output.summary
+      - build_followup_questions.output.confirmations
+      - prior_review.output.thread_error
     prompt: |
       ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
 
@@ -1645,6 +1740,14 @@ agents:
       {{ apply_followup_triage.output.blocking_count }} blocking and
       {{ apply_followup_triage.output.recommended_count }} recommended{% if apply_followup_triage.output.dropped_count %}, and let {{ apply_followup_triage.output.dropped_count }} go{% endif %}.
 
+      {% if (build_followup_questions.output.confirmations | length) > 0 %}
+      Approving or commenting first replies "Fix confirmed" on {{ build_followup_questions.output.confirmations | length }} addressed
+      thread{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }} and resolves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }}.
+      {% endif %}
+      {% if prior_review.output.thread_error %}
+      > Review threads could not be read ({{ prior_review.output.thread_error }}), so no earlier comment can be confirmed, resolved or reopened on this run.
+      {% endif %}
+
       ---
 
       Approving posts a short LGTM with thanks tailored to this contribution, which
@@ -1664,7 +1767,7 @@ agents:
     options:
       - label: Approve with a personal thank-you
         value: approve
-        route: approval_writer
+        route: confirm_threads_approve
       - label: Post the points you kept as a review
         value: comment
         route: followup_comment_writer
@@ -1697,6 +1800,8 @@ agents:
       - build_followup_questions.output.resolved
       - apply_followup_triage.output.dropped_count?
       - ci_wait.output.summary
+      - build_followup_questions.output.confirmations
+      - prior_review.output.thread_error
     prompt: |
       ## Follow-up on #{{ pr_resolver.output.pr_number }} — {{ pr_resolver.output.pr_title }}
 
@@ -1745,6 +1850,14 @@ agents:
       {% endfor %}
       {% endif %}
 
+      {% if (build_followup_questions.output.confirmations | length) > 0 %}
+      Approving or commenting first replies "Fix confirmed" on {{ build_followup_questions.output.confirmations | length }} addressed
+      thread{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }} and resolves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }}.
+      {% endif %}
+      {% if prior_review.output.thread_error %}
+      > Review threads could not be read ({{ prior_review.output.thread_error }}), so no earlier comment can be confirmed, resolved or reopened on this run.
+      {% endif %}
+
       ---
 
       Approving posts a short LGTM with thanks tailored to this contribution.
@@ -1761,16 +1874,17 @@ agents:
 
       Running the full review starts the first-pass path from the top: concept
       review, code review, and a decision on every finding. That is the route
-      to fresh code findings; this pass only follows up earlier feedback and checks CI. It
+      to a complete fresh review; this pass follows up earlier feedback, flags new
+      problems in what changed since, and checks CI. It
       costs a full review and it posts a second, separate review to the pull
       request.
     options:
       - label: Approve with a personal thank-you
         value: approve
-        route: approval_writer
+        route: confirm_threads_approve
       - label: Comment with a note I write
         value: note
-        route: post_note
+        route: confirm_threads_note
         prompt_for: note
         multiline: true
       - label: Run the full review instead
@@ -1797,6 +1911,7 @@ agents:
       - apply_followup_triage.output.approved_count
       - apply_followup_triage.output.blocking_count
       - apply_followup_triage.output.recommended_count
+      - build_followup_questions.output.confirmations
     system_prompt: |
       You write the follow-up review that gets posted to a pull request. You
       are the last step before it is public, and you are writing to its author
@@ -1817,6 +1932,15 @@ agents:
 
       The severity on each point is theirs, not the reviewer's. The label wins.
       Write it at the weight it carries and let the wording follow.
+
+      Findings with status `new` are problems the change has introduced since
+      your earlier review. Write them as ordinary first mentions, not as a
+      second mention.
+
+      Findings marked as a reply on an earlier thread are posted as a reply
+      under your original comment, so write them as a direct continuation of
+      that conversation and do not greet the author again. The rest are posted
+      as fresh comments.
 
       Findings with status `ci` describe CI on this pass. Do not frame them as
       earlier feedback or imply the author has already been asked to fix them.
@@ -1857,6 +1981,10 @@ agents:
       {% if finding.path %}**Location:** `{{ finding.path }}{% if finding.line %}:{{ finding.line }}{% endif %}`{% else %}**Location:** none — this point has no single line{% endif %}
 
       **Status:** `{{ finding.status }}`
+      {% if finding.thread_id %}
+
+      **Posted as:** a reply on your original comment's thread{% if finding.thread_resolved %}, which the author had resolved and this reopens{% endif %}.
+      {% endif %}
 
       {{ finding.body }}
       {% if finding.suggestion %}
@@ -1901,6 +2029,11 @@ agents:
       Return a separate `opening`: one or two sentences thanking the author
       for this contribution and introducing the remaining feedback. Use only
       the PR title and the approved points, not a summary of the earlier review.
+      {% if (build_followup_questions.output.confirmations | length) > 0 %}
+      {{ build_followup_questions.output.confirmations | length }} earlier point{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }}
+      will be confirmed fixed and resolved on their own threads. Say briefly
+      that the fixes are confirmed and resolved, without naming them.
+      {% endif %}
       Credit specific progress only when an approved point supports it.
       When blocking points remain, explain that they need attention before
       moving forward; otherwise introduce the feedback as suggestions, not
@@ -1925,6 +2058,9 @@ agents:
     timeout: 300
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
@@ -1933,7 +2069,12 @@ agents:
       - followup_comment_writer.output.items
       - followup_comment_writer.output.opening
       - apply_followup_triage.output.approved
+      - build_followup_questions.output.confirmations
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/post_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -1942,9 +2083,57 @@ agents:
       - "{{ pr_worktree.output.base_sha }}"
       - "{{ pr_worktree.output.remote }}"
       - "COMMENT"
-    stdin: '{"mode": "findings", "opening": {{ followup_comment_writer.output.opening | tojson }}, "approved": {{ apply_followup_triage.output.approved | tojson }}, "items": {{ followup_comment_writer.output["items"] | tojson }}}'
+    stdin: '{"mode": "findings", "opening": {{ followup_comment_writer.output.opening | tojson }}, "approved": {{ apply_followup_triage.output.approved | tojson }}, "confirmations": {{ build_followup_questions.output.confirmations | tojson }}, "items": {{ followup_comment_writer.output["items"] | tojson }}}'
     routes:
       - to: cleanup
+
+  - name: confirm_threads_approve
+    description: Confirms fixed points and resolves their threads before the approval is written; a failure here never blocks the approval
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
+      - pr_resolver.output.pr_number
+      - build_followup_questions.output.confirmations
+    args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
+      - "{{ workflow.dir }}/scripts/sync_threads.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+    stdin: '{"confirmations": {{ build_followup_questions.output.confirmations | tojson }}}'
+    routes:
+      - to: approval_writer
+
+  - name: confirm_threads_note
+    description: Confirms fixed points and resolves their threads before your note is posted; a failure here never blocks the note
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
+      - pr_resolver.output.pr_number
+      - build_followup_questions.output.confirmations
+    args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
+      - "{{ workflow.dir }}/scripts/sync_threads.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+    stdin: '{"confirmations": {{ build_followup_questions.output.confirmations | tojson }}}'
+    routes:
+      - to: post_note
 
   - name: approval_writer
     description: Words the human's approval with a short thank-you tailored to this PR
@@ -1990,6 +2179,9 @@ agents:
     input:
       - workflow.input.merge
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
@@ -1997,6 +2189,10 @@ agents:
       - pr_worktree.output.remote
       - approval_writer.output.body
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/post_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -2020,9 +2216,16 @@ agents:
     timeout: 300
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/merge_readiness.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -2104,9 +2307,16 @@ agents:
     timeout: 300
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/merge_pr.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -2124,6 +2334,9 @@ agents:
     timeout: 300
     input:
       - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
       - pr_resolver.output.pr_number
       - pr_worktree.output.head_sha
       - pr_worktree.output.worktree_path
@@ -2131,6 +2344,10 @@ agents:
       - pr_worktree.output.remote
       - followup_clear_gate.output.additional_input
     args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
       - "{{ workflow.dir }}/scripts/post_review.py"
       - "{{ bootstrap.output.name_with_owner }}"
       - "{{ pr_resolver.output.pr_number }}"
@@ -2279,8 +2496,13 @@ agents:
       - post_followup_review.output.body_count?
       - post_followup_review.output.posted_count?
       - post_followup_review.output.error?
+      - post_followup_review.output.thread_replies?
+      - post_followup_review.output.thread_confirmations?
+      - post_followup_review.output.thread_errors?
+      - confirm_threads_approve.output.error?
+      - confirm_threads_note.output.error?
       - cleanup_report.output.summary
-    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; no review or CI findings were posted. {{ post_note.output.review_url }}{% else %}Posted {{ post_followup_review.output.posted_count }} findings from this follow-up pass on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} earlier points addressed, {{ apply_followup_triage.output.dropped_count }} findings let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.body_count }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %} {{ cleanup_report.output.summary }}"
+    reason: "{% if post_approval is defined %}Approved #{{ pr_resolver.output.pr_number }}{% if apply_followup_triage is defined and apply_followup_triage.output.approved_count %}, leaving {{ apply_followup_triage.output.approved_count }} finding{{ 's' if apply_followup_triage.output.approved_count != 1 else '' }} from this follow-up pass unraised{% endif %}.{% if merge_pr is defined %}{% if merge_pr.output.merged %} Squash-merged{% if merge_pr.output.branch_deleted %} and deleted the source branch{% endif %}.{% elif merge_pr.output.queued %} Auto-merge is on, so GitHub will squash it once the required checks pass — it is not merged yet.{% endif %}{% if merge_pr.output.error %} Note: {{ merge_pr.output.error }}{% endif %}{% endif %} {{ post_approval.output.review_url }}{% elif post_note is defined %}Commented on #{{ pr_resolver.output.pr_number }} with your note; no review or CI findings were posted. {{ post_note.output.review_url }}{% else %}Posted {{ post_followup_review.output.posted_count }} findings from this follow-up pass on #{{ pr_resolver.output.pr_number }} ({{ build_followup_questions.output.addressed_count }} earlier points addressed, {{ apply_followup_triage.output.dropped_count }} findings let go{% if apply_followup_triage.output.reclassified_count %}, {{ apply_followup_triage.output.reclassified_count }} reclassified{% endif %} at triage), {{ post_followup_review.output.inline_posted }} anchored inline and {{ post_followup_review.output.body_count }} in the body. {{ post_followup_review.output.review_url }}{% if post_followup_review.output.error %} Note: {{ post_followup_review.output.error }}{% endif %}{% endif %}{% if post_followup_review is defined and post_followup_review.output.thread_replies %} {{ post_followup_review.output.thread_replies }} replied on existing threads.{% endif %}{% if post_followup_review is defined and post_followup_review.output.thread_confirmations %} {{ post_followup_review.output.thread_confirmations }} earlier points confirmed and resolved.{% endif %}{% if post_followup_review is defined and post_followup_review.output.thread_errors %} Thread problems: {{ post_followup_review.output.thread_errors | join('; ') }}{% endif %}{% if confirm_threads_approve is defined and confirm_threads_approve.output.error %} Thread confirmation problems: {{ confirm_threads_approve.output.error }}{% endif %}{% if confirm_threads_note is defined and confirm_threads_note.output.error %} Thread confirmation problems: {{ confirm_threads_note.output.error }}{% endif %} {{ cleanup_report.output.summary }}"
 
   - name: followup_failed
     type: terminate
@@ -2300,7 +2522,6 @@ agents:
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_url
       - merge_pr.output.error
-      - merge_pr.output.state
       - cleanup_report.output.summary
     reason: "Approval for #{{ pr_resolver.output.pr_number }} was posted, but the merge could not be completed or confirmed. {{ merge_pr.output.error }} Check the current PR state and resolve the reported blockers before retrying. If the head changed, start a new review. {{ pr_resolver.output.pr_url }} {{ cleanup_report.output.summary }}"
 

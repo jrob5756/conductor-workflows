@@ -11,7 +11,7 @@ Sample workflow registry for [Conductor](https://github.com/microsoft/conductor)
 | `document-update` | Update an existing markdown document to incorporate a stated purpose, with technical and readability review cycles (loops back to the editor until both thresholds are met) |
 | `fusion` | Multi-model deliberation modelled on OpenRouter's Fusion Router: a panel of models from different labs answers independently in parallel, an analyst compares (never merges) their answers into consensus, contradictions, coverage gaps, unique insights and blind spots, and a synthesiser writes the final answer. A cheap gate lets trivial questions skip the panel |
 | `log-service-audit` | [Evidence-gated LogService audit](workflows/log-service-audit/README.md): isolated bug/dead-code/stability discovery, duplicate consolidation, then one candidate at a time through reproduction, verification, `needs triage` issue creation and cleanup |
-| `pr-review` | Review open pull requests for repository fit and implementation quality in isolated worktrees. Reuse passing CI, approve or retry runs only when needed, and reconcile current checks without duplicate findings. Follow-up runs track distinct earlier findings. Validate approved finding coverage and the reviewed head before publishing. Approval and squash-merge require separate decisions; stopped runs remain resumable until explicitly discarded |
+| `pr-review` | Review open pull requests for repository fit and implementation quality in isolated worktrees. Reuse passing CI, approve or retry runs only when needed, and reconcile current checks without duplicate findings. Follow-up runs track distinct earlier findings. Fixed points get a fix-confirmed reply and are resolved, unfixed ones are replied to on their original thread (reopened if resolved), and new problems become new inline comments. Validate approved finding coverage and the reviewed head before publishing. Approval and squash-merge require separate decisions; stopped runs remain resumable until explicitly discarded |
 | `sdd-design` | Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan) |
 | `sdd-plan` | Solution design + implementation plan with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge. Optional `design` input switches it to plan-only mode, consuming an existing design document (e.g. one produced by `sdd-design`) |
 | `sdd-implement` | Implement a plan epic-by-epic with epic-level and plan-level review |
@@ -35,6 +35,32 @@ conductor run sdd-plan --input goal="Design a caching layer"
 Run `pr-review` from the repository containing an open pull request. Closed
 and merged pull requests stop before review. Each invocation owns a separate
 worktree; starting another review does not remove an earlier checkout.
+
+GitHub authentication is checked automatically before any review or worktree
+starts. Preflight tries the active stored account first, then other accounts
+on the target host, selecting the first with repository write access. Public
+read access alone is insufficient for this workflow's CI and publishing actions.
+You are prompted only if no usable account is found or GitHub refuses the PR
+read: authenticate or repair permissions, then choose **Retry**, or stop
+without starting a review.
+
+The selected identity is pinned for PR discovery, prior-review lookup, checkout,
+CI, publication, and merging. Credentials are loaded into command environments,
+never workflow outputs or checkpoints; `gh`'s global active account is unchanged.
+Review agents are instructed to use the same authenticated command wrapper.
+Checkout fetches use HTTPS and a command-local GitHub credential helper, without
+changing your remotes or global Git configuration.
+An explicitly supplied `GH_TOKEN`/`GITHUB_TOKEN` (or the corresponding enterprise
+token) takes precedence and is never silently replaced by a stored credential.
+Changing that environment token requires a new run.
+
+Repository write permission is a preflight check, not a guarantee of token scopes
+or organization policy. If GitHub rejects a CI approval/rerun with an authorization
+error, the workflow pauses **before code review**. Restore the selected account's
+access and retry CI, or stop and clean up. Retrying does not switch identities,
+and it reuses already passing/running CI. Actual test failures still become
+blocking review findings. Permission changes after review begins can still make
+later operations fail; publication never blindly retries an uncertain write.
 
 Two inputs control repository-specific policy without changing the workflow:
 

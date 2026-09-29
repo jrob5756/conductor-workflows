@@ -40,10 +40,12 @@ class ChangesSinceReviewTests(unittest.TestCase):
             "no_previous_review",
         )
 
-    def scan(self, reviews, inline=None, conversation=None):
+    def scan(self, reviews, inline=None, conversation=None, threads=None):
         with patch.object(
             prior_review, "fetch",
             side_effect=[(reviews, ""), (inline or [], ""), (conversation or [], "")],
+        ), patch.object(
+            prior_review, "fetch_threads", return_value=(threads or {}, "")
         ), contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit):
                 prior_review.main(["owner/repo", "1", "me", "other", "abc", "/repo"])
@@ -98,6 +100,32 @@ class ChangesSinceReviewTests(unittest.TestCase):
         self.assertEqual(result["prior_items"][0]["replies"][0]["body"], "Fixed")
         self.assertEqual([item["finding_id"] for item in result["prior_items"]],
                          [item["finding_id"] for item in findings])
+
+    def test_inline_items_carry_thread_state_and_own_replies_are_not_items(self):
+        thread = {"thread_id": "T1", "resolved": True, "root_comment_id": 20, "last_author": "author"}
+        inline = [
+            {"id": 20, "user": {"login": "me"}, "path": "a.py", "line": 3, "body": "Fix it",
+             "created_at": "2026-01-01"},
+            {"id": 21, "user": {"login": "me"}, "in_reply_to_id": 20, "body": "Still open",
+             "created_at": "2026-01-02"},
+            {"id": 22, "user": {"login": "author"}, "in_reply_to_id": 20, "body": "Done",
+             "created_at": "2026-01-03"},
+        ]
+        result = self.scan([], inline, threads={20: thread, 21: thread, 22: thread})
+        self.assertEqual(len(result["prior_items"]), 1)
+        item = result["prior_items"][0]
+        self.assertEqual((item["thread_id"], item["comment_id"]), ("T1", 20))
+        self.assertTrue(item["thread_resolved"])
+        self.assertTrue(item["awaiting_reply"])
+        self.assertEqual(result["thread_error"], "")
+
+    def test_thread_replies_from_earlier_review_are_not_new_items(self):
+        findings = [{"finding_id": "run:b1", "source_type": "code", "path": "a.py", "line": 3,
+                     "body": "Still needed", "placement": "thread", "title": "T"}]
+        review = {"id": 10, "user": {"login": "me"}, "body": render(findings),
+                  "state": "COMMENTED", "commit_id": "abc"}
+        result = self.scan([review])
+        self.assertEqual(result["prior_items"], [])
 
     def test_edited_summary_and_unrecognized_metadata_remain_reviewable(self):
         finding = {"finding_id": "run:b1", "source_type": "code", "path": "",

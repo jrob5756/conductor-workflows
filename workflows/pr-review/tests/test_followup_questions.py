@@ -226,6 +226,66 @@ class FollowupQuestionsTests(unittest.TestCase):
                 self.assertFalse(applied["ok"])
                 self.assertEqual(applied["approved_count"], 0)
 
+    THREAD = {"thread_id": "T1", "comment_id": 20, "thread_resolved": False, "awaiting_reply": True}
+
+    def test_addressed_point_is_confirmed_and_resolved_on_its_thread(self):
+        result = self.build(
+            items=[{"source_ids": ["p1"], "status": "addressed", "title": "Bug", "path": "a.py",
+                    "line": 3, "evidence": "a.py:3 now checks expiry."}],
+            prior_items=[{"id": "p1", "body": "Fix", **self.THREAD}],
+        )
+        self.assertEqual(len(result["confirmations"]), 1)
+        action = result["confirmations"][0]
+        self.assertEqual((action["thread_id"], action["comment_id"], action["resolve"]), ("T1", 20, "resolve"))
+        self.assertTrue(action["body"].startswith("Fix confirmed."))
+        self.assertIn("a.py:3 now checks expiry.", action["body"])
+
+    def test_confirmation_skips_already_confirmed_and_still_open_threads(self):
+        resolved_by_me = {**self.THREAD, "thread_resolved": True, "awaiting_reply": False}
+        result = self.build(
+            items=[{"source_ids": ["p1"], "status": "addressed", "title": "A"},
+                   {"source_ids": ["p2"], "status": "addressed", "title": "B"},
+                   {"source_ids": ["p3"], "status": "partially_addressed", "title": "C",
+                    "severity": "BLOCKING"}],
+            prior_items=[
+                {"id": "p1", "body": "A", **resolved_by_me},
+                {"id": "p2", "body": "B", **{**self.THREAD, "thread_id": "T2", "comment_id": 30}},
+                {"id": "p3", "body": "C", **{**self.THREAD, "thread_id": "T2", "comment_id": 30}},
+            ],
+        )
+        self.assertEqual(result["confirmations"], [])
+        self.assertEqual(result["findings"][0]["thread_id"], "T2")
+
+    def test_resolved_thread_authors_closed_is_confirmed_without_resolving_again(self):
+        result = self.build(
+            items=[{"source_ids": ["p1"], "status": "addressed", "title": "A"}],
+            prior_items=[{"id": "p1", "body": "A", **{**self.THREAD, "thread_resolved": True}}],
+        )
+        self.assertEqual(result["confirmations"][0]["resolve"], "")
+
+    def test_open_point_carries_thread_so_it_reopens_and_new_items_are_new(self):
+        result = self.build(
+            items=[{"source_ids": ["p1"], "status": "not_addressed", "severity": "BLOCKING",
+                    "title": "Old"}],
+            new_items=[{"severity": "RECOMMENDED", "title": "Fresh", "path": "b.py", "line": 2,
+                        "original": "New problem"}],
+            prior_items=[{"id": "p1", "body": "Old", **{**self.THREAD, "thread_resolved": True}}],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["new_count"], 1)
+        old, new = result["findings"]
+        self.assertTrue(old["thread_resolved"])
+        self.assertEqual((new["status"], new["source_ids"]), ("new", []))
+        self.assertNotIn("thread_id", new)
+        self.assertEqual(result["unsourced_count"], 0)
+
+    def test_new_item_citing_a_source_is_rejected(self):
+        result = self.build(
+            items=[], prior_items=[{"id": "p1", "body": "Old"}],
+            new_items=[{"source_ids": ["p1"], "title": "x"}],
+        )
+        self.assertFalse(result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

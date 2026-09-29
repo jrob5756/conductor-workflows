@@ -51,6 +51,82 @@ class WorkflowRoutingTests(unittest.TestCase):
         self.assertEqual(self.route("select_review", {"followup": True}), "ci_start")
         self.assertEqual(self.route("select_review", {"followup": False}), "concept_review")
 
+    def test_account_selection_is_automatic_and_only_errors_prompt(self):
+        self.assertEqual(self.route("bootstrap", {"ok": True, "auth_error": False}), "pr_resolver")
+        self.assertEqual(self.route("bootstrap", {"ok": False, "auth_error": True}), "authentication_gate")
+        self.assertEqual(self.route("bootstrap", {"ok": False, "auth_error": False}), "bootstrap_failed")
+        gate = self.agents["authentication_gate"]
+        self.assertEqual(gate["type"], "human_gate")
+        self.assertEqual([option["route"] for option in gate["options"]], ["bootstrap_failed", "bootstrap"])
+        self.assertEqual(self.agents["pr_resolver"]["type"], "script")
+        self.assertNotIn("plugins", self.agents["pr_resolver"])
+
+    def test_every_github_script_uses_the_same_pinned_identity(self):
+        scripts = {
+            "pr_resolver.py", "pr_worktree.py", "prior_review.py", "ci.py",
+            "post_review.py", "merge_readiness.py", "merge_pr.py",
+        }
+        checked = []
+        for name, agent in self.agents.items():
+            args = agent.get("args", [])
+            if not any(any(argument.endswith("/" + script) for script in scripts) for argument in args):
+                continue
+            checked.append(name)
+            self.assertEqual(args[:4], [
+                "{{ workflow.dir }}/scripts/github_auth.py",
+                "{{ bootstrap.output.host }}", "{{ bootstrap.output.gh_user }}",
+                "{{ bootstrap.output.auth_source }}",
+            ], name)
+            for field in ("host", "gh_user", "auth_source"):
+                self.assertIn(f"bootstrap.output.{field}", agent["input"], name)
+        self.assertEqual(set(checked), {
+            "pr_resolver", "pr_worktree", "prior_review", "ci_start", "ci_wait",
+            "post_review", "post_followup_review", "post_approval", "post_note",
+            "merge_readiness", "merge_pr",
+        })
+        self.assertNotIn("GH_TOKEN", WORKFLOW.read_text())
+
+    def test_reviewers_use_authenticated_reads_without_global_switches(self):
+        for name in ("concept_review", "code_review", "followup_review"):
+            self.assertIn("scripts/github_auth.py", self.agents[name]["prompt"])
+            self.assertIn("Never run `gh auth switch`", self.agents[name]["prompt"])
+
+    def test_ci_authorization_error_pauses_before_review_and_retry_does_not_rebootstrap(self):
+        self.assertEqual(
+            self.route("ci_start", {"ok": False, "auth_error": True}), "ci_authentication_gate",
+        )
+        self.assertEqual(self.route("ci_start", {"ok": False, "auth_error": False}), "cleanup")
+        gate = self.agents["ci_authentication_gate"]
+        self.assertEqual(gate["type"], "human_gate")
+        self.assertEqual([option["route"] for option in gate["options"]], ["cleanup", "ci_start"])
+        self.assertNotIn("code_review", [option["route"] for option in gate["options"]])
+        self.assertEqual(self.route("ci_start", {"ok": True, "auth_error": False}), "followup_review")
+
+    def test_pr_endpoint_and_wrapper_authentication_errors_reach_retry_gate(self):
+        for output in (
+            {"found": False, "auth_error": True, "notes": "HTTP 403", "name_with_owner": "owner/repo"},
+            {"ok": False, "found": False, "auth_error": True, "notes": "Credential expired"},
+        ):
+            self.assertEqual(self.route("pr_resolver", output), "pr_authentication_gate")
+        self.assertEqual(
+            [option["route"] for option in self.agents["pr_authentication_gate"]["options"]],
+            ["pr_resolver_failed", "bootstrap"],
+        )
+
+    def test_merge_wrapper_failure_preserves_diagnostic_through_terminal_inputs(self):
+        diagnostic = "Selected GitHub credential expired; nothing was executed."
+        context = {
+            "pr_resolver": {"output": {"pr_number": 1, "pr_url": "https://github.com/owner/repo/pull/1"}},
+            "merge_pr": {"output": {"ok": False, "auth_error": True, "error": diagnostic}},
+            "cleanup_report": {"output": {"summary": "Cleanup complete."}},
+        }
+        self.assertEqual(self.route("cleanup_report", {}, **context), "merge_failed")
+        for reference in self.agents["merge_failed"]["input"]:
+            agent, output, field = reference.split(".")
+            self.assertIn(field, context[agent][output])
+        reason = self.jinja.from_string(self.agents["merge_failed"]["reason"]).render(**context)
+        self.assertIn(diagnostic, reason)
+
     def test_code_review_always_bracketed_by_ci(self):
         self.assertEqual(self.route("concept_review", {"blocking": [], "verdict": "good_addition"}), "ci_start")
         self.assertEqual(self.agents["concept_gate"]["options"][0]["route"], "ci_start")
@@ -203,11 +279,15 @@ class WorkflowRoutingTests(unittest.TestCase):
             self.assertEqual(self.route(writer, {"items": []}), publisher)
             rendered = self.jinja.from_string(self.agents[publisher]["stdin"]).render(
                 **{writer: {"output": {"items": items, "opening": opening}},
-                   triage: {"output": {"approved": approved}}}
+                   triage: {"output": {"approved": approved}},
+                   "build_followup_questions": {"output": {"confirmations": []}}}
             )
-            self.assertEqual(json.loads(rendered), {
+            expected = {
                 "mode": "findings", "opening": opening, "items": items, "approved": approved,
-            })
+            }
+            if writer == "followup_comment_writer":
+                expected["confirmations"] = []
+            self.assertEqual(json.loads(rendered), expected)
 
     def test_concept_note_and_approval_use_distinct_plain_modes(self):
         import json
@@ -232,8 +312,11 @@ class WorkflowRoutingTests(unittest.TestCase):
         for name in ("review_clear_gate", "followup_gate", "followup_clear_gate"):
             approve = next(option for option in self.agents[name]["options"]
                            if option["value"] == "approve")
-            self.assertEqual(approve["route"], "approval_writer")
+            expected = "approval_writer" if name == "review_clear_gate" else "confirm_threads_approve"
+            self.assertEqual(approve["route"], expected)
             self.assertNotIn("LGTM, thanks for contributing!", self.agents[name]["prompt"])
+        self.assertEqual(self.route("confirm_threads_approve", {"ok": False}), "approval_writer")
+        self.assertEqual(self.route("confirm_threads_note", {"ok": False}), "post_note")
         self.assertEqual(self.route("approval_writer", {"body": "Looks good, thanks!"}), "post_approval")
         self.assertEqual(self.agents["approval_writer"]["input"], ["pr_resolver.output.pr_title"])
         self.assertIn("approval_writer.output.body", self.agents["post_approval"]["input"])

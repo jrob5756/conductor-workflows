@@ -44,6 +44,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "CONDUCTOR_SELF_RUN_ID": "", "CONDUCTOR_RUN_ID": "",
             "CONDUCTOR_HOME": str(self.root / "conductor"),
+            "PR_REVIEW_GH_HOST": "",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -96,6 +97,33 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(first["base_sha"], self.base_sha)
         self.assertEqual(self.record(first)["repo_root"], str(self.repo))
         self.assertEqual(self.record(first)["owner"], lifecycle.process_identity(os.getppid()))
+
+    def test_pinned_checkout_uses_https_helper_instead_of_ambient_ssh_identity(self):
+        self.git("remote", "set-url", "origin", "git@github.com:owner/repo.git")
+        config = (self.repo / ".git" / "config").read_text()
+        original_git = pr_worktree.git
+        fetches = []
+
+        def local_transport(repo, *args):
+            if "fetch" in args:
+                fetches.append(args)
+                self.assertEqual(args[-2], "https://github.com/owner/repo.git")
+                self.assertIn("credential.helper=", args)
+                self.assertIn("credential.helper=!gh auth git-credential", args)
+                self.assertIn("http.https://github.com/owner/repo.git.extraHeader=", args)
+                args = (*args[:-2], str(self.repo), args[-1])
+            return original_git(repo, *args)
+
+        with patch.dict(os.environ, {"PR_REVIEW_GH_HOST": "github.com"}), patch.object(
+            pr_worktree, "git", side_effect=local_transport,
+        ):
+            created = self.create()
+        self.assertTrue(created["ok"], created)
+        self.assertEqual(len(fetches), 2)
+        self.assertEqual(created["head_sha"], self.head_sha)
+        self.assertEqual(created["base_sha"], self.base_sha)
+        self.assertEqual(created["remote"], "origin")
+        self.assertEqual((self.repo / ".git" / "config").read_text(), config)
 
     def test_clean_success_only_removes_owned_checkout_and_refs(self):
         first, second = self.create(), self.create()

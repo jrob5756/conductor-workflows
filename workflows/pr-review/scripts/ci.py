@@ -9,6 +9,7 @@ import sys
 import time
 from urllib.parse import parse_qs, urlsplit
 
+from github_auth import is_auth_failure
 from merge_readiness import (
     QueryError, command, inspect_checks, paginated, parse_json, query, validate_target,
     validate_ignored_checks,
@@ -32,7 +33,7 @@ def finding(title: str, body: str) -> dict:
 def response(findings=None, **extra) -> dict:
     findings = [{**item, "source_type": "ci"} for item in findings or []]
     return {
-        "ok": True, "error": "", "findings": findings,
+        "ok": True, "auth_error": False, "error": "", "findings": findings,
         "summary": "; ".join(f"{item['title']}: {item['body']}" for item in findings) if findings else "CI verified.",
         **extra,
     }
@@ -43,7 +44,7 @@ def fatal(error: str, findings=None, **extra) -> dict:
     diagnostic = finding("CI verification could not complete", error)
     if diagnostic not in findings:
         findings.append(diagnostic)
-    return response(findings, **{**extra, "ok": False, "error": error})
+    return response(findings, **{**extra, "ok": False, "auth_error": is_auth_failure(error), "error": error})
 
 
 def read_pr(nwo: str, pr_number: str, head_sha: str, deadline=None) -> dict:
@@ -216,6 +217,13 @@ def start(nwo: str, pr_number: str, head_sha: str) -> dict:
                 )
             except QueryError as exc:
                 findings.append(finding(f"Could not {action} PR CI", f"{run_label(nwo, run)}. {exc}"))
+                if is_auth_failure(str(exc)):
+                    return fatal(
+                        f"GitHub authorization prevented CI startup: {exc}", findings,
+                        run_ids=[item["id"] for item in tracked], runs=tracked,
+                        nwo=nwo, pr_number=str(pr_number), reviewed_head_sha=head_sha,
+                        discovery_pending=False,
+                    )
         read_pr(nwo, pr_number, head_sha, deadline)
     except QueryError as exc:
         error = str(exc)

@@ -28,14 +28,16 @@ PARTIALLY_ADDRESSED = "partially_addressed"
 UNCLEAR = "unclear"
 ADDRESSED = "addressed"
 OBSOLETE = "obsolete"
+NEW = "new"
 
-OUTSTANDING = (NOT_ADDRESSED, PARTIALLY_ADDRESSED, UNCLEAR)
+OUTSTANDING = (NOT_ADDRESSED, PARTIALLY_ADDRESSED, UNCLEAR, NEW)
 CLOSED = (ADDRESSED, OBSOLETE)
 
 STATUS_LABEL = {
     NOT_ADDRESSED: "Still open",
     PARTIALLY_ADDRESSED: "Partly done",
     UNCLEAR: "Could not tell",
+    NEW: "New",
     ADDRESSED: "Addressed",
     OBSOLETE: "Moot",
 }
@@ -76,6 +78,8 @@ def fail(message: str) -> None:
             "unaccounted_count": 0,
             "unsourced_count": 0,
             "ci_count": 0,
+            "new_count": 0,
+            "confirmations": [],
         }
     )
 
@@ -161,6 +165,7 @@ def normalize(entry: object) -> dict[str, object] | None:
         "title": title[:TITLE_LIMIT],
         "body": "\n\n".join(parts) or title,
         "suggestion": recommendation,
+        "evidence": evidence,
         "source_ids": sources,
         "source_id": sources[0] if sources else "",
         "source_type": entry.get("source_type", "code"),
@@ -246,7 +251,53 @@ EMPTY = {
     "unaccounted_count": 0,
     "unsourced_count": 0,
     "ci_count": 0,
+    "new_count": 0,
+    "confirmations": [],
 }
+
+
+def thread_of(item: dict[str, object], by_id: dict[str, dict[str, object]]) -> dict[str, object] | None:
+    """The first earlier comment behind this point that still has a readable thread."""
+    for source in item["source_ids"]:
+        prior = by_id.get(source)
+        if prior and isinstance(prior.get("thread_id"), str) and prior["thread_id"] \
+                and type(prior.get("comment_id")) is int:
+            return prior
+    return None
+
+
+def confirmations_for(
+    resolved: list[dict[str, object]],
+    outstanding: list[dict[str, object]],
+    by_id: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """Threads whose point is fixed: confirm the fix and resolve, unless another point still lives there."""
+    open_threads = set()
+    for item in outstanding:
+        thread = thread_of(item, by_id)
+        if thread:
+            open_threads.add(thread["thread_id"])
+    actions, seen = [], set()
+    for item in resolved:
+        thread = thread_of(item, by_id) if item["status"] == ADDRESSED else None
+        if not thread or thread["thread_id"] in open_threads | seen:
+            continue
+        seen.add(thread["thread_id"])
+        already_resolved = bool(thread.get("thread_resolved"))
+        # A resolved thread whose last word is yours was already confirmed on an earlier visit.
+        if already_resolved and not thread.get("awaiting_reply", True):
+            continue
+        evidence = str(item.get("evidence") or "").strip()
+        actions.append({
+            "thread_id": thread["thread_id"],
+            "comment_id": thread["comment_id"],
+            "body": f"Fix confirmed. {evidence}".strip(),
+            "resolve": "" if already_resolved else "resolve",
+            "path": item["path"],
+            "line": item["line"],
+            "title": item["title"],
+        })
+    return actions
 
 
 def main() -> None:
@@ -264,6 +315,7 @@ def main() -> None:
     ci_entries = []
     duplicates = []
     ci_verified = False
+    new_entries = []
     if isinstance(payload, list):
         entries, prior_items = payload, []
     elif isinstance(payload, dict):
@@ -272,6 +324,7 @@ def main() -> None:
         ci_entries = payload.get("ci_findings", [])
         ci_verified = "ci_findings" in payload
         duplicates = payload.get("duplicate_sources", [])
+        new_entries = payload.get("new_items", [])
     elif payload is None:
         entries, prior_items = [], []
     else:
@@ -281,6 +334,8 @@ def main() -> None:
         fail(f"The follow-up analysis must be a JSON array, got {type(entries).__name__}")
     if not isinstance(ci_entries, list):
         fail("CI findings must be a JSON array.")
+    if not isinstance(new_entries, list):
+        fail("New findings must be a JSON array.")
     if not isinstance(prior_items, list) or any(
         not isinstance(prior, dict) or not isinstance(prior.get("id"), str)
         or not prior["id"] or not isinstance(prior.get("body"), str) or not prior["body"].strip()
@@ -300,6 +355,14 @@ def main() -> None:
             invalid += 1
         else:
             normalized.append(item)
+
+    new_items = []
+    for entry in new_entries:
+        item = normalize(entry) if isinstance(entry, dict) and not entry.get("source_ids") else None
+        if item is None or item["source_type"] != "code":
+            invalid += 1
+        else:
+            new_items.append({**item, "status": NEW})
 
     if invalid:
         fail(
@@ -363,6 +426,14 @@ def main() -> None:
 
     outstanding = [item for item in normalized if item["status"] in OUTSTANDING]
     resolved = [item for item in normalized if item["status"] in CLOSED]
+    confirmations = confirmations_for(resolved, outstanding, by_id)
+    for item in outstanding:
+        thread = thread_of(item, by_id)
+        if thread:
+            item["thread_id"] = thread["thread_id"]
+            item["comment_id"] = thread["comment_id"]
+            item["thread_resolved"] = bool(thread.get("thread_resolved"))
+    outstanding.extend(new_items)
 
     for entry in ci_entries:
         if (
@@ -413,6 +484,8 @@ def main() -> None:
             # a point the analysis introduced rather than followed up. It is
             # still asked — the human drops what does not belong — but the
             # count says it happened.
+            "new_count": len(new_items),
+            "confirmations": confirmations,
             "unsourced_count": sum(
                 1
                 for item in normalized

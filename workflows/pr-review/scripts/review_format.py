@@ -8,29 +8,43 @@ import re
 MARKER = re.compile(r"\n\n<!-- conductor-review:v([12]):([A-Za-z0-9_=-]+) -->$")
 
 
-def visible_body(findings, opening=""):
+def location_of(item):
+    location = item["path"]
+    if location and item["line"]:
+        location += f":{item['line']}"
+    return location
+
+
+def visible_body(findings, opening="", confirmed=()):
     inline_count = sum(item["placement"] == "inline" for item in findings)
-    parts = [
-        f"{len(findings)} approved findings: {inline_count} inline, "
-        f"{len(findings) - inline_count} in this review body."
-    ]
+    thread_count = sum(item["placement"] == "thread" for item in findings)
+    body_count = len(findings) - inline_count - thread_count
+    summary = f"{len(findings)} approved findings: {inline_count} inline, "
+    if thread_count:
+        summary += f"{thread_count} as replies on existing threads, "
+    parts = [summary + f"{body_count} in this review body."]
     if opening:
         parts.insert(0, opening)
+    if thread_count:
+        lines = [f"- `{location_of(i) or 'General'}`: {i['title']}" for i in findings if i["placement"] == "thread"]
+        parts.append("Still open, replied on the original thread:\n\n" + "\n".join(lines))
+    if confirmed:
+        lines = [f"- `{location_of(i) or 'General'}`: {i['title']}" for i in confirmed]
+        parts.append("Fix confirmed and thread resolved on the original comment:\n\n" + "\n".join(lines))
     for item in findings:
         if item["placement"] == "body":
-            location = item["path"]
-            if location and item["line"]:
-                location += f":{item['line']}"
+            location = location_of(item)
             parts.append(f"### {location or 'General'}\n\n{item['body']}")
     return "\n\n".join(parts)
 
 
-def render(findings, opening=""):
+def render(findings, opening="", confirmed=()):
     """Include a manifest whose visible body can be verified before deduplication."""
-    encoded = base64.urlsafe_b64encode(
-        json.dumps({"opening": opening, "findings": findings}, ensure_ascii=True).encode()
-    ).decode()
-    return visible_body(findings, opening) + f"\n\n<!-- conductor-review:v2:{encoded} -->"
+    manifest = {"opening": opening, "findings": findings}
+    if confirmed:
+        manifest["confirmed"] = list(confirmed)
+    encoded = base64.urlsafe_b64encode(json.dumps(manifest, ensure_ascii=True).encode()).decode()
+    return visible_body(findings, opening, confirmed) + f"\n\n<!-- conductor-review:v2:{encoded} -->"
 
 
 def recover(body):
@@ -40,14 +54,18 @@ def recover(body):
         return None
     try:
         data = json.loads(base64.b64decode(match[2], altchars=b"-_", validate=True))
-        opening = ""
+        opening, confirmed = "", []
         if match[1] == "1":
             findings = data
         else:
-            if not isinstance(data, dict) or set(data) != {"opening", "findings"}:
+            if not isinstance(data, dict) or not {"opening", "findings"} <= set(data) <= {"opening", "findings", "confirmed"}:
                 return None
             opening, findings = data["opening"], data["findings"]
-            if not isinstance(opening, str):
+            confirmed = data.get("confirmed", [])
+            if not isinstance(opening, str) or not isinstance(confirmed, list) or any(
+                not isinstance(c, dict) or not all(isinstance(c.get(k), str) for k in ("path", "title"))
+                or type(c.get("line")) is not int for c in confirmed
+            ):
                 return None
         if not isinstance(findings, list) or not findings:
             return None
@@ -59,7 +77,8 @@ def recover(body):
                 or not item["finding_id"]
                 or item["finding_id"] in ids
                 or item.get("source_type") not in ("code", "ci")
-                or item.get("placement") not in ("inline", "body")
+                or item.get("placement") not in ("inline", "body", "thread")
+                or (item["placement"] == "thread" and not isinstance(item.get("title"), str))
                 or not isinstance(item.get("path"), str)
                 or type(item.get("line")) is not int
                 or not isinstance(item.get("body"), str)
@@ -67,7 +86,7 @@ def recover(body):
             ):
                 return None
             ids.add(item["finding_id"])
-        if visible_body(findings, opening) != body[:match.start()]:
+        if visible_body(findings, opening, confirmed) != body[:match.start()]:
             return None
         return findings
     except (ValueError, UnicodeDecodeError):

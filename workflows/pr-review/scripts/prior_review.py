@@ -50,7 +50,11 @@ Output:
     ok, error, has_prior_review, prior_items, context_comments, review_count,
     inline_count, issue_comment_count, reply_count, items_dropped,
     matched_logins, other_login_items, last_interaction_at, last_review_at,
-    last_review_state, last_review_commit, comparison_commit, change_status, change_summary
+    last_review_state, last_review_commit, comparison_commit, change_status, change_summary,
+    thread_error
+
+    Inline items also carry thread_id, comment_id, thread_resolved and awaiting_reply when
+    the thread could be read; `thread_error` explains why they are absent otherwise.
 """
 
 from __future__ import annotations
@@ -60,6 +64,7 @@ import subprocess
 import sys
 
 from review_format import recover
+from threads import fetch_threads
 
 BODY_LIMIT = 6000
 REPLY_LIMIT = 1500
@@ -102,6 +107,7 @@ def fail(message: str) -> None:
             "last_review_at": "",
             "last_review_state": "",
             "last_review_commit": "",
+            "thread_error": "",
         }
     )
 
@@ -261,6 +267,19 @@ def main(argv: list[str]) -> None:
     if conversation is None:
         fail(f"Could not read the conversation comments on {nwo}#{pr_number}. {error}")
 
+    thread_map, thread_error = fetch_threads(nwo, pr_number)
+
+    def thread_fields(comment_id: object) -> dict[str, object]:
+        thread = thread_map.get(comment_id) if isinstance(comment_id, int) else None
+        if thread is None:
+            return {}
+        return {
+            "thread_id": thread["thread_id"],
+            "comment_id": thread["root_comment_id"],
+            "thread_resolved": thread["resolved"],
+            "awaiting_reply": str(thread["last_author"]).casefold() not in mine,
+        }
+
     me = gh_user.casefold()
     # A PENDING review is a draft only its author can see. Treating one as a
     # prior review would branch the workflow on something the pull request's
@@ -283,6 +302,9 @@ def main(argv: list[str]) -> None:
         if login_of(comment).casefold() in mine
         and comment.get("pull_request_review_id") not in draft_reviews
     ]
+    my_comment_ids = {c["id"] for c in my_inline if c.get("id") is not None}
+    # A reply of yours inside your own thread continues that point; it is not a new one.
+    my_inline = [c for c in my_inline if c.get("in_reply_to_id") is None or c["in_reply_to_id"] not in my_comment_ids]
     my_conversation = [c for c in conversation if login_of(c).casefold() in mine]
 
     threads: dict[object, list[dict[str, object]]] = {}
@@ -295,7 +317,10 @@ def main(argv: list[str]) -> None:
         provenance = recover(str(review.get("body") or ""))
         if provenance is not None:
             for finding in provenance:
+                if finding["placement"] == "thread":
+                    continue
                 replies = []
+                thread = {}
                 for comment in my_inline:
                     if (
                         finding["placement"] == "inline"
@@ -307,6 +332,7 @@ def main(argv: list[str]) -> None:
                     ):
                         represented_inline.add(comment.get("id"))
                         replies.extend(replies_to(comment, threads, mine))
+                        thread = thread_fields(comment.get("id"))
                 items.append({
                     "kind": "finding",
                     "finding_id": finding["finding_id"],
@@ -320,6 +346,7 @@ def main(argv: list[str]) -> None:
                     "body": finding["body"],
                     "replies": replies,
                     "review_id": review.get("id"),
+                    **thread,
                 })
             continue
         body = truncate(review.get("body"), BODY_LIMIT)
@@ -359,6 +386,7 @@ def main(argv: list[str]) -> None:
                 "url": str(comment.get("html_url") or ""),
                 "body": body,
                 "replies": replies_to(comment, threads, mine),
+                **thread_fields(comment.get("id")),
             }
         )
     for comment in my_conversation:
@@ -453,6 +481,7 @@ def main(argv: list[str]) -> None:
             "last_review_at": stamp_of(latest_review) if latest_review else "",
             "last_review_state": str(latest_review.get("state") or "") if latest_review else "",
             "last_review_commit": str(latest_review.get("commit_id") or "") if latest_review else "",
+            "thread_error": thread_error,
         }
     )
 

@@ -14,6 +14,7 @@ import sys
 import uuid
 
 from review_format import render
+from threads import apply_actions, valid_action
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -38,6 +39,9 @@ def fail(message: str) -> None:
             "body_count": 0,
             "posted_count": 0,
             "fallback_used": False,
+            "thread_replies": 0,
+            "thread_confirmations": 0,
+            "thread_errors": [],
         }
     )
 
@@ -180,6 +184,9 @@ def validate_findings(parsed):
             or not isinstance(finding.get("path", ""), str)
             or type(finding.get("line", 0)) is not int or finding.get("line", 0) < 0
             or finding.get("source_type", "code") not in ("code", "ci")
+            or not isinstance(finding.get("title", ""), str)
+            or not isinstance(finding.get("thread_id", ""), str)
+            or type(finding.get("comment_id", 0)) is not int
         ):
             raise ValueError(f"Malformed approved finding {identity}.")
         by_id[identity] = finding
@@ -203,9 +210,38 @@ def validate_findings(parsed):
             "path": finding.get("path", ""),
             "line": finding.get("line", 0),
             "body": written[identity],
+            "title": finding.get("title", ""),
+            "thread_id": finding.get("thread_id", ""),
+            "comment_id": finding.get("comment_id", 0),
+            "thread_resolved": bool(finding.get("thread_resolved")),
         }
         for identity, finding in by_id.items()
     ]
+
+
+def validate_confirmations(parsed):
+    confirmations = parsed.get("confirmations", [])
+    if not isinstance(confirmations, list) or not all(valid_action(c) for c in confirmations):
+        raise ValueError("Malformed thread confirmations.")
+    for c in confirmations:
+        if not isinstance(c.get("path", ""), str) or type(c.get("line", 0)) is not int or not isinstance(c.get("title", ""), str):
+            raise ValueError("Malformed thread confirmations.")
+    return confirmations
+
+
+def thread_actions(findings, confirmations):
+    """Replies for still-open points, reopening any the author had resolved, then confirmations."""
+    actions = [
+        {
+            "thread_id": item["thread_id"],
+            "comment_id": item["comment_id"],
+            "body": item["body"],
+            "resolve": "unresolve" if item["thread_resolved"] else "",
+        }
+        for item in findings
+        if item["placement"] == "thread"
+    ]
+    return actions + confirmations
 
 
 def main(argv: list[str]) -> None:
@@ -233,6 +269,7 @@ def main(argv: list[str]) -> None:
     mode = parsed.get("mode")
     findings = []
     inline = []
+    confirmations = []
     demoted = 0
     if mode == "findings":
         if event != "COMMENT":
@@ -245,15 +282,26 @@ def main(argv: list[str]) -> None:
             findings = validate_findings(parsed)
         except ValueError as exc:
             fail(str(exc))
+        try:
+            confirmations = validate_confirmations(parsed)
+        except ValueError as exc:
+            fail(str(exc))
         anchors = anchorable_lines(load_diff(worktree, base_ref, remote, nwo, pr_number))
         for item in findings:
             path, line = item["path"], item["line"]
+            if item["thread_id"] and item["comment_id"]:
+                item["placement"] = "thread"
+                continue
             item["placement"] = "inline" if path and line in anchors.get(path, set()) else "body"
             if item["placement"] == "inline":
                 inline.append({"path": path, "line": line, "side": "RIGHT", "body": item["body"]})
             elif path and line:
                 demoted += 1
-        body = render(findings, opening)
+        confirmed = [
+            {"path": c.get("path", ""), "line": c.get("line", 0), "title": c.get("title", "")}
+            for c in confirmations
+        ]
+        body = render(findings, opening, confirmed)
     elif mode in ("concept", "note", "approval"):
         if (mode == "approval") != (event == "APPROVE"):
             fail("Approval mode and event must agree.")
@@ -269,44 +317,44 @@ def main(argv: list[str]) -> None:
     if inline:
         payload["comments"] = inline
 
-    url, error, retryable = post(nwo, pr_number, payload)
-    if url:
+    thread_count = sum(item["placement"] == "thread" for item in findings)
+
+    def finish(review_url: str, error: str, inline_posted: int, fallback: bool) -> None:
+        # The review is already public, so thread failures are reported rather than fatal.
+        _, thread_errors = apply_actions(nwo, pr_number, thread_actions(findings, confirmations))
         emit(
             {
                 "ok": True,
-                "error": "",
-                "review_url": url,
-                "inline_posted": len(inline),
-                "inline_demoted": demoted,
-                "body_count": len(findings) - len(inline),
+                "error": error,
+                "review_url": review_url,
+                "inline_posted": inline_posted,
+                "inline_demoted": demoted + (len(inline) if fallback else 0),
+                "body_count": len(findings) - inline_posted - thread_count,
                 "posted_count": len(findings),
-                "fallback_used": False,
+                "fallback_used": fallback,
+                "thread_replies": thread_count,
+                "thread_confirmations": len(confirmations),
+                "thread_errors": thread_errors,
             }
         )
+
+    url, error, retryable = post(nwo, pr_number, payload)
+    if url:
+        finish(url, "", len(inline), False)
 
     if not inline or not retryable:
         fail(f"Could not post the review: {error}")
 
     for item in findings:
-        item["placement"] = "body"
+        if item["placement"] == "inline":
+            item["placement"] = "body"
     retry_url, retry_error, _ = post(
-        nwo, pr_number, {"commit_id": head_sha, "event": event, "body": render(findings, opening)}
+        nwo, pr_number, {"commit_id": head_sha, "event": event, "body": render(findings, opening, confirmed)}
     )
     if not retry_url:
         fail(f"Could not post the review: {error}. Retry without inline comments: {retry_error}")
 
-    emit(
-        {
-            "ok": True,
-            "error": f"Inline comments were rejected and folded into the body: {error}",
-            "review_url": retry_url,
-            "inline_posted": 0,
-            "inline_demoted": demoted + len(inline),
-            "body_count": len(findings),
-            "posted_count": len(findings),
-            "fallback_used": True,
-        }
-    )
+    finish(retry_url, f"Inline comments were rejected and folded into the body: {error}", 0, True)
 
 
 if __name__ == "__main__":

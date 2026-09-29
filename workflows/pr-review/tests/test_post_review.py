@@ -84,6 +84,34 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual([item["body"] for item in recovered],
                          [item["body"] for item in payload["items"]])
 
+    def test_thread_findings_reply_reopen_and_confirmations_resolve(self):
+        payload = finding_payload(2)
+        payload["approved"][0].update(title="Still open", thread_id="T1", comment_id=20,
+                                      thread_resolved=True)
+        payload["confirmations"] = [{"thread_id": "T2", "comment_id": 30, "body": "Fix confirmed.",
+                                     "resolve": "resolve", "path": "old.py", "line": 4, "title": "Fixed"}]
+        with patch.object(post_review, "apply_actions", return_value=(2, [])) as apply:
+            result, calls = self.execute(payload)
+        self.assertEqual((result["inline_posted"], result["body_count"],
+                          result["thread_replies"], result["thread_confirmations"]), (1, 0, 1, 1))
+        posted = json.loads(calls[-1][1])
+        self.assertEqual(len(posted["comments"]), 1)
+        self.assertIn("1 as replies on existing threads", posted["body"])
+        self.assertIn("`old.py:4`: Fixed", posted["body"])
+        self.assertEqual(len(recover(posted["body"])), 2)
+        actions = apply.call_args.args[2]
+        self.assertEqual([(a["thread_id"], a["resolve"]) for a in actions],
+                         [("T1", "unresolve"), ("T2", "resolve")])
+        self.assertEqual(actions[0]["body"], "Written finding 1")
+
+    def test_thread_action_failures_are_reported_not_fatal(self):
+        payload = finding_payload(1)
+        payload["approved"][0].update(title="T", thread_id="T1", comment_id=20)
+        with patch.object(post_review, "apply_actions", return_value=(0, ["boom"])):
+            result, _ = self.execute(payload)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["thread_errors"], ["boom"])
+
     def test_malformed_missing_duplicate_unknown_items_never_reach_api(self):
         invalid_items = [
             [], None, {}, ["text"], [{}], [{"finding_id": "b1"}],
