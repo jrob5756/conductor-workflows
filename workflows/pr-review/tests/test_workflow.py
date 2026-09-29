@@ -367,5 +367,21 @@ class WorkflowRoutingTests(unittest.TestCase):
             self.assertIn("cleanup_report.output.summary", terminal["input"])
 
 
+    def test_writer_prompt_renders_findings_without_thread_fields(self):
+        prompt = self.jinja.from_string(self.agents["followup_comment_writer"]["prompt"])
+        base = {"id": "b1", "severity": "BLOCKING", "title": "T", "path": "", "line": 0,
+                "status": "new", "body": "B", "suggestion": "", "guidance": ""}
+        threaded = {**base, "id": "b2", "thread_id": "T1", "thread_resolved": True}
+        rendered = prompt.render(
+            pr_resolver={"output": {"pr_number": 1, "pr_title": "x"}},
+            prior_review={"output": {"last_review_at": "t", "last_interaction_at": "t"}},
+            apply_followup_triage={"output": {"approved": [base, threaded], "approved_count": 2,
+                                              "blocking_count": 2, "recommended_count": 0}},
+            build_followup_questions={"output": {"confirmations": []}},
+        )
+        self.assertEqual(rendered.count("a reply on your original comment's thread"), 1)
+        self.assertIn("reopens", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

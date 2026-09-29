@@ -1981,9 +1981,9 @@ agents:
       {% if finding.path %}**Location:** `{{ finding.path }}{% if finding.line %}:{{ finding.line }}{% endif %}`{% else %}**Location:** none — this point has no single line{% endif %}
 
       **Status:** `{{ finding.status }}`
-      {% if finding.thread_id %}
+      {% if finding.thread_id is defined and finding.thread_id %}
 
-      **Posted as:** a reply on your original comment's thread{% if finding.thread_resolved %}, which the author had resolved and this reopens{% endif %}.
+      **Posted as:** a reply on your original comment's thread{% if finding.thread_resolved is defined and finding.thread_resolved %}, which the author had resolved and this reopens{% endif %}.
       {% endif %}
 
       {{ finding.body }}
