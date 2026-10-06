@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import uuid
 
 
@@ -33,9 +34,59 @@ def safe_path(value: str) -> Path:
     return path
 
 
+def _require_supported_platform(needs: str) -> None:
+    if not sys.platform.startswith(("linux", "darwin")):
+        raise LifecycleError(f"Automatic lifecycle operations require {needs}.")
+
+
+def _ps(pid: int, *fields: str) -> list[str] | None:
+    """Query macOS ps; None means the process does not exist."""
+    result = subprocess.run(
+        ["ps", "-o", ",".join(f"{field}=" for field in fields), "-p", str(pid)],
+        capture_output=True, text=True, check=False, env={**os.environ, "LC_ALL": "C"},
+    )
+    out = result.stdout.strip()
+    if result.returncode == 1 and not out and not result.stderr.strip():
+        return None
+    if result.returncode:
+        raise LifecycleError(f"Cannot establish process identity for PID {pid}: ps failed.")
+    return out.split(None, len(fields) - 1)
+
+
+def _darwin_boot_id() -> str:
+    # bootsessionuuid is stable; kern.boottime can shift when the clock is adjusted.
+    for key in ("kern.bootsessionuuid", "kern.boottime"):
+        result = subprocess.run(
+            ["sysctl", "-n", key], capture_output=True, text=True, check=False
+        )
+        out = result.stdout.strip()
+        if result.returncode == 0 and out:
+            match = re.search(r"sec = (\d+)", out)
+            return match.group(1) if match else out
+    raise LifecycleError("Cannot establish local boot identity.")
+
+
+def _darwin_process_identity(pid: int) -> dict[str, object] | None:
+    fields = _ps(pid, "stat", "lstart")
+    if fields is None:
+        return None
+    if len(fields) != 2:
+        raise LifecycleError(f"Malformed process identity for PID {pid}.")
+    state, started = fields
+    if state.startswith("Z"):
+        return None
+    try:
+        start = int(time.mktime(time.strptime(started, "%a %b %d %H:%M:%S %Y")))
+    except (ValueError, OverflowError) as exc:
+        raise LifecycleError(f"Malformed process start time for PID {pid}.") from exc
+    # macOS has no PID namespaces, so a constant satisfies the stored-identity shape.
+    return {"pid": pid, "start": str(start), "boot": _darwin_boot_id(), "namespace": 0}
+
+
 def process_identity(pid: int) -> dict[str, object] | None:
-    if not sys.platform.startswith("linux"):
-        raise LifecycleError("Automatic lifecycle operations require Linux /proc process identity.")
+    _require_supported_platform("Linux /proc or macOS ps process identity")
+    if sys.platform.startswith("darwin"):
+        return _darwin_process_identity(pid)
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     except FileNotFoundError:
@@ -54,14 +105,22 @@ def process_identity(pid: int) -> dict[str, object] | None:
     return {"pid": pid, "start": fields[19], "boot": boot, "namespace": namespace}
 
 
+def _parent_pid(pid: int) -> int:
+    if sys.platform.startswith("darwin"):
+        fields = _ps(pid, "ppid")
+        if fields is None:
+            raise LifecycleError(f"PID {pid} exited during ancestry inspection.")
+        return int(fields[0])
+    return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+
+
 def ancestor_pids() -> set[int]:
     result: set[int] = set()
     pid = os.getppid()
     while pid > 1 and pid not in result:
         result.add(pid)
         try:
-            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-            pid = int(fields[1])
+            pid = _parent_pid(pid)
         except (OSError, ValueError, IndexError) as exc:
             raise LifecycleError(f"Cannot establish runner ancestry: {exc}") from exc
     return result
@@ -149,9 +208,8 @@ def check_inactive(record: dict, *, discard: bool) -> None:
 
 @contextmanager
 def registry(repo: str):
-    """Serialize this repository's lifecycle commands; Linux is required."""
-    if not sys.platform.startswith("linux"):
-        raise LifecycleError("Automatic lifecycle operations require Linux /proc and flock.")
+    """Serialize this repository's lifecycle commands; Linux or macOS is required."""
+    _require_supported_platform("Linux or macOS with flock")
     import fcntl
 
     repo_path = safe_path(repo)

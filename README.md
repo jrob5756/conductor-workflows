@@ -121,7 +121,7 @@ active or uncertain owners and legacy worktrees without ownership records.
 Add `--allow-dirty` only when you also intend to delete uncommitted, untracked,
 and ignored files. It does not override ownership or changed-head checks.
 
-The owned-worktree lifecycle currently requires Linux `/proc` and `flock`.
+The owned-worktree lifecycle requires Linux (`/proc`) or macOS (`ps`/`sysctl`), plus `flock`.
 Automatic discard cannot verify ownership across boots or PID namespaces and
 refuses those cases; inspect retained resources manually rather than bypassing
 the checks. A still-live dashboard is conservatively treated as an active owner.

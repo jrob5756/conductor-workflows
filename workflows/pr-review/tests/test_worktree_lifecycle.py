@@ -17,12 +17,14 @@ import pr_worktree
 import worktree_lifecycle as lifecycle
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "Lifecycle commands require Linux /proc")
+@unittest.skipUnless(
+    sys.platform.startswith(("linux", "darwin")), "Lifecycle commands require Linux or macOS"
+)
 class WorktreeLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.worktrees = self.root / "repo.worktrees"
@@ -250,7 +252,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
 
     def test_different_boot_or_namespace_refuses(self):
-        for key, value in (("boot", "another-boot"), ("namespace", 0)):
+        other_namespace = lifecycle.process_identity(os.getpid())["namespace"] + 1
+        for key, value in (("boot", "another-boot"), ("namespace", other_namespace)):
             with self.subTest(key=key):
                 created = self.create()
                 self.update_record(created, owner={**self.record(created)["owner"], key: value})
@@ -430,13 +433,48 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["worktree_removed"])
 
-    def test_non_linux_refuses_automatic_deletion(self):
+    def test_unsupported_platform_refuses_automatic_deletion(self):
         created = self.create()
-        with patch.object(lifecycle.sys, "platform", "darwin"):
+        with patch.object(lifecycle.sys, "platform", "freebsd14"):
             result = self.clean(created)
         self.assertFalse(result["ok"])
         self.assertIn("Linux", result["notes"])
         self.assertTrue(Path(created["worktree_path"]).exists())
+
+
+class DarwinProcessIdentityTests(unittest.TestCase):
+    """Parsing is exercised with stubbed ps/sysctl so it runs on every platform."""
+
+    def run_identity(self, ps_output, ps_code=0, ps_err=""):
+        def fake_run(args, **kwargs):
+            if args[0] == "ps":
+                return subprocess.CompletedProcess(args, ps_code, ps_output, ps_err)
+            return subprocess.CompletedProcess(args, 0, "{ sec = 1790000000, usec = 5 }\n", "")
+
+        with patch.object(lifecycle.sys, "platform", "darwin"), \
+                patch.object(lifecycle.subprocess, "run", side_effect=fake_run):
+            return lifecycle.process_identity(4242)
+
+    def test_live_process_has_checkable_identity(self):
+        identity = self.run_identity("Ss   Tue Oct  6 08:38:13 2026\n")
+        self.assertEqual(identity["pid"], 4242)
+        self.assertTrue(identity["start"].isdigit())
+        self.assertEqual(identity["boot"], "1790000000")
+        self.assertEqual(identity["namespace"], 0)
+
+    def test_missing_process_is_none(self):
+        self.assertIsNone(self.run_identity("", ps_code=1))
+
+    def test_zombie_is_none(self):
+        self.assertIsNone(self.run_identity("Z    Tue Oct  6 08:38:13 2026\n"))
+
+    def test_ps_failure_is_unknown_not_dead(self):
+        with self.assertRaises(lifecycle.LifecycleError):
+            self.run_identity("", ps_code=2, ps_err="ps: illegal option")
+
+    def test_malformed_start_time_is_unknown(self):
+        with self.assertRaises(lifecycle.LifecycleError):
+            self.run_identity("Ss   not a date\n")
 
 
 if __name__ == "__main__":
