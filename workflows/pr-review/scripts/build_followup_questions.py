@@ -374,16 +374,23 @@ def main() -> None:
 
     by_id = {prior["id"]: prior for prior in prior_items}
     known = set(by_id)
-    cited = {source for item in normalized for source in item["source_ids"]}
     delegated = {source for source, prior in by_id.items()
                  if prior.get("source_type") == "ci"} if ci_verified else set()
     verified_ci = set(delegated)
     retained = []
+    cited: set[str] = set()
     for item in normalized:
         sources = set(item["source_ids"])
         prior_ci = sources & verified_ci
-        if prior_ci and sources - verified_ci:
-            fail("A follow-up point mixes CI and code sources; split them before reconciliation.")
+        foreign = sources - verified_ci
+        if prior_ci and foreign:
+            # An unverified earlier note about the same CI failure may ride along on a CI
+            # point. Only the verified CI sources are delegated; the note must still be
+            # accounted for by another point, or the unexamined-source check stops the run.
+            if not all(by_id.get(source, {}).get("source_type") == "legacy" for source in foreign):
+                fail("A follow-up point mixes CI and code sources; split them before reconciliation.")
+            sources = prior_ci
+        cited.update(sources)
         if ci_verified and (prior_ci or item["source_type"] == "ci"):
             if not sources or not sources <= known:
                 fail("A delegated CI point must cite known earlier feedback.")

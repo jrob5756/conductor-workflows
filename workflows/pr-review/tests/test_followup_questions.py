@@ -175,6 +175,51 @@ class FollowupQuestionsTests(unittest.TestCase):
         self.assertEqual(result["question_count"], 1)
         self.assertEqual(result["findings"][0]["title"], "Real code bug")
 
+    def test_legacy_note_riding_on_a_ci_point_does_not_stop_the_run(self):
+        prior_items = [
+            {"id": "p1", "body": "CI failed", "source_type": "ci"},
+            {"id": "p2", "body": "CI is red on one job; the test looks wrong.", "source_type": "legacy"},
+        ]
+        result = self.build(
+            prior_items=prior_items,
+            items=[
+                {"source_ids": ["p1", "p2"], "source_type": "ci", "status": "addressed",
+                 "title": "Current-head CI passes"},
+                {"source_ids": ["p2"], "source_type": "code", "status": "addressed",
+                 "title": "Test tolerates Windows name casing"},
+            ],
+            ci_findings=[],
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delegated_ci_count"], 1)
+        self.assertEqual(result["addressed_count"], 1)
+
+    def test_legacy_note_on_a_ci_point_still_needs_another_point_to_account_for_it(self):
+        result = self.build(
+            prior_items=[
+                {"id": "p1", "body": "CI failed", "source_type": "ci"},
+                {"id": "p2", "body": "CI is red; also fix the retry bug.", "source_type": "legacy"},
+            ],
+            items=[{"source_ids": ["p1", "p2"], "source_type": "ci", "status": "addressed",
+                    "title": "Current-head CI passes"}],
+            ci_findings=[],
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("p2 is unexamined", result["error"])
+
+    def test_code_source_mixed_into_a_ci_point_is_still_refused(self):
+        result = self.build(
+            prior_items=[
+                {"id": "p1", "body": "CI failed", "source_type": "ci"},
+                {"id": "p2", "body": "Real code bug", "source_type": "code"},
+            ],
+            items=[{"source_ids": ["p1", "p2"], "source_type": "ci", "status": "addressed",
+                    "title": "Current-head CI passes"}],
+            ci_findings=[],
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("mixes CI and code", result["error"])
+
     def test_genuine_code_provenance_cannot_be_discarded_as_ci(self):
         result = self.build(
             prior_items=[{"id": "p1", "body": "Real code bug", "source_type": "code"}],
