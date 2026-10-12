@@ -141,7 +141,7 @@ workflow:
 
   runtime:
     provider: copilot
-    default_model: gpt-6-sol
+    default_model: gpt-6.1-sol
     max_session_seconds: 3600
     checkpoint:
       every_agent: true   # long, human-gated run — keep it resumable after an
@@ -664,7 +664,7 @@ agents:
 
   - name: coder
     description: Implements the approved plan on autopilot and verifies it with the repository's own build, lint and test commands
-    model: gpt-6-sol
+    model: gpt-6.1-sol
     context_tier: long_context
     reasoning:
       effort: high
@@ -927,7 +927,7 @@ agents:
 
   - name: review_fixer
     description: Applies the review's findings and pushes them, so the review itself never has to double as an implementer
-    model: gpt-6-sol
+    model: gpt-6.1-sol
     context_tier: long_context
     reasoning:
       effort: medium
@@ -1361,7 +1361,7 @@ agents:
 
   - name: conflict_resolver
     description: Merges the base branch into the pull request branch and resolves the conflicts, re-running the repository's own checks before pushing
-    model: gpt-6-sol
+    model: gpt-6.1-sol
     context_tier: long_context
     reasoning:
       effort: high
