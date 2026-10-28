@@ -271,7 +271,8 @@ class CheckTests(unittest.TestCase):
 class CommandTests(unittest.TestCase):
     def test_subprocess_errors_are_explicit(self):
         for error in (FileNotFoundError("gh"), subprocess.TimeoutExpired(["gh"], 30)):
-            with self.subTest(error=error), patch.object(readiness.subprocess, "run", side_effect=error):
+            with self.subTest(error=error), patch.object(readiness.subprocess, "run", side_effect=error), \
+                    patch.object(readiness.time, "sleep"):
                 with self.assertRaises(readiness.QueryError):
                     readiness.query(["pr", "view", "1"])
 
@@ -299,6 +300,64 @@ class CommandTests(unittest.TestCase):
             readiness.query(["pr", "view", "1"])
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
         self.assertFalse(run.call_args.kwargs.get("shell", False))
+
+
+def failed(stderr):
+    return subprocess.CompletedProcess([], 1, "", stderr)
+
+
+OK = subprocess.CompletedProcess([], 0, "{}", "")
+TLS = 'Get "https://api.github.com/repos/o/r/pulls/1": net/http: TLS handshake timeout'
+
+
+class TransientRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.sleep = self.enterContext(patch.object(readiness.time, "sleep"))
+
+    def test_read_recovers_from_a_dropped_tls_handshake(self):
+        with patch.object(readiness, "command", side_effect=[failed(TLS), OK]) as command:
+            self.assertEqual(readiness.query(["api", "repos/o/r/pulls/1"]), {})
+        self.assertEqual(command.call_count, 2)
+        self.sleep.assert_called_once_with(readiness.RETRY_BACKOFF[0])
+
+    def test_persistent_transient_read_failure_is_still_reported(self):
+        with patch.object(readiness, "command", return_value=failed("gh: Server Error (HTTP 502)")) as command:
+            with self.assertRaisesRegex(readiness.QueryError, "HTTP 502"):
+                readiness.query(["api", "repos/o/r"])
+        self.assertEqual(command.call_count, len(readiness.RETRY_BACKOFF) + 1)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], list(readiness.RETRY_BACKOFF))
+
+    def test_definitive_github_answers_are_not_retried(self):
+        for stderr in ("gh: Not Found (HTTP 404)", "gh: Bad credentials (HTTP 401)", "rate limit exceeded (HTTP 403)"):
+            with self.subTest(stderr=stderr), patch.object(readiness, "command", return_value=failed(stderr)) as command:
+                with self.assertRaises(readiness.QueryError):
+                    readiness.query(["api", "repos/o/r"])
+                self.assertEqual(command.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_mutation_is_resent_only_when_the_request_never_left(self):
+        with patch.object(readiness, "command", side_effect=[failed(TLS), OK]) as command:
+            self.assertEqual(readiness.retrying_command(["api", "x"], mutation=True).returncode, 0)
+        self.assertEqual(command.call_count, 2)
+        for stderr in ('Post "https://api.github.com/x": read tcp: connection reset by peer', "HTTP 502: Bad Gateway"):
+            with self.subTest(stderr=stderr), patch.object(readiness, "command", return_value=failed(stderr)) as command:
+                self.assertEqual(readiness.retrying_command(["api", "x"], mutation=True).returncode, 1)
+                self.assertEqual(command.call_count, 1)
+
+    def test_backoff_never_sleeps_past_the_deadline(self):
+        deadline = readiness.time.monotonic() + readiness.RETRY_BACKOFF[0] / 2
+        with patch.object(readiness, "command", return_value=failed(TLS)) as command:
+            with self.assertRaisesRegex(readiness.QueryError, "TLS handshake timeout"):
+                readiness.query(["api", "repos/o/r"], deadline)
+        self.assertEqual(command.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_answered_checks_are_not_retried_despite_stderr_noise(self):
+        rows = json.dumps([check(state="PENDING", bucket="pending")])
+        answered = subprocess.CompletedProcess([], 8, rows, "i/o timeout")
+        with patch.object(readiness, "command", return_value=answered) as command:
+            self.assertEqual(len(readiness.check_rows("owner/repo", "1", False)), 1)
+        self.assertEqual(command.call_count, 1)
 
 
 if __name__ == "__main__":

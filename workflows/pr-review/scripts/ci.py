@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from github_auth import is_auth_failure
 from merge_readiness import (
-    QueryError, command, inspect_checks, paginated, parse_json, query, validate_target,
+    QueryError, command, inspect_checks, paginated, parse_json, query, retrying_command, validate_target,
     validate_ignored_checks,
 )
 
@@ -206,7 +206,10 @@ def start(nwo: str, pr_number: str, head_sha: str) -> dict:
                     decision = "Reused passing" if run["status"] == "completed" else "Already running"
                     decisions.append(f"{decision}: {run_label(nwo, run)}")
                     continue
-                proc = command(["api", f"repos/{nwo}/actions/runs/{run['id']}/{endpoint}", "--method", "POST"], deadline)
+                proc = retrying_command(
+                    ["api", f"repos/{nwo}/actions/runs/{run['id']}/{endpoint}", "--method", "POST"],
+                    deadline, mutation=True, runner=command,
+                )
                 if proc.returncode:
                     raise QueryError(proc.stderr.strip() or proc.stdout.strip() or "GitHub rejected the request.")
                 tracked.append(tracking(run, action))

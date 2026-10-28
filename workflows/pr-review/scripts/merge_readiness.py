@@ -12,6 +12,24 @@ from urllib.parse import quote
 
 COMMAND_TIMEOUT = 30
 PR_FIELDS = "headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision,url"
+# One dropped TLS handshake used to end a whole review run (ci_wait routes any gh
+# failure to ci_failed), discarding the paid-for review. Reads retry with backoff,
+# bounded by the caller's deadline; total extra wait is at most sum(RETRY_BACKOFF).
+RETRY_BACKOFF = (2, 5, 10)
+# Failures where the request never reached GitHub, so even a mutation is safe to resend.
+_PRESEND_FAILURE = re.compile(
+    r"TLS handshake timeout|connection refused|no such host|server misbehaving|"
+    r"dial tcp [^\r\n]*: i/o timeout|network is unreachable",
+    re.IGNORECASE,
+)
+# Additional failures that are transient for an idempotent read, but where a mutation
+# may already have been applied.
+_TRANSIENT_READ_FAILURE = re.compile(
+    r"i/o timeout|connection reset|broken pipe|unexpected EOF|\": EOF\b|"
+    r"Client\.Timeout exceeded|timeout awaiting response headers|"
+    r"\bHTTP 50[0234]\b|could not complete: .*timed out",
+    re.IGNORECASE,
+)
 
 
 class QueryError(RuntimeError):
@@ -45,6 +63,46 @@ def command(args: list[str], deadline: float | None = None) -> subprocess.Comple
         raise QueryError(f"gh {' '.join(args[:3])} could not complete: {exc}") from exc
 
 
+def is_transient(message: str, *, mutation: bool = False) -> bool:
+    """Whether a gh failure is a network or GitHub-side blip worth resending."""
+    if _PRESEND_FAILURE.search(message):
+        return True
+    return not mutation and bool(_TRANSIENT_READ_FAILURE.search(message))
+
+
+def _can_wait(delay: float, deadline: float | None) -> bool:
+    return deadline is None or time.monotonic() + delay < deadline
+
+
+def retrying_command(
+    args: list[str], deadline: float | None = None, *, mutation: bool = False, runner=None,
+) -> subprocess.CompletedProcess:
+    """Run gh, resending after transient failures while the deadline allows.
+
+    Output on stdout means GitHub answered (`gh pr checks` exits 8 with rows for
+    pending checks), so only a failure with empty stdout is a retry candidate.
+    `runner` lets a caller keep its own patchable `command` seam.
+    """
+    runner = runner or command
+    for delay in (*RETRY_BACKOFF, None):
+        try:
+            proc = runner(args, deadline)
+        except QueryError as exc:
+            message = str(exc)
+            if delay is None or not is_transient(message, mutation=mutation) or not _can_wait(delay, deadline):
+                raise
+        else:
+            message = proc.stderr.strip()
+            if (
+                proc.returncode == 0 or proc.stdout.strip() or delay is None
+                or not is_transient(message, mutation=mutation) or not _can_wait(delay, deadline)
+            ):
+                return proc
+        print(f"gh {' '.join(args[:3])}: transient failure, retrying in {delay}s: {message}", file=sys.stderr)
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def parse_json(text: str, label: str):
     try:
         return json.loads(text)
@@ -53,7 +111,7 @@ def parse_json(text: str, label: str):
 
 
 def query(args: list[str], deadline: float | None = None):
-    proc = command(args, deadline)
+    proc = retrying_command(args, deadline)
     if proc.returncode:
         raise QueryError(f"gh {' '.join(args[:3])}: {proc.stderr.strip() or proc.stdout.strip() or 'request failed'}")
     value = parse_json(proc.stdout, "gh")
@@ -116,7 +174,7 @@ def check_rows(nwo: str, pr_number: str, required: bool, deadline=None) -> list[
     args = ["pr", "checks", str(pr_number), "-R", nwo, "--json", "name,state,bucket,link,workflow"]
     if required:
         args.append("--required")
-    proc = command(args, deadline)
+    proc = retrying_command(args, deadline)
     text = proc.stdout.strip()
     if not text and proc.returncode == 1:
         message = proc.stderr.strip().lower()
