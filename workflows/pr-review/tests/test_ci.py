@@ -173,6 +173,19 @@ class StartTests(unittest.TestCase):
         self.assertIn("/rerun", command.call_args.args[0][1])
         self.assertEqual(command.call_args.args[0][-2:], ["--method", "POST"])
 
+    def test_rerun_is_resent_after_a_dropped_tls_handshake(self):
+        with patch.object(ci, "read_pr", return_value=PR), patch.object(
+            ci, "discover", return_value=[run(conclusion="failure")],
+        ), patch.object(ci, "command", side_effect=[
+            subprocess.CompletedProcess([], 1, "", 'Post "https://api.github.com/x": net/http: TLS handshake timeout'),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]) as command, patch("merge_readiness.time.sleep"):
+            result = ci.start("owner/repo", "1", SHA)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["findings"])
+        self.assertEqual(result["runs"][0]["action"], "rerun")
+        self.assertEqual(command.call_count, 2)
+
     def test_start_deadline_leaves_time_to_emit_blocking_feedback(self):
         with patch.object(ci.time, "monotonic", return_value=100), patch.object(
             ci, "read_pr", return_value=PR
