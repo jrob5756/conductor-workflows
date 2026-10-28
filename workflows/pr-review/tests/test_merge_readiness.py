@@ -352,7 +352,15 @@ class TransientRetryTests(unittest.TestCase):
         self.assertEqual(command.call_count, 1)
         self.sleep.assert_not_called()
 
-    def test_answered_checks_are_not_retried_despite_stderr_noise(self):
+    def test_slurped_pagination_failure_is_retried_despite_empty_array_on_stdout(self):
+        # gh api --paginate --slurp prints "[]" even when the first request never left.
+        slurped = subprocess.CompletedProcess([], 1, "[]\n", TLS)
+        page = subprocess.CompletedProcess([], 0, '[{"runs": [{"id": 1}]}]', "")
+        with patch.object(readiness, "command", side_effect=[slurped, page]) as command:
+            self.assertEqual(readiness.paginated("repos/o/r/actions/runs", "runs"), [{"id": 1}])
+        self.assertEqual(command.call_count, 2)
+
+    def test_pending_checks_answer_is_not_retried_despite_stderr_noise(self):
         rows = json.dumps([check(state="PENDING", bucket="pending")])
         answered = subprocess.CompletedProcess([], 8, rows, "i/o timeout")
         with patch.object(readiness, "command", return_value=answered) as command:

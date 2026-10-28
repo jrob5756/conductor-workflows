@@ -15,7 +15,7 @@ PR_FIELDS = "headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,rev
 # One dropped TLS handshake used to end a whole review run (ci_wait routes any gh
 # failure to ci_failed), discarding the paid-for review. Reads retry with backoff,
 # bounded by the caller's deadline; total extra wait is at most sum(RETRY_BACKOFF).
-RETRY_BACKOFF = (2, 5, 10)
+RETRY_BACKOFF = (2, 5, 10, 20, 30)
 # Failures where the request never reached GitHub, so even a mutation is safe to resend.
 _PRESEND_FAILURE = re.compile(
     r"TLS handshake timeout|connection refused|no such host|server misbehaving|"
@@ -79,8 +79,9 @@ def retrying_command(
 ) -> subprocess.CompletedProcess:
     """Run gh, resending after transient failures while the deadline allows.
 
-    Output on stdout means GitHub answered (`gh pr checks` exits 8 with rows for
-    pending checks), so only a failure with empty stdout is a retry candidate.
+    Classification uses the exit code and stderr only: `gh api --paginate --slurp`
+    prints `[]` on stdout even when the request never left, so stdout is not proof
+    of an answer. Exit 8 is gh's "checks pending" answer and is never retried.
     `runner` lets a caller keep its own patchable `command` seam.
     """
     runner = runner or command
@@ -94,7 +95,7 @@ def retrying_command(
         else:
             message = proc.stderr.strip()
             if (
-                proc.returncode == 0 or proc.stdout.strip() or delay is None
+                proc.returncode in (0, 8) or delay is None
                 or not is_transient(message, mutation=mutation) or not _can_wait(delay, deadline)
             ):
                 return proc
