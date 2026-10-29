@@ -100,6 +100,11 @@ Approvals use a short LGTM or equivalent and thanks tailored to the contribution
 without claiming that waived findings were resolved. Inline findings keep their
 approved severity, and notes you write yourself are posted verbatim.
 
+On a follow-up run, fixed points are confirmed and their threads resolved when
+you approve, comment or post a note. To resolve them without publishing
+anything else, choose **Resolve the fixed threads, post nothing else**;
+**Post nothing** leaves every thread as it was.
+
 Stopping through the dashboard retains the checkpoint and worktree for
 resumption. It is not the same as choosing **Post nothing**, which follows the
 workflow's cleanup path. Keep retained worktrees until you resume or explicitly

@@ -327,6 +327,29 @@ class WorkflowRoutingTests(unittest.TestCase):
         self.assertIn("Add export option", feature)
         self.assertNotEqual(fix, feature)
 
+    def test_followup_gates_can_resolve_fixed_threads_without_publishing(self):
+        for name in ("followup_gate", "followup_blocking_gate", "followup_clear_gate"):
+            options = {option["value"]: option["route"] for option in self.agents[name]["options"]}
+            self.assertEqual(options["resolve_only"], "confirm_threads_only")
+            self.assertEqual(options["stop"], "cleanup")
+        node = self.agents["confirm_threads_only"]
+        self.assertIn("{{ workflow.dir }}/scripts/sync_threads.py", node["args"])
+        self.assertEqual(self.route("confirm_threads_only", {"ok": False}), "cleanup")
+        self.assertEqual(self.route("cleanup_report", {}), "no_review")
+        reason = self.jinja.from_string(self.agents["no_review"]["reason"])
+        resolved = reason.render(
+            pr_resolver={"output": {"pr_number": 7, "pr_url": "url"}},
+            cleanup_report={"output": {"summary": "Cleanup: done."}},
+            confirm_threads_only={"output": {"synced": 2, "error": "T9: forbidden"}},
+        )
+        self.assertIn("2 fixed threads confirmed and resolved", resolved)
+        self.assertIn("T9: forbidden", resolved)
+        untouched = reason.render(
+            pr_resolver={"output": {"pr_number": 7, "pr_url": "url"}},
+            cleanup_report={"output": {"summary": "Cleanup: done."}},
+        )
+        self.assertIn("Nothing was posted", untouched)
+
     def test_review_writers_request_warm_openings_without_reclassifying_findings(self):
         for name in ("comment_writer", "followup_comment_writer"):
             writer = self.agents[name]
@@ -393,7 +416,7 @@ class WorkflowRoutingTests(unittest.TestCase):
             "followup_gate",
         )
         values = [o["value"] for o in self.agents["followup_blocking_gate"]["options"]]
-        self.assertEqual(values, ["comment", "stop"])
+        self.assertEqual(values, ["comment", "resolve_only", "stop"])
         self.assertNotIn("approval_writer", str(self.agents["followup_blocking_gate"]["options"]))
 
     def test_triage_prompts_stay_short_so_first_question_is_visible(self):

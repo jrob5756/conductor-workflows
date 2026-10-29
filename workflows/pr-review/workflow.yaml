@@ -1688,6 +1688,7 @@ agents:
       {% if (build_followup_questions.output.confirmations | length) > 0 %}
       Approving or commenting first replies "Fix confirmed" on {{ build_followup_questions.output.confirmations | length }} addressed
       thread{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }} and resolves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }}.
+      To resolve {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }} without publishing anything else, choose "Resolve the fixed threads"; "Post nothing" leaves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }} open.
       {% endif %}
       {% if prior_review.output.thread_error %}
       > Review threads could not be read ({{ prior_review.output.thread_error }}), so no earlier comment can be confirmed, resolved or reopened on this run.
@@ -1716,6 +1717,9 @@ agents:
       - label: Post the points you kept as a review
         value: comment
         route: followup_comment_writer
+      - label: Resolve the fixed threads, post nothing else
+        value: resolve_only
+        route: confirm_threads_only
       - label: Post nothing
         value: stop
         route: cleanup
@@ -1787,6 +1791,7 @@ agents:
       {% if (build_followup_questions.output.confirmations | length) > 0 %}
       Posting first replies "Fix confirmed" on {{ build_followup_questions.output.confirmations | length }} addressed
       thread{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }} and resolves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }}.
+      To resolve {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }} without publishing anything else, choose "Resolve the fixed threads"; "Post nothing" leaves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }} open.
       {% endif %}
       {% if prior_review.output.thread_error %}
       > Review threads could not be read ({{ prior_review.output.thread_error }}), so no earlier comment can be confirmed, resolved or reopened on this run.
@@ -1801,6 +1806,9 @@ agents:
       - label: Post the points you kept as a review
         value: comment
         route: followup_comment_writer
+      - label: Resolve the fixed threads, post nothing else
+        value: resolve_only
+        route: confirm_threads_only
       - label: Post nothing
         value: stop
         route: cleanup
@@ -1883,6 +1891,7 @@ agents:
       {% if (build_followup_questions.output.confirmations | length) > 0 %}
       Approving or commenting first replies "Fix confirmed" on {{ build_followup_questions.output.confirmations | length }} addressed
       thread{{ 's' if (build_followup_questions.output.confirmations | length) != 1 else '' }} and resolves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }}.
+      To resolve {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }} without publishing anything else, choose "Resolve the fixed threads"; "Post nothing" leaves {{ 'it' if (build_followup_questions.output.confirmations | length) == 1 else 'them' }} open.
       {% endif %}
       {% if prior_review.output.thread_error %}
       > Review threads could not be read ({{ prior_review.output.thread_error }}), so no earlier comment can be confirmed, resolved or reopened on this run.
@@ -1920,6 +1929,9 @@ agents:
       - label: Run the full review instead
         value: full_review
         route: concept_review
+      - label: Resolve the fixed threads, post nothing else
+        value: resolve_only
+        route: confirm_threads_only
       - label: Post nothing
         value: stop
         route: cleanup
@@ -2164,6 +2176,30 @@ agents:
     stdin: '{"confirmations": {{ build_followup_questions.output.confirmations | tojson }}}'
     routes:
       - to: post_note
+
+  - name: confirm_threads_only
+    description: Confirms fixed points and resolves their threads without publishing a review, approval or note
+    type: script
+    command: python3
+    timeout: 300
+    input:
+      - bootstrap.output.name_with_owner
+      - bootstrap.output.host
+      - bootstrap.output.gh_user
+      - bootstrap.output.auth_source
+      - pr_resolver.output.pr_number
+      - build_followup_questions.output.confirmations
+    args:
+      - "{{ workflow.dir }}/scripts/github_auth.py"
+      - "{{ bootstrap.output.host }}"
+      - "{{ bootstrap.output.gh_user }}"
+      - "{{ bootstrap.output.auth_source }}"
+      - "{{ workflow.dir }}/scripts/sync_threads.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ pr_resolver.output.pr_number }}"
+    stdin: '{"confirmations": {{ build_followup_questions.output.confirmations | tojson }}}'
+    routes:
+      - to: cleanup
 
   - name: approval_writer
     description: Words the human's approval with a short thank-you tailored to this PR
@@ -2562,7 +2598,9 @@ agents:
       - pr_resolver.output.pr_number
       - pr_resolver.output.pr_url
       - cleanup_report.output.summary
-    reason: "Nothing was posted to #{{ pr_resolver.output.pr_number }}. Either the review found nothing, you dropped every finding, or you stopped at a gate. {{ pr_resolver.output.pr_url }} {{ cleanup_report.output.summary }}"
+      - confirm_threads_only.output.synced?
+      - confirm_threads_only.output.error?
+    reason: "{% if confirm_threads_only is defined %}No review was posted to #{{ pr_resolver.output.pr_number }}; {{ confirm_threads_only.output.synced }} fixed thread{{ 's' if confirm_threads_only.output.synced != 1 else '' }} confirmed and resolved, and every open point was left as is.{% if confirm_threads_only.output.error %} Thread problems: {{ confirm_threads_only.output.error }}{% endif %}{% else %}Nothing was posted to #{{ pr_resolver.output.pr_number }}. Either the review found nothing, you dropped every finding, or you stopped at a gate.{% endif %} {{ pr_resolver.output.pr_url }} {{ cleanup_report.output.summary }}"
 
   - name: stopped
     type: terminate
