@@ -132,7 +132,7 @@ workflow:
 agents:
   - name: architect
     description: Researches the codebase and broader context, then authors a solution design document with actionable implementation plan
-    model: gpt-6-astra 
+    model: claude-opus-5.5
     context_tier: long_context
     reasoning:
       effort: xhigh
@@ -564,7 +564,7 @@ agents:
 
   - name: fixer
     description: Applies targeted revisions to the plan document from review feedback, escalating to the architect when the feedback requires a fundamental rework
-    model: claude-sonnet-5
+    model: claude-sonnet-5.5
     context_tier: long_context
     reasoning:
       effort: medium 
