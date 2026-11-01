@@ -41,6 +41,9 @@ jobs:
       - name: Test PR review scripts and routing
         run: python3 -m unittest discover -s workflows/pr-review/tests -v
 
+      - name: Test ship merge script and routing
+        run: python3 -m unittest discover -s workflows/ship/tests -v
+
       - name: Test LogService audit evidence and publication
         run: python3 -m unittest discover -s workflows/log-service-audit/tests -v
 

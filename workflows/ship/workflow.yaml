@@ -30,14 +30,14 @@
 #     ↓
 #   merge_gate                merge / don't merge (human gate)
 #     ↓
-#   merge ─────────────→ merge_conflicts   the branch conflicts with the base:
+#   merge (script) ────→ merge_conflicts   the branch conflicts with the base:
 #     ↓                       ↓            resolve them / stop (human gate)
 #     ↓                  conflict_resolver merge the base branch in, resolve,
 #     ↓                       ↓            re-verify, push, then merge again
 #     ↓ ←────────────────────┘
-#   $end                      [merge-pr skill] squash, delete branch, remove
-#                             the worktree — runs in the repo root, NOT in the
-#                             worktree it is deleting
+#   $end                      squash, delete branch, remove the worktree —
+#                             from the repo root, NOT the worktree it deletes.
+#                             Not merged and not conflicting → merge_failed
 #
 # Loops
 #   Two, and a human drives both. The coder runs once, and if it does not
@@ -79,9 +79,9 @@
 #   Steps with no `working_dir` run in the directory you invoked
 #   `conductor run` from, so the workflow targets whatever repository you are
 #   standing in. Once the worktree exists, every implementation step pins
-#   `working_dir` to its absolute path. `merge` deliberately pins back to the
-#   repository root, mirroring the manual step of leaving the worktree before
-#   deleting it.
+#   `working_dir` to its absolute path. `merge` instead works on the
+#   repository root with `git -C`, mirroring the manual step of leaving the
+#   worktree before deleting it.
 #
 # Plugins
 #   Each step declares the plugin whose skill it drives, rather than the
@@ -98,7 +98,7 @@
 #     planner                               ado@jason-tools    ado agent (ADO MCP)
 #     planner                          ms-internal@jason-tools ms-internal agent (Learn, EngHub)
 #     coder                                 dev@jason-tools    code-comments
-#     review, merge                         prs@jason-tools    code-review, merge-pr
+#     review                                prs@jason-tools    code-review
 #     review_fixer, conflict_resolver       git@jason-tools    git-workflow, gh-cli
 #     review_fixer                          dev@jason-tools    code-comments
 #
@@ -1209,103 +1209,60 @@ agents:
       - to: merge
 
   - name: merge
-    description: Merges the pull request and cleans up the branch and worktree, using the merge-pr skill
-    model: gpt-6-luna
-    plugins:
-      - prs@jason-tools       # merge-pr
-    # Pinned to the repository root, NOT the worktree — this step deletes that
-    # worktree, and an agent cannot remove the directory it is standing in.
-    working_dir: "{{ bootstrap.output.repo_root }}"
+    description: Squash-merges the pull request, then removes the worktree and deletes the local and remote branch
+    # A script, not an agent: merging needs no judgement, and the agent that
+    # drove the `merge-pr` skill merged nothing and reported success once the
+    # skill was marked `disable-model-invocation`. Any outcome that is neither
+    # merged nor blocked by conflicts carries `error` and fails the run below.
+    # Cleanup runs against the repository root (`git -C`), never inside the
+    # worktree it deletes, and never forces: a dirty worktree, or a local branch
+    # with commits the PR does not contain, is kept and reported.
+    type: script
+    command: python3
+    timeout: 600
     input:
       - ship_draft.output.pr_number
+      - bootstrap.output.name_with_owner
       - bootstrap.output.repo_root
       - bootstrap.output.default_branch
+      - bootstrap.output.gh_user
+      - issue_resolver.output.issue_number
+      - worktree_verify.output.worktree_path
       - worktree_verify.output.branch
-    system_prompt: |
-      You invoke the `merge-pr` skill and report what it did. The skill owns the
-      merge strategy and the cleanup, including which branches and worktrees are
-      yours to remove. Follow it as written.
-
-      A human already approved this merge at a gate, or the run is on autopilot
-      and there is no gate to ask at — either way, do not ask again. But do stop
-      if the repository's own state makes merging unsafe.
-
-      You never resolve merge conflicts. Conflicts mean the branch needs real
-      work that a later step owns, and forcing past them here would either
-      clobber the base branch or land a resolution nobody verified. Report them
-      and stop.
-    prompt: |
-      Merge pull request #{{ ship_draft.output.pr_number }}, which merges
-      `{{ worktree_verify.output.branch }}` into
-      `{{ bootstrap.output.default_branch }}`.
-
-      ## First, check that it can merge
-
-      ```
-      gh pr view {{ ship_draft.output.pr_number }} --json mergeable,mergeStateStatus
-      ```
-
-      If `mergeable` is `CONFLICTING` — or the merge itself fails because the
-      branch conflicts with the base — **stop immediately**:
-
-      - Set `blocked_by_conflicts: true` and `merged: false`.
-      - Name the conflicting files in `conflict_summary`, along with what the
-        base branch changed underneath this one if you can tell. Get the file
-        list from `gh pr view --json files` plus
-        `git -C {{ bootstrap.output.repo_root }} fetch origin` and
-        `git -C {{ bootstrap.output.repo_root }} merge-tree`, or from the failed
-        merge's own error output.
-      - Do **not** check out the branch, do not resolve anything, do not force
-        the merge, and do not delete the branch or the worktree. A later step
-        resolves conflicts and sends the PR back here; it needs both intact.
-
-      A `mergeable` of `UNKNOWN` means GitHub is still computing it — wait a few
-      seconds and re-read it before deciding.
-
-      ## Otherwise, merge it
-
-      /merge-pr #{{ ship_draft.output.pr_number }}
-
-      Then report what was merged and what was cleaned up. Set
-      `blocked_by_conflicts: false` for any outcome that is not a conflict, and
-      put the reason in `cleanup_notes` if the merge failed for some other
-      cause.
-    output:
-      merged:
-        type: boolean
-        description: True when the pull request was squash-merged
-      blocked_by_conflicts:
-        type: boolean
-        description: True only when the merge did not happen because the branch conflicts with the base. False for a successful merge and for every other kind of failure.
-      conflict_summary:
-        type: string
-        description: Which files conflict and what changed underneath the branch, when blocked_by_conflicts is true. Empty otherwise.
-      merge_commit:
-        type: string
-        description: SHA of the squash-merge commit on the default branch
-      branch_deleted:
-        type: boolean
-        description: True when both the remote and local branch were deleted
-      worktree_removed:
-        type: boolean
-        description: True when the worktree was removed
-      issue_closed:
-        type: boolean
-        description: True when the linked issue was closed by the merge
-      cleanup_notes:
-        type: string
-        description: Anything left behind or needing manual attention. Empty when cleanup was complete.
+    args:
+      - "{{ workflow.dir }}/scripts/merge.py"
+      - "{{ bootstrap.output.name_with_owner }}"
+      - "{{ ship_draft.output.pr_number }}"
+      - "{{ worktree_verify.output.branch }}"
+      - "{{ worktree_verify.output.worktree_path }}"
+      - "{{ bootstrap.output.repo_root }}"
+      - "{{ bootstrap.output.default_branch }}"
+      - "{{ issue_resolver.output.issue_number }}"
+      - "{{ bootstrap.output.gh_user }}"
     routes:
+      - to: merge_failed
+        when: "{{ not output.merged and not output.blocked_by_conflicts }}"
       - to: merge_conflicts
-        when: "{{ not output.merged and output.blocked_by_conflicts and not workflow.input.autopilot }}"
+        when: "{{ output.blocked_by_conflicts and not workflow.input.autopilot }}"
       # Autopilot resolves conflicts itself, bounded by the same round counter
       # that bounds the coder — without it, a resolver that keeps reporting
       # success would loop against a merge that keeps failing.
       - to: conflict_resolver
-        when: "{{ not output.merged and output.blocked_by_conflicts and (conflict_resolver is not defined or conflict_resolver.output.round < workflow.input.max_autopilot_rounds) }}"
+        when: "{{ output.blocked_by_conflicts and (conflict_resolver is not defined or conflict_resolver.output.round < workflow.input.max_autopilot_rounds) }}"
       - to: merge_blocked
-        when: "{{ not output.merged and output.blocked_by_conflicts }}"
+        when: "{{ output.blocked_by_conflicts }}"
       - to: $end
+
+  - name: merge_failed
+    type: terminate
+    status: failed
+    input:
+      - merge.output.error
+      - ship_draft.output.pr_url
+    reason: >-
+      The merge did not happen: {{ merge.output.error }}
+      The pull request is left open with its worktree and branch intact —
+      {{ ship_draft.output.pr_url }}
 
   - name: merge_conflicts
     type: human_gate
