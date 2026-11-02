@@ -28,13 +28,13 @@
 #   grinding through the round cap into a human gate.
 #
 # Human escalation:
-#   Either reviewer may put questions to a human whenever its verdict turns on
-#   something the code and the plan cannot settle, on any round. The human can
-#   skip any question or abort the run from the question gate. This is the only
-#   point at which the workflow asks for human input — there is no round-cap
-#   gate. An epic that exhausts max_epic_review_rounds is committed as-is with
-#   its unresolved issues flagged in the plan, and the final plan_reviewer pass
-#   is told to give it extra scrutiny. Disable questions entirely with
+#   The coder, both fixers, and both reviewers may put questions to a human
+#   when a decision turns on something the code and the plan cannot settle.
+#   Answers return to the same agent, preserving work already done. The human
+#   can skip any question or abort the run from the question gate. There is no
+#   round-cap gate. An epic that exhausts max_epic_review_rounds is committed
+#   as-is with its unresolved issues flagged in the plan, and the final
+#   plan_reviewer pass is told to give it extra scrutiny. Disable questions with
 #   --input allow_human_escalation=false for a fully unattended run.
 #
 # Usage:
@@ -52,7 +52,7 @@
 
 workflow:
   name: implement
-  description: Implement a feature based on an implementation plan document
+  description: Implement a feature based on an implementation plan document, with epic-level and plan-level review and optional human questions from the coder, fixers, and reviewers
   version: "2.0.0"
   entry_point: epic_selector
 
@@ -97,7 +97,7 @@ workflow:
       type: boolean
       required: false
       default: true
-      description: Whether a reviewer may pause the workflow to ask a human questions it cannot resolve from the code or the plan. Reviewers may ask on any round; set false for a fully unattended run.
+      description: Whether the coder, fixers, and reviewers may pause the workflow to ask a human questions they cannot resolve from the code or the plan. Agents may ask on any round; set false for a fully unattended run.
 
   context:
     mode: accumulate
@@ -230,7 +230,10 @@ agents:
       effort: high
     input:
       - workflow.input.plan
+      - workflow.input.allow_human_escalation?
       - epic_selector.output
+      - coder.output?
+      - coder_questions.output?
     system_prompt: |
       You are a Senior Software Engineer agent. Your task is to implement code changes
       for ONE specific epic that has been assigned to you.
@@ -259,6 +262,32 @@ agents:
 
       **Plan Document:**
       {{ workflow.input.plan }}
+
+      {% if context.history and context.history[-1] == 'coder_questions' %}
+      ## Resume After Human Questions
+
+      Your previous pass paused on this epic. Read the current working tree
+      and your previous report; preserve completed changes and tests rather
+      than starting the epic over.
+
+      **Previous progress:** {{ coder.output | json }}
+
+      {% if coder_questions.output.answered_any %}
+      **Human answers:**
+      {{ coder_questions.output.transcript }}
+      {% else %}
+      The human skipped all questions. Proceed with safe, in-scope assumptions
+      and record them in `implementation_notes`; do not invent missing prerequisites.
+      {% endif %}
+
+      Apply the answers to the implementation and record confirmed decisions
+      in the plan under this epic, so the reviewers and later agents use them.
+      Questions missing from the transcript were skipped. Do not re-ask
+      answered or skipped questions. Investigate any remaining uncertainty
+      and report a real prerequisite blocker using `blocked` as usual.
+      Your final report must cover the entire epic, including work completed
+      before the pause, not just the changes made since the answers.
+      {% endif %}
 
       {% if epic_selector.output.prerequisites_met == false %}
       **Selector Flagged Prerequisites As Not Met:**
@@ -332,8 +361,34 @@ agents:
       human can fix the plan.
 
       Use this only for a real, verified blocker. Design questions, ambiguity in
-      the epic, and issues you worked around are `implementation_notes`, not
-      `blocked`.
+      the epic, and issues you worked around are not missing-prerequisite
+      blockers; use the human-question path below when a decision is needed.
+
+      ## Human Questions
+
+      {% if workflow.input.allow_human_escalation %}
+      If an unstated requirement, design trade-off, or ambiguity in this epic
+      would change your implementation and cannot be resolved from the plan,
+      code, or documentation, ask rather than silently choose.
+      Set `needs_human_escalation` to true and return the questions in
+      `escalation_questions`. Pause before making the affected changes; keep
+      work already completed and report only actual progress and verification.
+      Do not mark the epic complete or commit while waiting for answers.
+
+      Each question must be self-contained. Return objects of the form
+      `{"question": "...", "choices": ["...", "..."]}` with 2-4 concrete
+      choices when alternatives can be named. Put your default choice first,
+      ending in ` (Recommended)`; omit `choices` for open-ended questions.
+      Do not ask what you can discover yourself or ask for permission to
+      perform work the plan already requires. Do not re-ask a question the
+      human already answered or skipped.
+      {% else %}
+      Human questions are disabled. State safe, in-scope assumptions in
+      `implementation_notes` and keep the existing prerequisite-blocker behavior.
+      {% endif %}
+
+      When no new human decision is needed, set `needs_human_escalation` to
+      false and `escalation_questions` to an empty list.
     output:
       current_epic:
         type: string
@@ -368,10 +423,39 @@ agents:
       blocked_reason:
         type: string
         description: Concrete list of what is missing and why the epic cannot proceed. Required when blocked is true, empty otherwise.
+      needs_human_escalation:
+        type: boolean
+        description: Whether a human decision is needed before implementation can continue. False when no new question needs answering.
+      escalation_questions:
+        type: array
+        description: 'Self-contained questions that change the implementation. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted for open-ended questions. Empty unless needs_human_escalation is true.'
     routes:
+      - to: coder_questions
+        when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and (output.escalation_questions | length) > 0 }}"
       - to: epic_blocked
         when: "{{ output.blocked }}"
       - to: epic_reviewer
+
+  - name: coder_questions
+    type: questions
+    description: Asks the coder's unresolved questions and resumes implementation of the same epic with the human's answers
+    source: coder.output.escalation_questions
+    prompt: |
+      ## Implementation — {{ coder.output.current_epic }}
+
+      The coder needs a decision it cannot resolve from the code or the plan.
+      Completed work is preserved; this epic has not been committed.
+
+      Answer what you can. Skipped questions leave the coder to use its best
+      judgment within the epic's scope. You can go back and revise an earlier
+      answer before finishing, or abort to stop without committing this epic.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: $end
+    routes:
+      - to: coder
 
   # A blocked epic must not reach `committer`, which marks epics DONE and commits
   # them. The coder is told to stop when a prerequisite is genuinely missing, but
@@ -499,8 +583,10 @@ agents:
       specific file and line for is not a finding.
 
       Note that the implementer is *instructed* to update this epic's status
-      markers in the plan document (`{{ workflow.input.plan }}`). Those edits
-      are in scope by design — never flag them as scope creep.
+      markers and record confirmed human decisions in the plan document
+      (`{{ workflow.input.plan }}`). Those edits are in scope by design —
+      never flag them as scope creep. Use those recorded decisions when
+      interpreting the epic's requirements.
 
       {% if from_fixer %}
       ## RE-REVIEW — Round {{ (epic_reviewer.output.review_round | default(0)) + 1 }} of at most {{ workflow.input.max_epic_review_rounds }}
@@ -558,7 +644,7 @@ agents:
       2. **Scope Containment**
          - Verify every changed line in the diff traces to a specific task in THIS epic
          - Flag any modified files NOT specified in the epic details (excluding
-           the plan document's own status updates)
+           the plan document's status updates and confirmed human decisions)
          - Flag any drive-by changes: formatting, style adjustments, comment rewrites, or refactoring outside the epic's scope
          - Flag unnecessary abstractions, configurability, or flexibility not in the plan
 
@@ -748,9 +834,12 @@ agents:
       effort: medium
     input:
       - workflow.input.plan
+      - workflow.input.allow_human_escalation?
       - epic_selector.output
       - coder.output
       - epic_reviewer.output
+      - epic_fixer.output?
+      - epic_fixer_questions.output?
     system_prompt: |
       You are a Senior Software Engineer agent specializing in resolving code
       review feedback on a single epic.
@@ -767,6 +856,28 @@ agents:
 
       **Epic Details:**
       {{ coder.output.epic_details }}
+
+      {% if context.history and context.history[-1] == 'epic_fixer_questions' %}
+      ## Resume After Human Questions
+
+      Resume the same fix pass. Read the current diff and preserve fixes and
+      passing tests already in place; do not re-implement the epic.
+
+      **Previous progress:** {{ epic_fixer.output | json }}
+
+      {% if epic_fixer_questions.output.answered_any %}
+      **Human answers:**
+      {{ epic_fixer_questions.output.transcript }}
+      {% else %}
+      The human skipped all questions. Use safe, in-scope assumptions and
+      record them in `implementation_notes`.
+      {% endif %}
+
+      Apply confirmed decisions to the fixes and record them in the plan under
+      this epic for the reviewer. Questions missing from the transcript were
+      skipped. Do not re-ask answered or skipped questions. Report the full
+      epic state, including work completed before this pause.
+      {% endif %}
 
       **Review round:** {{ epic_reviewer.output.review_round }} of at most
       {{ workflow.input.max_epic_review_rounds }}
@@ -822,6 +933,30 @@ agents:
          rather than silently ignoring it.
 
       **STOP once the listed issues are resolved. Do NOT implement other epics.**
+
+      ## Human Questions
+
+      {% if workflow.input.allow_human_escalation %}
+      If fixing a blocking issue requires a human decision that the review,
+      plan, code, and documentation cannot settle, ask before making the
+      affected changes. Set `needs_human_escalation` to true and populate
+      `escalation_questions`. Preserve completed fixes and report actual
+      progress; do not commit or claim unresolved issues are fixed.
+
+      Return self-contained objects:
+      `{"question": "...", "choices": ["...", "..."]}`. Give 2-4 concrete
+      choices when possible, with your default first and ending in
+      ` (Recommended)`; omit `choices` for open-ended questions. Do not ask
+      about facts you can verify yourself, expand the epic's scope, or re-ask
+      questions the human answered or skipped. If an issue remains unresolved
+      after skipped questions, say so in `implementation_notes` for review.
+      {% else %}
+      Human questions are disabled. Use safe, in-scope assumptions and report
+      unresolved issues honestly in `implementation_notes` for review.
+      {% endif %}
+
+      When no new human decision is needed, set `needs_human_escalation` to
+      false and `escalation_questions` to an empty list.
     output:
       current_epic:
         type: string
@@ -850,8 +985,37 @@ agents:
       verification_evidence:
         type: array
         description: The exact build, lint and test commands run this round, each with its outcome
+      needs_human_escalation:
+        type: boolean
+        description: Whether a human decision is needed before the epic's fixes can continue. False when no new question needs answering.
+      escalation_questions:
+        type: array
+        description: 'Self-contained questions that change a blocking fix. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted for open-ended questions. Empty unless needs_human_escalation is true.'
     routes:
+      - to: epic_fixer_questions
+        when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and (output.escalation_questions | length) > 0 }}"
       - to: epic_reviewer
+
+  - name: epic_fixer_questions
+    type: questions
+    description: Asks the epic fixer's unresolved questions and resumes the same fix pass with the human's answers
+    source: epic_fixer.output.escalation_questions
+    prompt: |
+      ## Epic fixes — {{ coder.output.current_epic }}
+
+      The epic fixer needs a decision to resolve the review feedback.
+      Completed fixes are preserved; this epic has not been committed.
+
+      Answer what you can. Skipped questions leave the fixer to use its best
+      judgment and report anything unresolved to the reviewer. You can revise
+      earlier answers or abort to stop without committing this epic.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: $end
+    routes:
+      - to: epic_fixer
 
   - name: mark_round_cap_reached
     type: set
@@ -1313,8 +1477,11 @@ agents:
     input:
       - workflow.input.plan
       - workflow.input.epic?
+      - workflow.input.allow_human_escalation?
       - coder.output
       - plan_reviewer.output
+      - fixer.output?
+      - fixer_questions.output?
     system_prompt: |
       You are a Senior Software Engineer agent specializing in fixing issues
       identified during holistic code review.
@@ -1340,6 +1507,28 @@ agents:
 
       **Original Plan:**
       {{ workflow.input.plan }}
+
+      {% if context.history and context.history[-1] == 'fixer_questions' %}
+      ## Resume After Human Questions
+
+      Resume the same plan-level fix pass. Read the current working tree and
+      preserve fixes and passing tests already in place.
+
+      **Previous progress:** {{ fixer.output | json }}
+
+      {% if fixer_questions.output.answered_any %}
+      **Human answers:**
+      {{ fixer_questions.output.transcript }}
+      {% else %}
+      The human skipped all questions. Use safe, in-scope assumptions and
+      record them in `fix_notes`.
+      {% endif %}
+
+      Apply confirmed decisions to the fixes and record them in the plan for
+      the reviewer. Questions missing from the transcript were skipped. Do
+      not re-ask answered or skipped questions. Your report must cover the
+      entire fix pass, including work completed before this pause.
+      {% endif %}
 
       **Reviewer Decision:** {{ plan_reviewer.output.decision }}
 
@@ -1374,6 +1563,31 @@ agents:
       - {{ suggestion }}
       {% endfor %}
       {% endif %}
+
+      ## Human Questions
+
+      {% if workflow.input.allow_human_escalation %}
+      If resolving a blocking issue requires a human decision that the review,
+      plan, code, and documentation cannot settle, ask before making the
+      affected changes. Set `needs_human_escalation` to true and populate
+      `escalation_questions`. Preserve completed fixes and report actual
+      progress. Do not run the Commit Fixes task while requesting answers;
+      leave `commit_message` empty until the fix pass is ready to commit.
+
+      Return self-contained objects:
+      `{"question": "...", "choices": ["...", "..."]}`. Give 2-4 concrete
+      choices when possible, with your default first and ending in
+      ` (Recommended)`; omit `choices` for open-ended questions. Do not ask
+      what you can verify yourself, expand the implemented scope, or re-ask
+      questions the human answered or skipped. Report anything unresolved
+      after skipped questions in `fix_notes` and `all_issues_resolved`.
+      {% else %}
+      Human questions are disabled. Use safe, in-scope assumptions and report
+      unresolved issues honestly in `fix_notes` and `all_issues_resolved`.
+      {% endif %}
+
+      When no new human decision is needed, set `needs_human_escalation` to
+      false and `escalation_questions` to an empty list.
 
       ## FIX TASKS
 
@@ -1425,8 +1639,37 @@ agents:
       all_issues_resolved:
         type: boolean
         description: Whether all issues have been resolved
+      needs_human_escalation:
+        type: boolean
+        description: Whether a human decision is needed before the plan-level fixes can continue. False when no new question needs answering.
+      escalation_questions:
+        type: array
+        description: 'Self-contained questions that change a blocking fix. Each entry is an object: {"question": "...", "choices": ["..."]}, with choices omitted for open-ended questions. Empty unless needs_human_escalation is true.'
     routes:
+      - to: fixer_questions
+        when: "{{ workflow.input.allow_human_escalation and output.needs_human_escalation and (output.escalation_questions | length) > 0 }}"
       - to: plan_reviewer
+
+  - name: fixer_questions
+    type: questions
+    description: Asks the plan-level fixer's unresolved questions and resumes the same fix pass with the human's answers
+    source: fixer.output.escalation_questions
+    prompt: |
+      ## Final implementation fixes
+
+      The fixer needs a decision to resolve the plan review feedback.
+      Earlier epic commits remain in place; this fix pass is not committed yet.
+
+      Answer what you can. Skipped questions leave the fixer to use its best
+      judgment and report anything unresolved to the reviewer. You can revise
+      earlier answers or abort to stop, leaving current fixes uncommitted.
+    allow_back: true
+    allow_skip: true
+    allow_skip_all: true
+    allow_abort: true
+    abort_route: $end
+    routes:
+      - to: fixer
 
 output:
   plan: "{{ workflow.input.plan }}"
@@ -1442,5 +1685,5 @@ output:
   blocked_reason: "{{ epic_blocked.output.blocked_note if epic_blocked is defined else '' }}"
   plan_review_decision: "{{ plan_reviewer.output.decision if plan_reviewer is defined else '' }}"
   plan_review_suggestions: "{{ plan_reviewer.output.suggestions | json if plan_reviewer is defined else '[]' }}"
-  human_questions_answered: "{{ (epic_reviewer_questions is defined and epic_reviewer_questions.output.answered_any) or (plan_reviewer_questions is defined and plan_reviewer_questions.output.answered_any) }}"
+  human_questions_answered: "{{ (coder_questions is defined and coder_questions.output.answered_any) or (epic_fixer_questions is defined and epic_fixer_questions.output.answered_any) or (fixer_questions is defined and fixer_questions.output.answered_any) or (epic_reviewer_questions is defined and epic_reviewer_questions.output.answered_any) or (plan_reviewer_questions is defined and plan_reviewer_questions.output.answered_any) }}"
   iterations: "{{ context.iteration }}"

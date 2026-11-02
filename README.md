@@ -14,7 +14,7 @@ Sample workflow registry for [Conductor](https://github.com/microsoft/conductor)
 | `pr-review` | Review open pull requests for repository fit and implementation quality in isolated worktrees. Reuse passing CI, approve or retry runs only when needed, and reconcile current checks without duplicate findings. Follow-up runs track distinct earlier findings. Fixed points get a fix-confirmed reply and are resolved, unfixed ones are replied to on their original thread (reopened if resolved), and new problems become new inline comments. Validate approved finding coverage and the reviewed head before publishing. Approval and squash-merge require separate decisions; stopped runs remain resumable until explicitly discarded |
 | `sdd-design` | Solution design document with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge (no implementation plan) |
 | `sdd-plan` | Solution design + implementation plan with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge. Optional `design` input switches it to plan-only mode, consuming an existing design document (e.g. one produced by `sdd-design`) |
-| `sdd-implement` | Implement a plan epic-by-epic with epic-level and plan-level review |
+| `sdd-implement` | Implement a plan epic-by-epic with epic-level and plan-level review. The coder, fixers, and reviewers can ask human questions when the plan or code cannot settle a decision |
 | `ship` | Take an existing GitHub issue to a merged pull request: cuts a worktree, plans behind a human question gate, implements unattended, opens a draft PR, reviews it and applies the findings in a separate step, then publishes and merges behind a human gate with full branch and worktree cleanup. A merge blocked by conflicts pauses to ask whether to resolve them, and `autopilot=true` bypasses every human gate |
 
 ## Usage
@@ -29,6 +29,18 @@ conductor registry list sample
 # Run a workflow
 conductor run sdd-plan --input goal="Design a caching layer"
 ```
+
+### Implementation questions
+
+`sdd-implement` enables human escalation by default. The coder, both fixers,
+and both reviewers can pause to ask questions that affect their implementation
+or verdict. Answers return to the same agent, preserving completed work.
+You can revise answers, skip questions, or abort; aborting leaves any
+uncommitted work in place. Question gates do not change the existing
+review-round cap behavior.
+
+Set `--input allow_human_escalation=false` for an unattended run with no
+question gates.
 
 ### PR review behavior
 

@@ -24,7 +24,7 @@ workflows:
     description: "Solution design + implementation plan with technical and readability review cycles, a fixer agent applying targeted revisions between rounds, and a human gate when reviews don't converge. Accepts an optional `design` input to skip the design phase and produce only the implementation plan from an existing design document"
     path: workflows/sdd/plan.yaml
   sdd-implement:
-    description: "Implement a feature based on an implementation plan document, with epic-level and plan-level review"
+    description: "Implement a feature based on an implementation plan document, with epic-level and plan-level review and optional human questions from the coder, fixers, and reviewers"
     path: workflows/sdd/implement.yaml
   ship:
     description: "Takes an existing GitHub issue to a merged pull request — cuts a worktree, plans with a human question gate, implements unattended, opens a draft PR, reviews it and applies the findings in a separate step, then publishes and merges behind a human gate with full branch and worktree cleanup. Merge conflicts pause for a human, and `autopilot` bypasses every gate"
