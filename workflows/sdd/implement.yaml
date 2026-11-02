@@ -278,6 +278,7 @@ agents:
   - name: coder
     description: Implements code changes for a single epic
     working_dir: "{{ worktree_setup.output.worktree_path }}"
+    max_session_seconds: 28800  # 8 hours; reviewers keep the 1-hour runtime default
     model: claude-sonnet-5.5
     context_tier: long_context
     reasoning:
@@ -896,6 +897,7 @@ agents:
   - name: epic_fixer
     description: Resolves the epic reviewer's blocking issues with a narrow, fix-only pass instead of re-running the full implementation
     working_dir: "{{ worktree_setup.output.worktree_path }}"
+    max_session_seconds: 28800  # 8 hours; reviewers keep the 1-hour runtime default
     model: claude-sonnet-5.5
     context_tier: long_context
     reasoning:
