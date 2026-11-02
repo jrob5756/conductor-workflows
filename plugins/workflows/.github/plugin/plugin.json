@@ -1,7 +1,7 @@
 {
   "name": "workflows",
-  "description": "Invoke Conductor workflows from the conductor-workflows registry as skills. Ships `fusion`, which runs multi-model deliberation over a hard question, and `ship`, which takes a GitHub issue to a merged pull request in the background.",
-  "version": "0.2.0",
+  "description": "Invoke Conductor workflows from the conductor-workflows registry as manually-run skills, plus the Conductor MCP server. Ships ship (issue to merged PR), pr-review, sdd-design, sdd-plan and sdd-implement, and monitor, which watches a run and recovers it from failures.",
+  "version": "0.3.0",
   "author": {
     "name": "jrob5756"
   },
@@ -12,9 +12,15 @@
     "conductor",
     "workflow",
     "multi-agent",
-    "deliberation",
-    "fusion",
+    "mcp",
     "ship",
-    "pull-request"
-  ]
+    "pull-request",
+    "pr-review",
+    "sdd",
+    "design",
+    "planning",
+    "implementation",
+    "monitor"
+  ],
+  "mcpServers": ".mcp.json"
 }

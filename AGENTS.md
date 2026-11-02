@@ -23,8 +23,9 @@ This is a sample workflow registry for [Conductor](https://github.com/microsoft/
 
 - Plugins live at `plugins/<plugin>/` with a `.github/plugin/plugin.json` manifest (Copilot convention) and are registered in `.github/plugin/marketplace.json`.
 - Skills live at `plugins/<plugin>/skills/<skill>/SKILL.md`. The `name` in the frontmatter **must** equal the parent directory name, or the skill silently fails to load. Names are kebab-case and must not contain `/`, `.`, or `:`.
-- The plugin/skill pair determines the invocation: `plugins/workflows/skills/fusion` is invoked as `/workflows:fusion`.
-- **Skills must not bundle copies of workflow YAML.** Resolve workflows through the Conductor registry (`conductor run <id>@<registry>`) so a skill and its workflow cannot drift apart.
+- The plugin/skill pair determines the invocation: `plugins/workflows/skills/ship` is invoked as `/workflows:ship`.
+- **Skills must not bundle copies of workflow YAML.** Resolve workflows through the Conductor registry (the `conductor` MCP server's workflow tools, or `conductor run <id>@<registry>`) so a skill and its workflow cannot drift apart.
+- Workflow skills are manual only: set `disable-model-invocation: true` in their frontmatter.
 - A skill that wraps a workflow must never answer the user's request itself when the workflow fails — the orchestration is the point, so it reports the error and stops.
 
 ## Validating changes

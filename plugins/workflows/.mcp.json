@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "conductor": {
+      "type": "stdio",
+      "command": "conductor",
+      "args": [
+        "mcp", "serve",
+        "--toolsets", "workflows",
+        "--toolsets", "runs",
+        "--toolsets", "introspect",
+        "--toolsets", "diagnose"
+      ]
+    }
+  }
+}

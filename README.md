@@ -153,18 +153,25 @@ from Copilot CLI / VS Code and Claude Code.
 /plugin install workflows@conductor-workflows
 ```
 
-Then invoke a workflow directly:
+Then invoke a workflow directly. Every skill is manual only, so the model never
+starts a workflow on its own:
 
 ```text
-/workflows:fusion Compare ridge, lasso, and elastic-net regression. Where does each shine?
 /workflows:ship 123
+/workflows:sdd-plan Add OAuth2 login
+/workflows:monitor
 ```
 
 | Plugin | Skill | Runs |
 |--------|-------|------|
-| `workflows` | `fusion` | The `fusion` multi-model deliberation workflow |
-| `workflows` | `ship` | The `ship` workflow, in the background — returns a dashboard URL to track it |
+| `workflows` | `ship` | The `ship` workflow, in the background. Returns a run ID and dashboard URL |
+| `workflows` | `pr-review` | The `pr-review` workflow on an existing pull request |
+| `workflows` | `sdd-design` | The `sdd-design` workflow |
+| `workflows` | `sdd-plan` | The `sdd-plan` workflow |
+| `workflows` | `sdd-implement` | The `sdd-implement` workflow |
+| `workflows` | `monitor` | Checks a run every 10 minutes (configurable). On a failure, it fixes the cause and resumes the run, unless the failure needs a human |
 
-The skills resolve workflows through the Conductor registry rather than
-bundling copies, so a skill and its workflow cannot drift apart. See
+The plugin includes the Conductor MCP server, and the skills launch workflows
+through it. The server resolves workflows from your Conductor registries rather
+than from bundled copies, so a skill and its workflow can't drift apart. See
 [`plugins/workflows/README.md`](plugins/workflows/README.md).
