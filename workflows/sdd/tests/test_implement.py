@@ -31,6 +31,11 @@ class ImplementationEscalationTests(unittest.TestCase):
                 "max_epic_review_rounds": 4,
             }},
             "context": {"history": list(history)},
+            "worktree_setup": {"output": {
+                "plan": "/repo.worktrees/feature/feature.plan.md",
+                "worktree_path": "/repo.worktrees/feature",
+                "branch": "feature/feature",
+            }},
             "epic_selector": {"output": {
                 "current_epic": "EPIC-002",
                 "epic_details": "Implement the next feature.",

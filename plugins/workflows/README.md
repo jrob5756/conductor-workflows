@@ -11,7 +11,7 @@ registry as skills.
 | `pr-review` | The `pr-review` workflow on an existing pull request |
 | `sdd-design` | The `sdd-design` workflow: a reviewed solution design document |
 | `sdd-plan` | The `sdd-plan` workflow: design plus implementation plan, or the plan only from an existing design |
-| `sdd-implement` | The `sdd-implement` workflow: implements a plan epic by epic |
+| `sdd-implement` | The `sdd-implement` workflow: implements a plan epic by epic in its own git worktree |
 | `monitor` | Watches a run on a schedule, fixes and resumes it after a failure, and stops to ask you when a failure needs a human |
 
 Plus `.mcp.json`, which registers the Conductor MCP server
